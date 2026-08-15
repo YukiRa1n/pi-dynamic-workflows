@@ -1,0 +1,29 @@
+import { type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { type Static } from "typebox";
+import { type RunStatus } from "./run-persistence.js";
+import type { WorkflowManager } from "./workflow-manager.js";
+declare const workflowControlSchema: any;
+export type WorkflowControlInput = Static<typeof workflowControlSchema>;
+export interface WorkflowControlToolOptions {
+    manager?: WorkflowManager;
+    /** Live manager accessor; prefer over a closed-over manager when the extension may replace it. */
+    getManager?: () => WorkflowManager;
+}
+export interface WorkflowControlRunDetails {
+    runId: string;
+    workflowName: string;
+    status: RunStatus;
+    phase: string | null;
+    counts: {
+        total: number;
+        done: number;
+        running: number;
+        queued: number;
+        error: number;
+        skipped: number;
+    };
+    activeLabels: string[];
+    tokenTotal: number;
+}
+export declare function createWorkflowControlTool(options: WorkflowControlToolOptions): ToolDefinition<typeof workflowControlSchema, Record<string, unknown>>;
+export {};
