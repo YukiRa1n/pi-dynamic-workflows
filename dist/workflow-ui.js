@@ -15,8 +15,8 @@
 import { getLanguageFromPath, getMarkdownTheme, renderDiff, } from "@earendil-works/pi-coding-agent";
 import { Markdown, parseKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { aggregateAgentUsage, fmtCost, fmtTokenSegment, tokenFigures } from "./display.js";
+import { safeStringify, serializeBounded } from "./safe-serialize.js";
 import { registerSavedWorkflow } from "./saved-commands.js";
-import { safeStringify } from "./safe-serialize.js";
 const STATUS_ICON = {
     pending: "·",
     queued: "·",
@@ -1056,7 +1056,7 @@ function renderNavigatorFrame(state, model, width, theme, viewportRows, markdown
             body.push(dim("Location: ") + (w.location === "user" ? "user (~/.pi)" : "project (.pi)"));
             body.push(dim("Saved at: ") + asText(w.savedAt));
             if (w.parameters)
-                body.push(dim("Parameters: ") + JSON.stringify(w.parameters));
+                body.push(dim("Parameters: ") + safeStringify(w.parameters));
             body.push("", theme.fg("accent", theme.bold("Script:")));
             // Coerce (#110): corrupt saved-workflow JSON can carry a non-string script.
             body.push(...renderCodeLines(asText(w.script), "javascript", width, markdownTheme, renderCache));
@@ -1134,7 +1134,7 @@ function toolCallArguments(entry) {
 function redactCommandSecrets(command) {
     return command
         .replace(/\b(?:gh[opusr]_[A-Za-z0-9_]{12,}|github_pat_[A-Za-z0-9_]{12,}|sk-[A-Za-z0-9_-]{12,})\b/g, "[REDACTED]")
-        .replace(/((?:authorization|api[-_]?key|access[-_]?token|password)\s*[:=]\s*)([^\s;'\"]+)/gi, "$1[REDACTED]");
+        .replace(/((?:authorization|api[-_]?key|access[-_]?token|password)\s*[:=]\s*)([^\s;'"]+)/gi, "$1[REDACTED]");
 }
 function compactHistoryLine(entry, width) {
     const label = historyLabel(entry);
@@ -1149,7 +1149,10 @@ function compactHistoryLine(entry, width) {
         case "bash":
             detail = value("command");
             if (detail)
-                detail = redactCommandSecrets(detail.replace(/\s*\r?\n\s*/g, " ⏎ ").replace(/[ \t]+/g, " ").trim());
+                detail = redactCommandSecrets(detail
+                    .replace(/\s*\r?\n\s*/g, " ⏎ ")
+                    .replace(/[ \t]+/g, " ")
+                    .trim());
             break;
         case "read": {
             const path = value("path");
@@ -1161,11 +1164,13 @@ function compactHistoryLine(entry, width) {
         case "grep": {
             const pattern = value("pattern");
             const path = value("path");
-            detail = [pattern ? `/${pattern}/` : undefined, path ? `in ${path}` : undefined].filter(Boolean).join(" ") || undefined;
+            detail =
+                [pattern ? `/${pattern}/` : undefined, path ? `in ${path}` : undefined].filter(Boolean).join(" ") || undefined;
             break;
         }
         case "find":
-            detail = [value("pattern"), value("path") ? `in ${value("path")}` : undefined].filter(Boolean).join(" ") || undefined;
+            detail =
+                [value("pattern"), value("path") ? `in ${value("path")}` : undefined].filter(Boolean).join(" ") || undefined;
             break;
         case "ls":
             detail = value("path") ?? ".";
@@ -1188,7 +1193,7 @@ function compactHistoryLine(entry, width) {
         if (raw) {
             try {
                 const parsed = JSON.parse(raw);
-                detail = JSON.stringify(parsed);
+                detail = serializeBounded(parsed, { pretty: false, maxBytes: 8_000 });
             }
             catch {
                 detail = raw;

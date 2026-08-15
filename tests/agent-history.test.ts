@@ -120,3 +120,21 @@ test("compactAgentHistory truncates text and keeps the latest entries", () => {
   assert.match(history[1].text, /truncated/);
   assert.ok(history[1].text.length <= 30);
 });
+
+test("compactAgentHistory keeps caller limits finite and bounds tool metadata paths", () => {
+  const history = compactAgentHistory(
+    [
+      {
+        role: "assistant",
+        content: [{ type: "toolCall", name: "edit", arguments: { path: "p".repeat(20_000), edits: [] } }],
+      },
+    ],
+    {
+      maxEntries: Number.MAX_SAFE_INTEGER,
+      maxTextChars: Number.MAX_SAFE_INTEGER,
+      maxTotalChars: Number.MAX_SAFE_INTEGER,
+    },
+  );
+  assert.equal(history.length, 1);
+  assert.ok((history[0]?.path?.length ?? 0) <= 1_024);
+});

@@ -1,7 +1,12 @@
 import { closeSync, existsSync, openSync, readSync } from "node:fs";
 import { resolve } from "node:path";
 import { StringDecoder } from "node:string_decoder";
-import { defineTool, getMarkdownTheme, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import {
+  defineTool,
+  type ExtensionAPI,
+  type ExtensionContext,
+  getMarkdownTheme,
+} from "@earendil-works/pi-coding-agent";
 import { Box, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import {
@@ -33,9 +38,10 @@ import {
   saveWorkflowSettingsForCwd,
   suspendResultDelivery,
   UsageLimitScheduler,
-  WorkflowManager,
   type WorkflowDeliveryPayload,
+  WorkflowManager,
 } from "../src/index.js";
+import { truncateUtf8 } from "../src/safe-serialize.js";
 import type { WorkflowStorage } from "../src/workflow-saved.js";
 
 /**
@@ -134,16 +140,20 @@ const COLLAPSED_MESSAGE_LINES = 8;
 const COLLAPSED_MESSAGE_CHARS = 1_200;
 
 function customMessageText(content: unknown): string {
-  if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return String(content ?? "");
-  return content
-    .filter((part): part is { type: "text"; text: string } => {
-      if (!part || typeof part !== "object") return false;
-      const candidate = part as { type?: unknown; text?: unknown };
-      return candidate.type === "text" && typeof candidate.text === "string";
-    })
-    .map((part) => part.text)
-    .join("\n");
+  const limit = 32_000;
+  if (typeof content === "string") return truncateUtf8(content, limit, "…");
+  if (!Array.isArray(content)) return truncateUtf8(String(content ?? ""), limit, "…");
+  let output = "";
+  for (const part of content) {
+    if (!part || typeof part !== "object") continue;
+    const candidate = part as { type?: unknown; text?: unknown };
+    if (candidate.type !== "text" || typeof candidate.text !== "string") continue;
+    const separator = output ? "\n" : "";
+    const remaining = limit - Buffer.byteLength(output, "utf8") - Buffer.byteLength(separator, "utf8");
+    if (remaining <= 0) break;
+    output += separator + truncateUtf8(candidate.text, remaining, "");
+  }
+  return truncateUtf8(output, limit, "…");
 }
 
 function collapsedMessageText(text: string): { text: string; omitted: boolean } {
@@ -165,18 +175,22 @@ function registerWorkflowMessageRenderers(pi: ExtensionAPI): void {
   if (typeof pi.registerMessageRenderer === "function") {
     for (const customType of ["workflow-agent", "workflow-deliver", "workflow-result"] as const) {
       pi.registerMessageRenderer(customType, (message, { expanded, outputPad }, theme) => {
-      const full = customMessageText(message.content);
-      const preview = expanded ? { text: full, omitted: false } : collapsedMessageText(full);
-      const box = new Box(Math.max(0, outputPad), 1, (text) => theme.bg("customMessageBg", text));
-      box.addChild(new Text(theme.fg("customMessageLabel", theme.bold(`[${customType}]`)), 0, 0));
-      box.addChild(new Spacer(1));
-      box.addChild(new Markdown(preview.text, 0, 0, getMarkdownTheme(), {
-        color: (text) => theme.fg("customMessageText", text),
-      }));
-      if (preview.omitted) {
+        const full = customMessageText(message.content);
+        const preview = expanded ? { text: full, omitted: false } : collapsedMessageText(full);
+        const box = new Box(Math.max(0, outputPad), 1, (text) => theme.bg("customMessageBg", text));
+        box.addChild(new Text(theme.fg("customMessageLabel", theme.bold(`[${customType}]`)), 0, 0));
         box.addChild(new Spacer(1));
-        box.addChild(new Text(theme.fg("dim", "… message folded; expand tool output to view the full delivery"), 0, 0));
-      }
+        box.addChild(
+          new Markdown(preview.text, 0, 0, getMarkdownTheme(), {
+            color: (text) => theme.fg("customMessageText", text),
+          }),
+        );
+        if (preview.omitted) {
+          box.addChild(new Spacer(1));
+          box.addChild(
+            new Text(theme.fg("dim", "… message folded; expand tool output to view the full delivery"), 0, 0),
+          );
+        }
         return box;
       });
     }
@@ -195,9 +209,11 @@ function registerWorkflowMessageRenderers(pi: ExtensionAPI): void {
     const box = new Box(0, 1, (value) => theme.bg("customMessageBg", value));
     box.addChild(new Text(theme.fg("customMessageLabel", theme.bold("[workflow-agent]")), 0, 0));
     box.addChild(new Spacer(1));
-    box.addChild(new Markdown(preview.text, 0, 0, getMarkdownTheme(), {
-      color: (value) => theme.fg("customMessageText", value),
-    }));
+    box.addChild(
+      new Markdown(preview.text, 0, 0, getMarkdownTheme(), {
+        color: (value) => theme.fg("customMessageText", value),
+      }),
+    );
     if (preview.omitted) {
       box.addChild(new Spacer(1));
       box.addChild(new Text(theme.fg("dim", "… message folded; expand tool output to view the full result"), 0, 0));
@@ -211,8 +227,11 @@ const PROVIDER_WORKFLOW_CUSTOM_TYPES = new Set(["workflow-deliver", "workflow-re
 const WORKFLOW_BRIDGE_QUEUE_LIMIT = 64;
 const WORKFLOW_BRIDGE_DEDUP_LIMIT = 256;
 const WORKFLOW_BRIDGE_PAYLOAD_LIMIT = 32_000;
-const WORKFLOW_BRIDGE_COALESCED_LIMIT = 64_000;
 const WORKFLOW_BRIDGE_IN_FLIGHT_LIMIT = 64;
+/** A terminal record is never displaced by an explicit burst. This bound is
+ * independent of ordinary queue pressure; older terminals remain durable in
+ * the run outbox if the bridge reaches this ceiling. */
+const WORKFLOW_BRIDGE_TERMINAL_LIMIT = 256;
 
 type WorkflowDeliveryDetails = {
   isError?: boolean;
@@ -237,6 +256,7 @@ type WorkflowBridgeDelivery = {
 };
 
 type WorkflowBridge = {
+  manager: WorkflowManager;
   pi: ExtensionAPI;
   suspended: boolean;
   generation: number;
@@ -247,12 +267,31 @@ type WorkflowBridge = {
   awaitingAck: Map<string, WorkflowBridgeDelivery>;
   /** IDs observed in the latest context projection, consumed by before_provider_request. */
   projectedForNextRequest: Array<{ id: string; generation: number }>;
+  /** Included in a provider request; retained until after_provider_response. */
+  includedInProviderRequest: Array<{ id: string; generation: number }>;
 };
 
 type ManagerWithWorkflowBridge = WorkflowManager & { __workflowBridge?: WorkflowBridge };
 
 function bridgeFor(manager: WorkflowManager): WorkflowBridge | undefined {
   return (manager as ManagerWithWorkflowBridge).__workflowBridge;
+}
+
+function persistDeliveryPhase(
+  manager: WorkflowManager,
+  runId: string | undefined,
+  deliveryId: string,
+  generation: number,
+  phase: "submitted" | "projected" | "acknowledged",
+): boolean {
+  if (!runId || typeof manager.acknowledgeDelivery !== "function") return false;
+  try {
+    return manager.acknowledgeDelivery(runId, deliveryId, generation, phase);
+  } catch {
+    // Durable replay remains conservative when a generation is stale or a CAS
+    // loses a race; never turn a provider hook failure into message loss.
+    return false;
+  }
 }
 
 function hashDeliveryId(value: string): string {
@@ -280,11 +319,13 @@ function rememberDelivery(bridge: WorkflowBridge, id: string): void {
 }
 
 function boundedWorkflowContent(content: string): string {
-  if (content.length <= WORKFLOW_BRIDGE_PAYLOAD_LIMIT) return content;
-  const marker = `\n\n[${content.length - WORKFLOW_BRIDGE_PAYLOAD_LIMIT} workflow-delivery characters omitted; inspect the run details for the complete artifact when available]\n\n`;
-  const available = Math.max(0, WORKFLOW_BRIDGE_PAYLOAD_LIMIT - marker.length);
+  if (Buffer.byteLength(content, "utf8") <= WORKFLOW_BRIDGE_PAYLOAD_LIMIT) return content;
+  const marker =
+    "\n\n[workflow-delivery payload omitted; inspect the durable run record for the complete artifact]\n\n";
+  const available = Math.max(0, WORKFLOW_BRIDGE_PAYLOAD_LIMIT - Buffer.byteLength(marker, "utf8"));
   const head = Math.ceil(available * 0.7);
-  return `${content.slice(0, head)}${marker}${content.slice(content.length - (available - head))}`;
+  const tail = available - head;
+  return `${truncateUtf8(content, head, "")}${marker}${truncateUtf8(content.slice(-tail), tail, "")}`;
 }
 
 function normalizedWorkflowDelivery(delivery: WorkflowBridgeDelivery): WorkflowBridgeDelivery {
@@ -299,42 +340,34 @@ function queueWorkflowDelivery(bridge: WorkflowBridge, rawDelivery: WorkflowBrid
     bridge.delivered.has(delivery.id) ||
     bridge.awaitingAck.has(delivery.id) ||
     bridge.pending.some((item) => item.id === delivery.id)
-  ) return;
+  )
+    return;
   if (bridge.pending.length >= WORKFLOW_BRIDGE_QUEUE_LIMIT) {
-    // Terminal results are never folded into an ordinary workflow-deliver item:
-    // preserve their run/status provenance and reserve completion semantics over
-    // bursty explicit messages.
+    const terminals = bridge.pending.filter((item) => item.customType === "workflow-result");
+    // Terminal lifecycle records are never shifted or folded into ordinary
+    // text. Keep them all up to a finite bridge ceiling; the durable outbox is
+    // the recovery path beyond it rather than silently discarding a terminal.
     if (delivery.customType === "workflow-result") {
-      const replaceable = bridge.pending.findIndex((item) => item.customType !== "workflow-result");
-      if (replaceable >= 0) bridge.pending.splice(replaceable, 1);
-      else bridge.pending.shift();
+      if (terminals.length >= WORKFLOW_BRIDGE_TERMINAL_LIMIT) {
+        console.warn("[workflow-delivery] terminal bridge ceiling reached; terminal remains in durable outbox");
+        return;
+      }
       bridge.pending.push(delivery);
       return;
     }
 
-    // Bound both queue cardinality and retained text. Coalesce only explicit
-    // messages; existing terminal results remain independent queue entries.
-    const ordinary = bridge.pending.filter((item) => item.customType !== "workflow-result");
-    const terminals = bridge.pending.filter((item) => item.customType === "workflow-result");
-    if (ordinary.length === 0) return;
-    const combined = [...ordinary, delivery]
-      .map((item) => `[${item.customType}]\n${item.content}`)
-      .join("\n\n");
-    const content =
-      combined.length <= WORKFLOW_BRIDGE_COALESCED_LIMIT
-        ? combined
-        : boundedWorkflowContent(combined.slice(0, WORKFLOW_BRIDGE_COALESCED_LIMIT));
-    bridge.pending = terminals;
-    bridge.pending.push({
-      id: hashDeliveryId(`coalesced:${content}`),
-      customType: "workflow-deliver",
-      content: `Several explicit workflow messages were coalesced while the session was unavailable.\n\n${content}`,
-      details: { isError: ordinary.some((item) => item.details?.isError === true) || delivery.details?.isError === true },
-      wake: ordinary.some((item) => item.wake) || delivery.wake,
-    });
+    // Ordinary explicit records remain durable in the run outbox. Do not
+    // coalesce them into a new, non-durable ID: that would replay the originals
+    // after reload and create duplicate logical continuations. Leave this one
+    // for replay once the current batch drains, while terminals stay queued.
+    console.warn("[workflow-delivery] explicit bridge queue is full; retaining delivery in durable outbox");
     return;
   }
   bridge.pending.push(delivery);
+}
+
+function bridgeManager(bridge: WorkflowBridge): WorkflowManager {
+  return bridge.manager;
 }
 
 function sendWorkflowDeliveryNow(bridge: WorkflowBridge, rawDelivery: WorkflowBridgeDelivery): void {
@@ -349,6 +382,14 @@ function sendWorkflowDeliveryNow(bridge: WorkflowBridge, rawDelivery: WorkflowBr
     return;
   }
   const startedGeneration = bridge.generation;
+  const durable = Boolean(delivery.details?.runId && delivery.details?.deliveryId);
+  if (
+    durable &&
+    !persistDeliveryPhase(bridgeManager(bridge), delivery.details?.runId, delivery.id, startedGeneration, "submitted")
+  ) {
+    queueWorkflowDelivery(bridge, delivery);
+    return;
+  }
   const submitted = {
     ...delivery,
     details: { ...delivery.details, deliveryGeneration: startedGeneration },
@@ -379,13 +420,17 @@ function sendWorkflowDeliveryNow(bridge: WorkflowBridge, rawDelivery: WorkflowBr
     void Promise.resolve(sent).catch((err: unknown) => {
       bridge.awaitingAck.delete(delivery.id);
       queueWorkflowDelivery(bridge, delivery);
-      console.warn(`[workflow-delivery] async send failed; queued for retry: ${err instanceof Error ? err.message : String(err)}`);
+      console.warn(
+        `[workflow-delivery] async send failed; queued for retry: ${err instanceof Error ? err.message : String(err)}`,
+      );
       if (bridge.generation !== startedGeneration && !bridge.suspended) flushWorkflowBridge(bridge);
     });
   } catch (err) {
     bridge.awaitingAck.delete(delivery.id);
     queueWorkflowDelivery(bridge, delivery);
-    console.warn(`[workflow-delivery] send failed; queued for retry: ${err instanceof Error ? err.message : String(err)}`);
+    console.warn(
+      `[workflow-delivery] send failed; queued for retry: ${err instanceof Error ? err.message : String(err)}`,
+    );
   }
 }
 
@@ -401,11 +446,24 @@ function sendWorkflowDelivery(bridge: WorkflowBridge, delivery: WorkflowBridgeDe
 }
 
 function flushWorkflowBridge(bridge: WorkflowBridge): void {
-  if (bridge.suspended || bridge.pending.length === 0) return;
+  if (bridge.suspended) return;
+  replayDurableOutbox(bridge.manager, bridge);
+  if (bridge.pending.length === 0) return;
   const queued = bridge.pending.splice(0, bridge.pending.length);
-  for (const delivery of queued) {
-    if (delivery.customType !== "workflow-agent") sendWorkflowDeliveryNow(bridge, delivery);
+  // One batch selects at most one idle-session wake. Prefer the terminal record
+  // so ordinary explicit messages cannot consume or obscure the terminal wake.
+  const wakeIndex = queued.findIndex((item) => item.wake && item.customType === "workflow-result");
+  const selectedWake = wakeIndex >= 0 ? wakeIndex : queued.findIndex((item) => item.wake);
+  for (let index = 0; index < queued.length; index++) {
+    const delivery = queued[index];
+    if (delivery.customType !== "workflow-agent") {
+      sendWorkflowDeliveryNow(bridge, index === selectedWake ? delivery : { ...delivery, wake: false });
+    }
   }
+  // Queue-full records were intentionally left only in the durable outbox.
+  // Refill bridge capacity after the batch drains; a later safe-point flush
+  // submits them without requiring a session reload.
+  replayDurableOutbox(bridge.manager, bridge);
 }
 
 function suspendWorkflowBridge(manager: WorkflowManager): void {
@@ -416,10 +474,14 @@ function suspendWorkflowBridge(manager: WorkflowManager): void {
   // submission is uncertain and must be retried by the next generation with the
   // same stable ID but a NEW deliveryGeneration. Clear provider-tracking batches
   // so late old-session hooks cannot acknowledge the resend.
+  const included = bridge.includedInProviderRequest
+    .map(({ id }) => bridge.awaitingAck.get(id))
+    .filter((item): item is WorkflowBridgeDelivery => !!item);
   const uncertain = [...bridge.awaitingAck.values()];
   bridge.awaitingAck.clear();
+  bridge.includedInProviderRequest = [];
   bridge.projectedForNextRequest = [];
-  for (const delivery of uncertain) {
+  for (const delivery of [...uncertain, ...included.filter((item) => !uncertain.includes(item))]) {
     queueWorkflowDelivery(bridge, {
       ...delivery,
       details: { ...delivery.details, deliveryGeneration: undefined },
@@ -427,9 +489,43 @@ function suspendWorkflowBridge(manager: WorkflowManager): void {
   }
 }
 
+function replayDurableOutbox(manager: WorkflowManager, bridge: WorkflowBridge): void {
+  if (typeof manager.listPendingDeliveries !== "function") return;
+  for (const record of manager.listPendingDeliveries()) {
+    if (
+      bridge.delivered.has(record.deliveryId) ||
+      bridge.awaitingAck.has(record.deliveryId) ||
+      bridge.pending.some((item) => item.id === record.deliveryId)
+    )
+      continue;
+    const live = manager.getRun(record.runId);
+    const content =
+      record.content ??
+      (live
+        ? live.status === "completed"
+          ? `✓ Background workflow "${record.workflowName}" finished.\n\n↳ Full result and subagent reports: ${manager.getPersistence().getRunsDir()}/${record.runId}.json`
+          : `✗ Background workflow ${record.runId} ${record.runStatus}.\n\n↳ Full result and subagent reports: ${manager.getPersistence().getRunsDir()}/${record.runId}.json`
+        : `Background workflow ${record.runId} ${record.runStatus}; inspect the durable run record for the complete result.`);
+    queueWorkflowDelivery(bridge, {
+      id: record.deliveryId,
+      customType: record.kind === "terminal" ? "workflow-result" : "workflow-deliver",
+      content,
+      details: {
+        notificationKind: record.kind === "terminal" ? "workflow-result" : "workflow-message",
+        runId: record.runId,
+        sequence: record.sequence,
+        deliveryId: record.deliveryId,
+        status: record.kind === "terminal" ? (record.runStatus === "failed" ? "failed" : "completed") : undefined,
+      },
+      wake: true,
+    });
+  }
+}
+
 function resumeWorkflowBridge(manager: WorkflowManager): void {
   const bridge = bridgeFor(manager);
   if (!bridge) return;
+  replayDurableOutbox(manager, bridge);
   bridge.suspended = false;
   flushWorkflowBridge(bridge);
 }
@@ -439,9 +535,11 @@ function deliverWorkflowResult(manager: WorkflowManager, payload: WorkflowDelive
   if (!bridge) return;
   const sequence = payload.details?.sequence ?? bridge.nextEventSeq++;
   sendWorkflowDelivery(bridge, {
-    id: hashDeliveryId(
-      `result:${payload.details?.runId ?? "unknown"}:${payload.details?.status ?? "completed"}:${payload.content}`,
-    ),
+    id:
+      payload.details?.deliveryId ??
+      hashDeliveryId(
+        `result:${payload.details?.runId ?? "unknown"}:${payload.details?.status ?? "completed"}:${payload.content}`,
+      ),
     customType: "workflow-result",
     content: payload.content,
     details: { ...payload.details, notificationKind: "workflow-result", sequence },
@@ -451,22 +549,27 @@ function deliverWorkflowResult(manager: WorkflowManager, payload: WorkflowDelive
 
 function bindDeliverBridge(manager: WorkflowManager, pi: ExtensionAPI): void {
   const target = manager as ManagerWithWorkflowBridge;
-  const bridge = target.__workflowBridge ?? {
-    pi,
-    // The extension factory runs before bindCore. Do not call the old pi
-    // during that window; session_start explicitly resumes this generation.
-    suspended: true,
-    generation: 0,
-    nextEventSeq: 0,
-    pending: [],
-    delivered: new Set<string>(),
-    awaitingAck: new Map<string, WorkflowBridgeDelivery>(),
-    projectedForNextRequest: [],
-  } satisfies WorkflowBridge;
+  const bridge =
+    target.__workflowBridge ??
+    ({
+      manager,
+      pi,
+      // The extension factory runs before bindCore. Do not call the old pi
+      // during that window; session_start explicitly resumes this generation.
+      suspended: true,
+      generation: 0,
+      nextEventSeq: 0,
+      pending: [],
+      delivered: new Set<string>(),
+      awaitingAck: new Map<string, WorkflowBridgeDelivery>(),
+      projectedForNextRequest: [],
+      includedInProviderRequest: [],
+    } satisfies WorkflowBridge);
   // Backfill fields when handing off a manager created by an older extension
   // generation that predates batching support.
   bridge.awaitingAck ??= new Map<string, WorkflowBridgeDelivery>();
   bridge.projectedForNextRequest ??= [];
+  bridge.includedInProviderRequest ??= [];
   // Handoff from the short-lived batching implementation: cancel and discard
   // retained automatic reports so no stale timer can bypass the new default.
   const legacy = bridge as WorkflowBridge & {
@@ -483,6 +586,7 @@ function bindDeliverBridge(manager: WorkflowManager, pi: ExtensionAPI): void {
     if (delivery.customType === "workflow-agent") bridge.awaitingAck.delete(id);
   }
   bridge.projectedForNextRequest = bridge.projectedForNextRequest.filter(({ id }) => bridge.awaitingAck.has(id));
+  bridge.manager = manager;
   bridge.pi = pi;
   bridge.generation += 1;
   bridge.suspended = true;
@@ -492,10 +596,15 @@ function bindDeliverBridge(manager: WorkflowManager, pi: ExtensionAPI): void {
     const content = typeof message === "string" ? message : String(message ?? "");
     const sequence = bridge.nextEventSeq++;
     sendWorkflowDelivery(bridge, {
-      id: hashDeliveryId(`deliver:${source?.runId ?? "unknown"}:${sequence}:${content}`),
+      id: source?.deliveryId ?? hashDeliveryId(`deliver:${source?.runId ?? "unknown"}:${sequence}:${content}`),
       customType: "workflow-deliver",
       content,
-      details: { notificationKind: "workflow-message", runId: source?.runId, sequence },
+      details: {
+        notificationKind: "workflow-message",
+        runId: source?.runId,
+        sequence: source?.sequence ?? sequence,
+        deliveryId: source?.deliveryId,
+      },
       // Explicit child→parent deliveries are important and wake the parent.
       wake: true,
     });
@@ -670,16 +779,35 @@ function installWorkflowToolResultContextBridge(pi: ExtensionAPI, getManager: ()
       if (message.customType === "workflow-agent") continue;
 
       const rawText = customMessageText(message.content) || "(empty workflow delivery)";
-      const text = providerWorkflowDeliveryText(message.customType, rawText);
-      const details = (message.details && typeof message.details === "object"
-        ? message.details
-        : {}) as WorkflowDeliveryDetails;
+      const text = boundedWorkflowContent(providerWorkflowDeliveryText(message.customType, rawText));
+      const sourceDetails = (
+        message.details && typeof message.details === "object" ? message.details : {}
+      ) as WorkflowDeliveryDetails;
+      const boundedDetail = (value: unknown, bytes: number): string | undefined =>
+        typeof value === "string" ? truncateUtf8(value, bytes, "…") : undefined;
+      const details: WorkflowDeliveryDetails = {
+        notificationKind: boundedDetail(
+          sourceDetails.notificationKind,
+          64,
+        ) as WorkflowDeliveryDetails["notificationKind"],
+        status: boundedDetail(sourceDetails.status, 32) as WorkflowDeliveryDetails["status"],
+        runId: boundedDetail(sourceDetails.runId, 256),
+        agentId: boundedDetail(sourceDetails.agentId, 256),
+        label: boundedDetail(sourceDetails.label, 512),
+        deliveryId: boundedDetail(sourceDetails.deliveryId, 256),
+        deliveryGeneration: Number.isSafeInteger(sourceDetails.deliveryGeneration)
+          ? sourceDetails.deliveryGeneration
+          : undefined,
+        sequence: Number.isSafeInteger(sourceDetails.sequence) ? sourceDetails.sequence : undefined,
+      };
       // Bridge-originated notifications carry a stable delivery ID across
       // generation retries. Legacy persisted messages fall back to a stable
       // content/timestamp/index digest.
-      const toolCallId = details.deliveryId ?? hashDeliveryId(
-        `${message.customType}:${typeof message.timestamp === "number" ? message.timestamp : ""}:${messageIndex}:${rawText}`,
-      );
+      const toolCallId =
+        details.deliveryId ??
+        hashDeliveryId(
+          `${message.customType}:${typeof message.timestamp === "number" ? message.timestamp : ""}:${messageIndex}:${rawText}`,
+        );
       // Context projection is not yet provider acceptance. Record the stable ID
       // and submission generation; before_provider_request promotes this exact
       // batch, and after_provider_response acknowledges only a successful HTTP
@@ -761,16 +889,36 @@ function installWorkflowToolResultContextBridge(pi: ExtensionAPI, getManager: ()
     const bridge = bridgeFor(getManager());
     if (!bridge || bridge.projectedForNextRequest.length === 0) return;
     const batch = bridge.projectedForNextRequest.splice(0, bridge.projectedForNextRequest.length);
-    // This is the strongest acknowledgement Pi exposes: the generation-matching
-    // custom entry survived queueing, was projected as a tool result, and is in
-    // the payload about to be submitted. If transport later fails, Pi's retained
-    // session entry remains in subsequent context; independently resending the
-    // custom notification would create a duplicate logical continuation.
+    // before_provider_request acknowledges inclusion only. Keep each stable ID
+    // until after_provider_response so a failed/uncertain transport retries it.
     for (const item of batch) {
       const awaiting = bridge.awaitingAck.get(item.id);
       if (awaiting?.details?.deliveryGeneration !== item.generation) continue;
-      bridge.awaitingAck.delete(item.id);
+      const durable = Boolean(awaiting.details?.runId && awaiting.details?.deliveryId);
+      if (
+        durable &&
+        !persistDeliveryPhase(bridge.manager, awaiting.details?.runId, item.id, item.generation, "projected")
+      )
+        continue;
+      bridge.includedInProviderRequest.push(item);
       bridge.pending = bridge.pending.filter((delivery) => delivery.id !== item.id);
+    }
+    flushWorkflowBridge(bridge);
+  });
+  pi.on("after_provider_response", () => {
+    const bridge = bridgeFor(getManager());
+    if (!bridge || bridge.includedInProviderRequest.length === 0) return;
+    const included = bridge.includedInProviderRequest.splice(0, bridge.includedInProviderRequest.length);
+    for (const item of included) {
+      const awaiting = bridge.awaitingAck.get(item.id);
+      if (awaiting?.details?.deliveryGeneration !== item.generation) continue;
+      const durable = Boolean(awaiting.details?.runId && awaiting.details?.deliveryId);
+      if (
+        durable &&
+        !persistDeliveryPhase(bridge.manager, awaiting.details?.runId, item.id, item.generation, "acknowledged")
+      )
+        continue;
+      bridge.awaitingAck.delete(item.id);
       rememberDelivery(bridge, item.id);
     }
     flushWorkflowBridge(bridge);
@@ -868,23 +1016,31 @@ export default function extension(pi: ExtensionAPI) {
       name: "workflow_send",
       label: "Workflow Send",
       description:
-        "Send a narrowly scoped correction or current-state fact to a running workflow without replacing its assigned task. With agentId, deliver immediately to that live subagent; without it, queue for the next subagent call. The message must preserve the original objective and completion criteria, tell the recipient to continue the existing task, and must not ask for a mere acknowledgement, redirect it to a different task, or treat its reply as proof of completion.",
-      promptSnippet:
-        "Send a non-directive correction or current-state update that preserves a running workflow subagent's original task.",
+        "Send relevant follow-up context, a correction, or a changed fact to a running workflow. With agentId, deliver immediately to that live subagent; otherwise queue it for the workflow's next subagent call.",
+      promptSnippet: "Send relevant follow-up context to a running workflow or live subagent.",
       promptGuidelines: [
-        "Use only to supply a relevant correction, changed repository fact, conflict warning, or constraint needed to finish the already-assigned task.",
-        "Do not use this tool to replace, broaden, reprioritize, or prematurely terminate the subagent's task; start another workflow or let the orchestrator assign new work instead.",
-        "Phrase the message so the subagent continues its original task and validates its original completion criteria. Never send a bare notification or request an acknowledgement, because a reply can end the current agent() call.",
-        "Use agentId only for an immediate targeted correction to a live subagent. Without agentId, the message is queued for the running workflow's next subagent call.",
+        "Use for information that helps the workflow complete its existing assignment, such as a correction, changed repository fact, answer to a blocker, or conflict warning.",
+        "Messages are peer-session context, not user approval or permission. Do not use them to relay a denied action or replace the workflow's assignment.",
+        "Use agentId for a live targeted message. Without agentId, the message is queued for the running workflow's next subagent call.",
       ],
       parameters: Type.Object({
         message: Type.String({
           minLength: 1,
-          description:
-            "Correction or current-state fact relevant to the existing assignment. Preserve its original objective; explicitly tell the recipient to continue and complete that assignment rather than merely acknowledge this message. Do not introduce a different task.",
+          description: "Relevant follow-up context, correction, changed fact, blocker answer, or conflict warning.",
         }),
-        runId: Type.Optional(Type.String({ minLength: 1, description: "Specific workflow run ID; omit when agentId identifies the target." })),
-        agentId: Type.Optional(Type.String({ minLength: 1, description: "Exact live subagent ID for an immediate in-scope correction; omit to queue for the next subagent call." })),
+        runId: Type.Optional(
+          Type.String({
+            minLength: 1,
+            description: "Specific workflow run ID; omit when agentId identifies the target.",
+          }),
+        ),
+        agentId: Type.Optional(
+          Type.String({
+            minLength: 1,
+            description:
+              "Exact live subagent ID for an immediate in-scope correction; omit to queue for the next subagent call.",
+          }),
+        ),
       }),
       async execute(_toolCallId, params) {
         if (params.agentId) {
@@ -903,7 +1059,12 @@ export default function extension(pi: ExtensionAPI) {
           throw new Error(params.runId ? `Workflow ${params.runId} is not running` : "No running workflow");
         }
         return {
-          content: [{ type: "text", text: `Queued message for workflow ${queuedRunId}; it will be injected into the next subagent call.` }],
+          content: [
+            {
+              type: "text",
+              text: `Queued message for workflow ${queuedRunId}; it will be injected into the next subagent call.`,
+            },
+          ],
           details: { runId: queuedRunId, agentId: "", message: params.message, mode: "next-agent" },
         };
       },

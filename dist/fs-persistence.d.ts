@@ -38,7 +38,7 @@ export declare function defaultPersistenceFs(): PersistenceFsLayer;
 export declare function resolvePersistenceFs(overrides?: Partial<PersistenceFsLayer>): PersistenceFsLayer;
 /** Ensure `dir` exists (recursive mkdir), idempotent. */
 export declare function ensureDir(fs: PersistenceFsLayer, dir: string): void;
-export declare function writeJsonAtomicWithBackup(fs: PersistenceFsLayer, path: string, data: unknown): void;
+export declare function writeJsonAtomicWithBackup(fs: PersistenceFsLayer, path: string, data: unknown, maxBytes?: number): void;
 /**
  * Read JSON from `path`, falling back to `path.bak` if the primary is
  * missing or fails to parse. Returns null if neither candidate parses.

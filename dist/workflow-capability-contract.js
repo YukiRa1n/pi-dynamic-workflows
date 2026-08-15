@@ -255,9 +255,7 @@ const capabilities = [
     runtimeGlobal("log", { signature: "log(message) => void" }),
     runtimeGlobal("deliver", {
         signature: "deliver(message) => Promise<void>",
-        constraints: [
-            "delivers a message into the host conversation when the host wired onDeliver; no-op otherwise",
-        ],
+        constraints: ["delivers a message into the host conversation when the host wired onDeliver; no-op otherwise"],
     }),
     runtimeGlobal("phase", {
         signature: "phase(title, options?) => void",
@@ -286,11 +284,17 @@ const capabilities = [
         "resolves a project/user saved workflow first, then one of the 5 built-in patterns",
         "mutually exclusive with resumeFromRunId",
     ]),
-    toolInput("args", "args?: Record<string, unknown>", ["top-level JSON object; built-in workflows consume named fields"]),
+    toolInput("args", "args?: Record<string, unknown>", [
+        "top-level JSON object; built-in workflows consume named fields",
+    ]),
     toolInput("maxAgents", "maxAgents?: number = 1000", ["default, not a hard product maximum"]),
     toolInput("concurrency", "concurrency?: number", ["runtime clamps to 1..16"]),
     toolInput("agentRetries", "agentRetries?: number = configured value or 0", ["floored and clamped to 0..3"]),
-    toolInput("agentTimeoutMs", "agentTimeoutMs?: number = configured default or unbounded"),
+    toolInput("agentTimeoutMs", "agentTimeoutMs?: number = configured default or no per-agent limit"),
+    toolInput("workflowTimeoutMs", "workflowTimeoutMs?: number = 30 minute default, up to 24 hours", [
+        "finite logical deadline for the complete workflow frame",
+        "cannot interrupt a pending Promise or a microtask-starved event loop",
+    ]),
     toolInput("tokenBudget", "tokenBudget?: number = configured default or unlimited", [
         "soft pre-call gate; in-flight work can overshoot",
     ]),

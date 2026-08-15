@@ -26,6 +26,7 @@ import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import { getAgentDir, parseFrontmatter } from "@earendil-works/pi-coding-agent";
 import { AGENTS_DIR } from "./config.js";
+import { serializeIdentity } from "./safe-serialize.js";
 
 export interface AgentDefinition {
   /** Stable identity used as the `agentType` value. */
@@ -206,7 +207,7 @@ export function applyToolPolicy<T extends { name: string }>(tools: T[], allow?: 
  */
 export function agentDefinitionKey(def: AgentDefinition | undefined): string | null {
   if (!def) return null;
-  return JSON.stringify({
+  return serializeIdentity({
     tools: def.tools ?? null,
     disallowedTools: def.disallowedTools ?? null,
     model: def.model ?? null,

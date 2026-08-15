@@ -5,17 +5,21 @@
 import { EventEmitter } from "node:events";
 import type { ModelRegistry, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { WorkflowAgent } from "./agent.js";
+import { DEFAULT_MAX_PAUSED_RUNS_IN_MEMORY, DEFAULT_WORKFLOW_TIMEOUT_MS, MAX_AGENT_PROMPT_BYTES } from "./config.js";
 import { preview, type WorkflowAgentSnapshot, type WorkflowSnapshot } from "./display.js";
 import { isProviderUsageLimit, WorkflowError, WorkflowErrorCode } from "./errors.js";
 import {
   assertSafeRunId,
   createRunPersistence,
+  type DeliveryBudgetState,
   generateRunId,
+  type PersistedDeliveryRecord,
   type PersistedRunState,
   type RunLease,
   type RunPersistence,
   type RunStatus,
 } from "./run-persistence.js";
+import { serializeIdentity } from "./safe-serialize.js";
 import { type JournalEntry, parseWorkflowScript, runWorkflow, type WorkflowRunResult } from "./workflow.js";
 
 export interface ManagedRun {
@@ -115,6 +119,8 @@ export interface ManagedRun {
    * CURRENT defaultAgentTimeoutMs.
    */
   agentTimeoutMs?: number | null;
+  /** Finite logical wall-clock deadline, fixed at run start and carried through resume. */
+  workflowTimeoutMs?: number;
   /**
    * The run's resolved concurrency (per-run value, else the manager's
    * concurrency at the time), fixed at run start/resume for the same reason
@@ -131,6 +137,12 @@ export interface ManagedRun {
   revision?: number;
   /** Stop already emitted its lifecycle event; prevents success/abort duplicates. */
   stopRequested?: boolean;
+  /** Durable explicit/terminal delivery records for this run. */
+  deliveryOutbox: PersistedDeliveryRecord[];
+  /** Monotonic stable-ID sequence, retained after acknowledgements remove records. */
+  nextDeliverySequence: number;
+  /** Finite explicit-delivery accounting, retained after acknowledgements. */
+  deliveryBudget: DeliveryBudgetState;
 }
 
 /** Per-execution options shared by sync, background, and resume runs. */
@@ -143,8 +155,10 @@ export interface ExecOptions {
   resumeJournal?: Map<string, JournalEntry>;
   /** Cap on total agents for this run. */
   maxAgents?: number;
-  /** Per-agent timeout in milliseconds. null/omitted means no hard timeout. */
+  /** Per-agent timeout in milliseconds. null/omitted means no per-agent hard timeout. */
   agentTimeoutMs?: number | null;
+  /** Finite logical wall-clock deadline for this execution. */
+  workflowTimeoutMs?: number;
   /** Host signal (e.g. tool/Esc) that should abort this run when fired. */
   externalSignal?: AbortSignal;
   /** Called with the live snapshot on every progress event. */
@@ -211,8 +225,10 @@ export interface WorkflowManagerOptions {
   modelRegistry?: ModelRegistry;
   /** The pi session id to tag runs with (see setSessionId). */
   sessionId?: string;
-  /** Default per-agent timeout when a run does not pass agentTimeoutMs. null means no hard timeout. */
+  /** Default per-agent timeout when a run does not pass agentTimeoutMs. null means no per-agent hard timeout. */
   defaultAgentTimeoutMs?: number | null;
+  /** Default finite logical wall-clock deadline for a workflow frame. */
+  defaultWorkflowTimeoutMs?: number;
   /** Default retry attempts after recoverable agent failures. */
   defaultAgentRetries?: number;
   /** Default hard token budget when a run does not pass tokenBudget. null/omitted means no budget. */
@@ -234,9 +250,13 @@ export interface WorkflowManagerOptions {
   /**
    * Bridge for the workflow runtime's deliver(message) global. Host wiring
    * (extensions/workflow.ts) sets this per generation so messages land in the
-   * current session's conversation.
+   * current session's conversation. Delivery identity is supplied by the
+   * manager's durable outbox and must be preserved by the host.
    */
-  onDeliver?: (message: string, source?: { runId: string; workflowName: string }) => void | Promise<void>;
+  onDeliver?: (
+    message: string,
+    source?: { runId: string; workflowName: string; deliveryId?: string; sequence?: number },
+  ) => void | Promise<void>;
   /** Optional observer for each live subagent result. Hosts should normally keep this persistence/UI-only. */
   onAgentMessage?: (event: {
     runId: string;
@@ -259,6 +279,8 @@ export interface WorkflowManagerOptions {
    * to observe eviction without creating dozens of runs.
    */
   maxTerminalRunsInMemory?: number;
+  /** How many settled paused run snapshots to retain in memory; disk remains resumable. */
+  maxPausedRunsInMemory?: number;
 }
 
 /** Options that a fresh extension generation may safely refresh on a live
@@ -269,6 +291,7 @@ export type WorkflowManagerReloadOptions = Pick<
   | "concurrency"
   | "loadSavedWorkflow"
   | "defaultAgentTimeoutMs"
+  | "defaultWorkflowTimeoutMs"
   | "defaultAgentRetries"
   | "defaultTokenBudget"
   | "toolsets"
@@ -299,6 +322,35 @@ const IN_MEMORY_TERMINAL_STATUSES: ReadonlySet<RunStatus> = new Set(["completed"
  * memory-retention mitigation in agent.ts).
  */
 const DEFAULT_MAX_TERMINAL_RUNS_IN_MEMORY = 20;
+const MAX_IN_MEMORY_RETENTION = 10_000;
+function boundedRetention(value: number | undefined, fallback: number): number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0
+    ? Math.min(value, MAX_IN_MEMORY_RETENTION)
+    : fallback;
+}
+
+/** Explicit deliver() admission budgets. Terminal lifecycle records do not
+ * consume these budgets and are always admitted with priority. */
+export const MAX_EXPLICIT_DELIVERIES_PER_RUN = 32;
+export const MAX_EXPLICIT_DELIVERY_BYTES_PER_RUN = 256 * 1024;
+export const MAX_EXPLICIT_DELIVERIES_PER_WINDOW = 8;
+export const EXPLICIT_DELIVERY_RATE_WINDOW_MS = 10_000;
+
+function freshDeliveryBudget(now = Date.now()): DeliveryBudgetState {
+  return { explicitCount: 0, explicitBytes: 0, windowStartedAt: now, windowCount: 0 };
+}
+
+function stableDeliveryId(runId: string, sequence: number): string {
+  let left = 2166136261;
+  let right = 0x9e3779b9;
+  const value = `${runId}:${sequence}`;
+  for (let i = 0; i < value.length; i++) {
+    const code = value.charCodeAt(i);
+    left = Math.imul(left ^ code, 16777619);
+    right = Math.imul(right ^ (code + i), 2246822519);
+  }
+  return `wf_${(left >>> 0).toString(16).padStart(8, "0")}${(right >>> 0).toString(16).padStart(8, "0")}`;
+}
 
 export class WorkflowManager extends EventEmitter {
   /**
@@ -350,7 +402,9 @@ export class WorkflowManager extends EventEmitter {
    * are harmless.
    */
   private terminalRunQueue: string[] = [];
+  private pausedRunQueue: string[] = [];
   private maxTerminalRunsInMemory: number;
+  private maxPausedRunsInMemory: number;
   private activitySeq = 0;
   private persistence: RunPersistence;
   private cwd: string;
@@ -364,13 +418,17 @@ export class WorkflowManager extends EventEmitter {
   /** The current pi session id; runs are stamped with it and listRuns() filters by it. */
   private sessionId?: string;
   private defaultAgentTimeoutMs: number | null;
+  private defaultWorkflowTimeoutMs: number;
   private defaultAgentRetries: number;
   private defaultTokenBudget: number | null;
   private toolsets?: Record<string, () => ToolDefinition[]>;
   private excludeSubagentTools?: string[];
   private persistAgentSessions: boolean;
   /** Runtime deliver() bridge; refreshed by host wiring each generation. */
-  onDeliver?: (message: string, source?: { runId: string; workflowName: string }) => void | Promise<void>;
+  onDeliver?: (
+    message: string,
+    source?: { runId: string; workflowName: string; deliveryId?: string; sequence?: number },
+  ) => void | Promise<void>;
   /** Optional host observer for live subagent results; not provider delivery by default. */
   onAgentMessage?: WorkflowManagerOptions["onAgentMessage"];
   private pendingMessages = new Map<string, string[]>();
@@ -394,6 +452,7 @@ export class WorkflowManager extends EventEmitter {
     this.modelRegistry = options.modelRegistry;
     this.sessionId = options.sessionId;
     this.defaultAgentTimeoutMs = options.defaultAgentTimeoutMs ?? null;
+    this.defaultWorkflowTimeoutMs = options.defaultWorkflowTimeoutMs ?? DEFAULT_WORKFLOW_TIMEOUT_MS;
     this.defaultAgentRetries = options.defaultAgentRetries ?? 0;
     this.defaultTokenBudget = options.defaultTokenBudget ?? null;
     this.toolsets = options.toolsets;
@@ -401,7 +460,11 @@ export class WorkflowManager extends EventEmitter {
     this.persistAgentSessions = options.persistAgentSessions ?? false;
     this.onDeliver = options.onDeliver;
     this.onAgentMessage = options.onAgentMessage;
-    this.maxTerminalRunsInMemory = options.maxTerminalRunsInMemory ?? DEFAULT_MAX_TERMINAL_RUNS_IN_MEMORY;
+    this.maxTerminalRunsInMemory = boundedRetention(
+      options.maxTerminalRunsInMemory,
+      DEFAULT_MAX_TERMINAL_RUNS_IN_MEMORY,
+    );
+    this.maxPausedRunsInMemory = boundedRetention(options.maxPausedRunsInMemory, DEFAULT_MAX_PAUSED_RUNS_IN_MEMORY);
     this.persistence = createRunPersistence(this.cwd);
     this.recoverStaleRuns();
   }
@@ -500,6 +563,7 @@ export class WorkflowManager extends EventEmitter {
    */
   private recoverStaleRuns(): void {
     for (const p of this.listAllRuns()) {
+      if (this.sessionId && p.sessionId !== this.sessionId) continue;
       if (p.status === "running" && !this.runs.has(p.runId)) {
         try {
           const lease = this.persistence.acquireRunLease(p.runId);
@@ -532,6 +596,7 @@ export class WorkflowManager extends EventEmitter {
     this.concurrency = options.concurrency ?? 8;
     this.loadSavedWorkflow = options.loadSavedWorkflow;
     this.defaultAgentTimeoutMs = options.defaultAgentTimeoutMs ?? null;
+    this.defaultWorkflowTimeoutMs = options.defaultWorkflowTimeoutMs ?? DEFAULT_WORKFLOW_TIMEOUT_MS;
     this.defaultAgentRetries = options.defaultAgentRetries ?? 0;
     this.defaultTokenBudget = options.defaultTokenBudget ?? null;
     this.toolsets = options.toolsets;
@@ -567,6 +632,7 @@ export class WorkflowManager extends EventEmitter {
     exec: ExecOptions = {},
   ): { runId: string; promise: Promise<WorkflowRunResult> } {
     const parsed = parseWorkflowScript(script);
+    const admittedArgs = this.admitArgs(args);
     const slug = parsed.meta.name
       ? parsed.meta.name
           .toLowerCase()
@@ -596,7 +662,7 @@ export class WorkflowManager extends EventEmitter {
       controller,
       startedAt: new Date(),
       script,
-      args,
+      args: admittedArgs,
       journal: [],
       background: true,
       sessionId: this.sessionId,
@@ -611,12 +677,16 @@ export class WorkflowManager extends EventEmitter {
       // manager's current defaults (see ManagedRun doc comments).
       maxAgents: exec.maxAgents,
       agentTimeoutMs: exec.agentTimeoutMs !== undefined ? exec.agentTimeoutMs : this.defaultAgentTimeoutMs,
+      workflowTimeoutMs: exec.workflowTimeoutMs ?? this.defaultWorkflowTimeoutMs,
       concurrency: exec.concurrency !== undefined ? exec.concurrency : this.concurrency,
       agentRetries: exec.agentRetries !== undefined ? exec.agentRetries : this.defaultAgentRetries,
       activitySeq: ++this.activitySeq,
       agentTimestamps: new Map(),
       agentsById: new Map(),
       executionSettled: false,
+      deliveryOutbox: [],
+      nextDeliverySequence: 0,
+      deliveryBudget: freshDeliveryBudget(),
     };
 
     this.runs.set(runId, managed);
@@ -628,7 +698,7 @@ export class WorkflowManager extends EventEmitter {
         runId,
         workflowName: parsed.meta.name,
         script,
-        args,
+        args: admittedArgs,
         sessionId: managed.sessionId,
         status: "running",
         phases: managed.snapshot.phases,
@@ -641,8 +711,12 @@ export class WorkflowManager extends EventEmitter {
         toolset: managed.toolset,
         maxAgents: managed.maxAgents,
         agentTimeoutMs: managed.agentTimeoutMs,
+        workflowTimeoutMs: managed.workflowTimeoutMs,
         concurrency: managed.concurrency,
         agentRetries: managed.agentRetries,
+        deliveryOutbox: managed.deliveryOutbox,
+        nextDeliverySequence: managed.nextDeliverySequence,
+        deliveryBudget: managed.deliveryBudget,
       };
       this.persistence.save(initialState, undefined, lease);
       managed.revision = initialState.revision;
@@ -658,11 +732,13 @@ export class WorkflowManager extends EventEmitter {
     // already records status/event/persist, but the promise still rejects.
     // The original promise is returned so callers can await it in try/catch.
     managed.executionSettled = false;
-    const promise = this.executeRun(managed, script, args, exec);
+    const promise = this.executeRun(managed, script, admittedArgs, exec);
     managed.execution = promise;
-    void promise.finally(() => {
-      managed.executionSettled = true;
-    }).catch(() => {});
+    void promise
+      .finally(() => {
+        managed.executionSettled = true;
+      })
+      .catch(() => {});
     promise.catch(() => {});
 
     return { runId, promise };
@@ -675,7 +751,8 @@ export class WorkflowManager extends EventEmitter {
    * a caller (e.g. the workflow tool) drive its own inline display.
    */
   async runSync(script: string, args?: unknown, exec: ExecOptions = {}): Promise<WorkflowRunResult> {
-    const managed = this.createManaged(script, args);
+    const admittedArgs = this.admitArgs(args);
+    const managed = this.createManaged(script, admittedArgs);
     const lease = this.persistence.acquireRunLease(managed.runId);
     if (!lease) throw new Error(`Could not acquire workflow run lease for ${managed.runId}`);
     managed.lease = lease;
@@ -685,6 +762,7 @@ export class WorkflowManager extends EventEmitter {
     // Same freeze-at-start pattern as tokenBudget (see startInBackground/ManagedRun).
     managed.maxAgents = exec.maxAgents;
     managed.agentTimeoutMs = exec.agentTimeoutMs !== undefined ? exec.agentTimeoutMs : this.defaultAgentTimeoutMs;
+    managed.workflowTimeoutMs = exec.workflowTimeoutMs ?? this.defaultWorkflowTimeoutMs;
     managed.concurrency = exec.concurrency !== undefined ? exec.concurrency : this.concurrency;
     managed.agentRetries = exec.agentRetries !== undefined ? exec.agentRetries : this.defaultAgentRetries;
     this.runs.set(managed.runId, managed);
@@ -706,12 +784,34 @@ export class WorkflowManager extends EventEmitter {
     // synchronously up to its first await, and stop() may observe the run in
     // that same turn.
     managed.executionSettled = false;
-    const execution = this.executeRun(managed, script, args, exec);
+    const execution = this.executeRun(managed, script, admittedArgs, exec);
     managed.execution = execution;
-    void execution.finally(() => {
-      managed.executionSettled = true;
-    }).catch(() => {});
+    void execution
+      .finally(() => {
+        managed.executionSettled = true;
+      })
+      .catch(() => {});
     return execution;
+  }
+
+  private admitArgs(args: unknown): unknown {
+    if (args === undefined) return undefined;
+    try {
+      const json = serializeIdentity(args, {
+        maxBytes: MAX_AGENT_PROMPT_BYTES,
+        maxItems: 100_000,
+        maxNodes: 100_000,
+        maxDepth: 128,
+        maxStringBytes: MAX_AGENT_PROMPT_BYTES,
+      });
+      return JSON.parse(json);
+    } catch (error) {
+      throw new WorkflowError(
+        `Workflow args must be finite plain JSON within ${MAX_AGENT_PROMPT_BYTES} UTF-8 bytes: ${error instanceof Error ? error.message : String(error)}`,
+        WorkflowErrorCode.RESOURCE_LIMIT_EXCEEDED,
+        { recoverable: false },
+      );
+    }
   }
 
   /** Build a fresh managed run with an empty snapshot. */
@@ -750,7 +850,168 @@ export class WorkflowManager extends EventEmitter {
       agentTimestamps: new Map(),
       agentsById: new Map(),
       executionSettled: false,
+      deliveryOutbox: [],
+      nextDeliverySequence: 0,
+      deliveryBudget: freshDeliveryBudget(),
     };
+  }
+
+  /** Admit an explicit deliver() call into the durable outbox. The counters
+   * are cumulative for the run, while the sliding window bounds continuation
+   * storms. Terminal notifications intentionally bypass this admission path. */
+  private admitExplicitDelivery(managed: ManagedRun, message: string): PersistedDeliveryRecord {
+    const content = typeof message === "string" ? message : String(message ?? "");
+    const bytes = Buffer.byteLength(content, "utf8");
+    const now = Date.now();
+    const budget = managed.deliveryBudget;
+    if (now - budget.windowStartedAt >= EXPLICIT_DELIVERY_RATE_WINDOW_MS) {
+      budget.windowStartedAt = now;
+      budget.windowCount = 0;
+    }
+    if (
+      budget.explicitCount >= MAX_EXPLICIT_DELIVERIES_PER_RUN ||
+      budget.explicitBytes + bytes > MAX_EXPLICIT_DELIVERY_BYTES_PER_RUN ||
+      budget.windowCount >= MAX_EXPLICIT_DELIVERIES_PER_WINDOW
+    ) {
+      throw new WorkflowError(
+        "Explicit delivery budget exceeded; terminal lifecycle delivery remains reserved",
+        WorkflowErrorCode.DELIVERY_BUDGET_EXCEEDED,
+        { recoverable: true },
+      );
+    }
+    const sequence = managed.nextDeliverySequence++;
+    const delivery: PersistedDeliveryRecord = {
+      deliveryId: stableDeliveryId(managed.runId, sequence),
+      sequence,
+      kind: "explicit",
+      status: "pending",
+      content,
+      createdAt: new Date(now).toISOString(),
+    };
+    budget.explicitCount++;
+    budget.explicitBytes += bytes;
+    budget.windowCount++;
+    managed.deliveryOutbox.push(delivery);
+    try {
+      this.persistRunStrict(managed);
+    } catch (error) {
+      managed.deliveryOutbox.pop();
+      managed.nextDeliverySequence--;
+      budget.explicitCount--;
+      budget.explicitBytes -= bytes;
+      budget.windowCount--;
+      throw error;
+    }
+    return delivery;
+  }
+
+  /** Reserve one terminal record before publishing terminal state. It is
+   * idempotent, so duplicate lifecycle events cannot create duplicate wakes. */
+  private ensureTerminalDelivery(managed: ManagedRun): PersistedDeliveryRecord | undefined {
+    if (!managed.background || (managed.status !== "completed" && managed.status !== "failed")) return undefined;
+    const existing = managed.deliveryOutbox.find((item) => item.terminal);
+    if (existing) return existing;
+    const sequence = managed.nextDeliverySequence++;
+    const delivery: PersistedDeliveryRecord = {
+      deliveryId: stableDeliveryId(managed.runId, sequence),
+      sequence,
+      kind: "terminal",
+      status: "pending",
+      terminal: true,
+      createdAt: new Date().toISOString(),
+    };
+    managed.deliveryOutbox.push(delivery);
+    return delivery;
+  }
+
+  private persistRunStrict(managed: ManagedRun): void {
+    if (!this.isCurrent(managed))
+      throw new WorkflowError("Workflow execution is stale", WorkflowErrorCode.PERSISTENCE_ERROR);
+    const timer = this.persistTimers.get(managed.runId);
+    if (timer) {
+      clearTimeout(timer);
+      this.persistTimers.delete(managed.runId);
+    }
+    if (!this.writeRunToDisk(managed, true)) {
+      throw new WorkflowError("Could not durably persist workflow delivery", WorkflowErrorCode.PERSISTENCE_ERROR, {
+        recoverable: true,
+      });
+    }
+  }
+
+  /** Durable outbox records awaiting provider inclusion or acknowledgement.
+   * This reads disk so reloads and evicted terminal runs are replayable. */
+  listPendingDeliveries(): Array<
+    PersistedDeliveryRecord & { runId: string; workflowName: string; runStatus: RunStatus }
+  > {
+    const pending: Array<PersistedDeliveryRecord & { runId: string; workflowName: string; runStatus: RunStatus }> = [];
+    for (const state of this.listAllRuns()) {
+      if (this.sessionId && state.sessionId !== this.sessionId) continue;
+      for (const delivery of state.deliveryOutbox ?? []) {
+        pending.push({ ...delivery, runId: state.runId, workflowName: state.workflowName, runStatus: state.status });
+      }
+    }
+    return pending;
+  }
+
+  /** Advance outbox state under the run's CAS/lease fence. Generation is
+   * checked on every transition and never changes logical delivery identity. */
+  acknowledgeDelivery(
+    runId: string,
+    deliveryId: string,
+    generation: number,
+    phase: "submitted" | "projected" | "acknowledged",
+  ): boolean {
+    assertSafeRunId(runId);
+    const managed = this.runs.get(runId);
+    const state = managed ? undefined : this.persistence.load(runId);
+    if (!managed && !this.ownsPersistedRun(state)) return false;
+    const target = managed
+      ? managed.deliveryOutbox.find((item) => item.deliveryId === deliveryId)
+      : state?.deliveryOutbox?.find((item) => item.deliveryId === deliveryId);
+    if (!target) return false;
+    if (phase === "submitted") {
+      if (generation < (target.generation ?? 0)) return false;
+    } else if (target.generation !== generation) {
+      return false;
+    }
+    if (managed) {
+      const previousOutbox = managed.deliveryOutbox;
+      const previousTarget = { ...target };
+      if (phase === "acknowledged") {
+        managed.deliveryOutbox = managed.deliveryOutbox.filter((item) => item.deliveryId !== deliveryId);
+      } else {
+        target.generation = generation;
+        target.status = phase === "submitted" && target.status === "projected" ? target.status : phase;
+      }
+      try {
+        this.persistRunStrict(managed);
+        return true;
+      } catch {
+        managed.deliveryOutbox = previousOutbox;
+        const rollback = managed.deliveryOutbox.find((item) => item.deliveryId === deliveryId);
+        if (rollback) Object.assign(rollback, previousTarget);
+        return false;
+      }
+    }
+    target.generation = generation;
+    if (phase === "submitted") target.status = target.status === "projected" ? target.status : "submitted";
+    else if (phase === "projected") target.status = "projected";
+    else if (state)
+      state.deliveryOutbox = (state.deliveryOutbox ?? []).filter((item) => item.deliveryId !== deliveryId);
+    if (!state) return false;
+    const lease = this.persistence.acquireRunLease(runId);
+    if (!lease) return false;
+    try {
+      const fresh = this.persistence.load(runId);
+      if (!fresh || fresh.revision !== state.revision) return false;
+      this.persistence.save(state, state.revision, lease);
+      return true;
+    } catch {
+      return false;
+    } finally {
+      this.persistence.releaseRunLease(lease);
+    }
   }
 
   private async executeRun(
@@ -768,6 +1029,7 @@ export class WorkflowManager extends EventEmitter {
       tokenBudget,
       concurrency,
       agentRetries,
+      workflowTimeoutMs,
       confirm,
       tools,
       initialTokenUsage,
@@ -791,6 +1053,7 @@ export class WorkflowManager extends EventEmitter {
       managed.concurrency !== undefined ? managed.concurrency : (concurrency ?? this.concurrency);
     const resolvedAgentRetries =
       managed.agentRetries !== undefined ? managed.agentRetries : (agentRetries ?? this.defaultAgentRetries);
+    const resolvedWorkflowTimeoutMs = managed.workflowTimeoutMs ?? workflowTimeoutMs ?? this.defaultWorkflowTimeoutMs;
     // The budget was resolved (per-run value, else defaultTokenBudget) and frozen
     // on the managed run at start/resume — read it from there so a resumed run
     // keeps the budget it started with. exec.tokenBudget is a safety net for
@@ -834,18 +1097,28 @@ export class WorkflowManager extends EventEmitter {
         agentRetries: resolvedAgentRetries,
         maxAgents: resolvedMaxAgents,
         agentTimeoutMs: resolvedAgentTimeoutMs,
+        workflowTimeoutMs: resolvedWorkflowTimeoutMs,
         tokenBudget: resolvedTokenBudget,
         tools: resolvedTools,
         excludeTools: this.excludeSubagentTools,
         confirm,
         onDeliver: (message) => {
-          if (this.isCurrent(managed)) {
-            return this.onDeliver?.(message, { runId: managed.runId, workflowName: managed.snapshot.name });
-          }
+          if (!this.isCurrent(managed)) return;
+          const delivery = this.admitExplicitDelivery(managed, message);
+          // Admission is durable before the host is allowed to submit the
+          // safe-point steer message. A persistence failure rejects deliver()
+          // rather than falsely reporting that it was sent.
+          return this.onDeliver?.(message, {
+            runId: managed.runId,
+            workflowName: managed.snapshot.name,
+            deliveryId: delivery.deliveryId,
+            sequence: delivery.sequence,
+          });
         },
         takePendingMessages: () => (this.isCurrent(managed) ? this.takePendingMessages(managed.runId) : []),
         onAgentSession: ({ id, session, send }) => {
-          if (this.isCurrent(managed)) this.activeAgentSenders.set(id, { runId: managed.runId, managed, session, send });
+          if (this.isCurrent(managed))
+            this.activeAgentSenders.set(id, { runId: managed.runId, managed, session, send });
         },
         onAgentSessionEnd: ({ id, session }) => {
           const target = this.activeAgentSenders.get(id);
@@ -928,6 +1201,15 @@ export class WorkflowManager extends EventEmitter {
           this.emitLive(managed, "agentStart", { runId: managed.runId, ...event });
           progress();
         },
+        onAgentModelResolved: (event) => {
+          if (!this.isCurrent(managed)) return;
+          const agent = managed.agentsById.get(event.id);
+          if (!agent || agent.model === event.model) return;
+          agent.model = event.model;
+          this.emitLive(managed, "agentModelResolved", { runId: managed.runId, ...event });
+          this.schedulePersist(managed);
+          progress();
+        },
         onAgentEnd: (event) => {
           if (!this.isCurrent(managed)) return;
           const agent = managed.agentsById.get(event.id);
@@ -1003,22 +1285,31 @@ export class WorkflowManager extends EventEmitter {
       managed.status = "completed";
       managed.result = result;
       this.pendingMessages.delete(managed.runId);
-      // Persist before announcing completion. Delivery text advertises the
+      const terminalDelivery = this.ensureTerminalDelivery(managed);
+      // Persist before announcing completion. The terminal outbox record is
+      // written in the same CAS publication as the complete result. Delivery
+      // text advertises the
       // durable run path as the retrieval channel for full structured output
       // and subagent reports; emitting first creates a race where the model can
       // follow a path that does not exist yet (or still contains running state).
       // persistRun()/writeRunToDisk() no-op for superseded executions.
-      this.persistRun(managed);
+      this.persistRunStrict(managed);
 
       // Gated the same way as disk/lease below (see emitLive()): a stale
       // execution's "complete" would otherwise still deliver a result for a
       // run that's been superseded or deleted (e.g. background result
       // delivery into the conversation) even though it's no longer current.
-      this.emitLive(managed, "complete", { runId: managed.runId, result });
+      this.emitLive(managed, "complete", {
+        runId: managed.runId,
+        result,
+        deliveryId: terminalDelivery?.deliveryId,
+        sequence: terminalDelivery?.sequence,
+      });
 
       // Guard lease release the same way: a stale execution settling after
       // resume() acquired a new lease must not touch the newer bookkeeping.
       if (this.isCurrent(managed)) {
+        this.cleanupManagedSenders(managed);
         this.releaseRunLease(managed);
         // Now (and only now — after the run's data is safely on disk and its
         // lease released) does this run become eviction-eligible; see the
@@ -1039,6 +1330,10 @@ export class WorkflowManager extends EventEmitter {
             );
 
       const usageLimitPaused = !managed.controller.signal.aborted && isProviderUsageLimit(workflowError);
+      // A failed terminal publication must not retain the uncommitted
+      // completed-result marker; replace it with the failed terminal record.
+      if (managed.status === "completed")
+        managed.deliveryOutbox = managed.deliveryOutbox.filter((item) => !item.terminal);
       if (managed.controller.signal.aborted) {
         // Intentional abort (pause/stop/Esc) — preserve status set by pause()/stop()
         if (managed.status === "running") {
@@ -1055,8 +1350,25 @@ export class WorkflowManager extends EventEmitter {
       } else {
         managed.status = "failed";
       }
+      // A result is publishable only with the completed terminal state. If that
+      // publication failed (for example the finite durable-size guard), do not
+      // carry the uncommitted value into a failed-state retry or accidentally
+      // claim that the complete result was durable.
+      if (managed.status !== "completed") managed.result = undefined;
       managed.error = workflowError;
       if (IN_MEMORY_TERMINAL_STATUSES.has(managed.status)) this.pendingMessages.delete(managed.runId);
+      const failureDelivery = this.ensureTerminalDelivery(managed);
+      let terminalPersistenceError: unknown;
+      if (managed.status === "failed") {
+        try {
+          this.persistRunStrict(managed);
+        } catch (error) {
+          // Continue the lifecycle tail so the lease is released and the
+          // producer receives an observable failure, but never claim durable
+          // terminal delivery when this publication failed.
+          terminalPersistenceError = error;
+        }
+      }
       // Both branches gated via emitLive() (see its doc comment) — a stale
       // execution's "paused"/"error" is equally misleading once superseded.
       if (usageLimitPaused) {
@@ -1075,7 +1387,12 @@ export class WorkflowManager extends EventEmitter {
         if (managed.status === "paused" || managed.stopRequested) {
           // pause()/stop() already emitted.
         } else if (externalSignal?.aborted && this.listenerCount("error") > 0) {
-          this.emitLive(managed, "error", { runId: managed.runId, error: workflowError });
+          this.emitLive(managed, "error", {
+            runId: managed.runId,
+            error: workflowError,
+            deliveryId: failureDelivery?.deliveryId,
+            sequence: failureDelivery?.sequence,
+          });
         } else if (managed.status === "aborted" && this.listenerCount("stopped") > 0) {
           this.emitLive(managed, "stopped", { runId: managed.runId });
         }
@@ -1083,13 +1400,27 @@ export class WorkflowManager extends EventEmitter {
         // Guarded: EventEmitter throws on an unlistened "error" emit, which
         // would abort this catch block mid-way — skipping the final persist,
         // the lease release, and the real error rethrow below.
-        this.emitLive(managed, "error", { runId: managed.runId, error: workflowError });
+        this.emitLive(managed, "error", {
+          runId: managed.runId,
+          error: workflowError,
+          deliveryId: failureDelivery?.deliveryId,
+          sequence: failureDelivery?.sequence,
+        });
       }
 
       // Persist final state (see the success-path comment above for the
-      // isCurrent() rationale — same guard, same reason).
-      this.persistRun(managed);
-      if (this.isCurrent(managed)) {
+      // isCurrent() rationale — same guard, same reason). A paused checkpoint
+      // is also a resumability boundary, so it must fail closed rather than
+      // releasing its lease after a best-effort write.
+      let finalPersisted = true;
+      try {
+        this.persistRunStrict(managed);
+      } catch (error) {
+        finalPersisted = false;
+        terminalPersistenceError ??= error;
+      }
+      if (this.isCurrent(managed) && finalPersisted) {
+        if (IN_MEMORY_TERMINAL_STATUSES.has(managed.status)) this.cleanupManagedSenders(managed);
         this.releaseRunLease(managed);
         // "paused" (manual pause() or a usage-limit checkpoint) is
         // deliberately NOT eviction-eligible — only a genuinely settled
@@ -1098,10 +1429,11 @@ export class WorkflowManager extends EventEmitter {
         // but skip the call entirely here so a paused run never even enters
         // the eviction queue.
         if (IN_MEMORY_TERMINAL_STATUSES.has(managed.status)) this.recordTerminalRun(managed.runId);
+        else if (managed.status === "paused" && usageLimitPaused) this.recordPausedRun(managed.runId, true);
       }
       removeExternalAbort?.();
 
-      throw workflowError;
+      throw terminalPersistenceError ?? workflowError;
     }
   }
 
@@ -1116,6 +1448,13 @@ export class WorkflowManager extends EventEmitter {
    */
   private isCurrent(managed: ManagedRun): boolean {
     return this.runs.get(managed.runId) === managed;
+  }
+
+  /** A bound session may only recover/control records explicitly owned by it.
+   * Legacy unowned records fail closed once a session is known. */
+  private ownsPersistedRun(state: PersistedRunState | null | undefined): boolean {
+    if (!state || !this.sessionId) return Boolean(state);
+    return state.sessionId === this.sessionId;
   }
 
   /**
@@ -1166,6 +1505,21 @@ export class WorkflowManager extends EventEmitter {
    * genuinely terminal, including one resumed back to "running" after being
    * queued here but before its turn to be evicted came up.
    */
+  private recordPausedRun(runId: string, settled = false): void {
+    this.pausedRunQueue.push(runId);
+    while (this.pausedRunQueue.length > this.maxPausedRunsInMemory) {
+      const oldest = this.pausedRunQueue.shift();
+      if (oldest === undefined) break;
+      const current = this.runs.get(oldest);
+      // Only evict a settled paused snapshot. A pending provider unwind still
+      // owns callbacks/leases and must remain fenced in memory.
+      if (current?.status === "paused" && (settled || current.executionSettled !== false)) {
+        this.cleanupManagedSenders(current);
+        this.runs.delete(oldest);
+      }
+    }
+  }
+
   private recordTerminalRun(runId: string): void {
     this.terminalRunQueue.push(runId);
     while (this.terminalRunQueue.length > this.maxTerminalRunsInMemory) {
@@ -1213,6 +1567,12 @@ export class WorkflowManager extends EventEmitter {
       usage.cacheWrite += tokenUsage.cacheWrite;
     }
     managed.snapshot.tokenUsage = usage;
+  }
+
+  private cleanupManagedSenders(managed: Pick<ManagedRun, "runId">): void {
+    for (const [agentId, target] of this.activeAgentSenders) {
+      if (target.managed.runId === managed.runId) this.activeAgentSenders.delete(agentId);
+    }
   }
 
   private releaseRunLease(managed: ManagedRun): void {
@@ -1291,10 +1651,12 @@ export class WorkflowManager extends EventEmitter {
       toolset: managed.toolset,
       maxAgents: managed.maxAgents,
       agentTimeoutMs: managed.agentTimeoutMs,
+      workflowTimeoutMs: managed.workflowTimeoutMs,
       concurrency: managed.concurrency,
       agentRetries: managed.agentRetries,
       pauseReason: managed.status === "paused" && isProviderUsageLimit(managed.error) ? "usage_limit" : undefined,
-      resetHint: managed.status === "paused" && isProviderUsageLimit(managed.error) ? managed.error.resetHint : undefined,
+      resetHint:
+        managed.status === "paused" && isProviderUsageLimit(managed.error) ? managed.error.resetHint : undefined,
       phases: managed.snapshot.phases,
       currentPhase: managed.snapshot.currentPhase,
       agents: managed.snapshot.agents.map((a) => {
@@ -1323,10 +1685,13 @@ export class WorkflowManager extends EventEmitter {
       updatedAt: new Date().toISOString(),
       completedAt: managed.status === "completed" ? new Date().toISOString() : undefined,
       durationMs: managed.result?.durationMs,
+      deliveryOutbox: managed.deliveryOutbox,
+      nextDeliverySequence: managed.nextDeliverySequence,
+      deliveryBudget: managed.deliveryBudget,
     };
   }
 
-  private writeRunToDisk(managed: ManagedRun) {
+  private writeRunToDisk(managed: ManagedRun, failClosed = false): boolean {
     // The sole choke point for every disk write (both persistRun()'s direct
     // calls and schedulePersist()'s deferred timer funnel through here) — skip
     // silently when `managed` is no longer the current entry for its runId
@@ -1351,16 +1716,18 @@ export class WorkflowManager extends EventEmitter {
     // and removing it would silently reopen a stale-write path the moment any
     // future change (e.g. a new way to journal without throwIfAborted()'s
     // gate) reintroduces a producer for it.
-    if (!this.isCurrent(managed)) return;
+    if (!this.isCurrent(managed)) return false;
     try {
       const state = this.persistedStateFor(managed);
       this.persistence.save(state, managed.revision, managed.lease);
       managed.revision = state.revision;
+      return true;
     } catch (err) {
-      // Persistence is best-effort: the run is still healthy in memory.
-      // Log so an operator debugging state-loss has a lead, but never crash
-      // the workflow over a disk-full situation.
+      if (failClosed) throw err;
+      // Ordinary progress persistence remains best-effort; delivery admission
+      // uses failClosed=true so a producer never observes a false send.
       console.warn("[workflow-manager] Persist run failed:", err);
+      return false;
     }
   }
 
@@ -1412,7 +1779,13 @@ export class WorkflowManager extends EventEmitter {
     }
 
     let persisted = this.persistence.load(runId);
-    if (!persisted?.script || persisted.status === "completed" || persisted.status === "aborted") return false;
+    if (
+      !this.ownsPersistedRun(persisted) ||
+      !persisted?.script ||
+      persisted.status === "completed" ||
+      persisted.status === "aborted"
+    )
+      return false;
     const lease = this.persistence.acquireRunLease(runId);
     if (!lease) return false;
     // MG-002: re-read the record UNDER the lease. Another manager/process may
@@ -1420,7 +1793,12 @@ export class WorkflowManager extends EventEmitter {
     // acquisition; resuming from the stale pre-lease snapshot would resurrect
     // it. Release and bail if the fresh record is no longer resumable.
     persisted = this.persistence.load(runId);
-    if (!persisted?.script || persisted.status === "completed" || persisted.status === "aborted") {
+    if (
+      !this.ownsPersistedRun(persisted) ||
+      !persisted?.script ||
+      persisted.status === "completed" ||
+      persisted.status === "aborted"
+    ) {
       this.persistence.releaseRunLease(lease);
       return false;
     }
@@ -1502,6 +1880,7 @@ export class WorkflowManager extends EventEmitter {
       // fallback — legacy runs resume with the manager's CURRENT default,
       // matching the only semantics such a run ever had.
       agentTimeoutMs: persisted.agentTimeoutMs !== undefined ? persisted.agentTimeoutMs : this.defaultAgentTimeoutMs,
+      workflowTimeoutMs: persisted.workflowTimeoutMs ?? this.defaultWorkflowTimeoutMs,
       // concurrency/agentRetries have no "explicit opt-out sentinel" the way
       // tokenBudget's null does — a legacy run without a persisted value falls
       // back to the manager's current values, matching how this execution
@@ -1515,6 +1894,11 @@ export class WorkflowManager extends EventEmitter {
       agentTimestamps: new Map(),
       agentsById: new Map(),
       executionSettled: false,
+      deliveryOutbox: (persisted.deliveryOutbox ?? []).map((delivery) => ({ ...delivery })),
+      nextDeliverySequence:
+        persisted.nextDeliverySequence ??
+        (persisted.deliveryOutbox ?? []).reduce((max, item) => Math.max(max, item.sequence), -1) + 1,
+      deliveryBudget: persisted.deliveryBudget ?? freshDeliveryBudget(),
     };
     this.runs.set(runId, managed);
     // Persist before notifying renderers: listRuns() is their source of truth for
@@ -1545,9 +1929,11 @@ export class WorkflowManager extends EventEmitter {
     managed.executionSettled = false;
     const execution = this.executeRun(managed, script, args, { resumeJournal, initialTokenUsage: priorTokenUsage });
     managed.execution = execution;
-    void execution.finally(() => {
-      managed.executionSettled = true;
-    }).catch(() => {});
+    void execution
+      .finally(() => {
+        managed.executionSettled = true;
+      })
+      .catch(() => {});
     execution.catch(() => {});
     try {
       this.safeEmit("resumed", { runId });
@@ -1597,14 +1983,24 @@ export class WorkflowManager extends EventEmitter {
     }
 
     let persisted = this.persistence.load(runId);
-    if (!persisted || (persisted.status !== "running" && persisted.status !== "paused")) return false;
+    if (
+      !this.ownsPersistedRun(persisted) ||
+      !persisted ||
+      (persisted.status !== "running" && persisted.status !== "paused")
+    )
+      return false;
     const lease = this.persistence.acquireRunLease(runId);
     if (!lease) return false;
     try {
       // STOP-TOCTOU: re-read under the lease so a concurrent resume/completion
       // between the initial load and acquire cannot be overwritten as aborted.
       persisted = this.persistence.load(runId);
-      if (!persisted || (persisted.status !== "running" && persisted.status !== "paused")) return false;
+      if (
+        !this.ownsPersistedRun(persisted) ||
+        !persisted ||
+        (persisted.status !== "running" && persisted.status !== "paused")
+      )
+        return false;
       this.persistence.save(
         { ...persisted, status: "aborted", updatedAt: new Date().toISOString() },
         persisted.revision,
@@ -1685,6 +2081,7 @@ export class WorkflowManager extends EventEmitter {
       this.persistence.releaseRunLease(lease);
       return false;
     }
+    this.cleanupManagedSenders(managed ?? { runId });
     this.runs.delete(runId);
     this.pendingMessages.delete(runId);
     // Cancel any pending throttled write so a deferred persist can't fire after

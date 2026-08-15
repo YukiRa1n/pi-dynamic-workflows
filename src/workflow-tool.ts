@@ -2,6 +2,7 @@ import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { BUILTIN_WORKFLOW_NAMES, resolveWorkflowInvocation } from "./builtin-workflows.js";
+import { MAX_WORKFLOW_TIMEOUT_MS } from "./config.js";
 import { renderWorkflowText, type WorkflowSnapshot } from "./display.js";
 import { parseWorkflowScript } from "./workflow.js";
 import { WorkflowManager } from "./workflow-manager.js";
@@ -28,10 +29,7 @@ const workflowToolSchema = Type.Object({
   ),
   name: Type.Optional(
     Type.String({
-      description:
-        "Run a saved or built-in workflow by name, not `script`; pass args in `args`. " +
-        `Built-ins: ${BUILTIN_WORKFLOW_NAMES.join(", ")} — see the workflow-patterns skill for args. ` +
-        "Same-named saved wins; not combinable with resumeFromRunId.",
+      description: "Saved or built-in workflow name; pass args in `args`. Not combinable with resumeFromRunId.",
     }),
   ),
   args: Type.Optional(
@@ -72,14 +70,22 @@ const workflowToolSchema = Type.Object({
     Type.Integer({
       minimum: 0,
       maximum: 3,
-      description: "Retry attempts for recoverable agent failures (timeout, connection, empty output). Default 0 unless configured.",
+      description:
+        "Retry attempts for recoverable agent failures (timeout, connection, empty output). Default 0 unless configured.",
     }),
   ),
   agentTimeoutMs: Type.Optional(
     Type.Integer({
       minimum: 1,
       description:
-        "Timeout per agent (ms). Omit to use configured `defaultAgentTimeoutMs`; without one, no hard timeout. Set only when the user asks to bound time.",
+        "Timeout per agent (ms). Omit to use configured `defaultAgentTimeoutMs`; without one, no hard timeout for individual agents. Set only when the user asks to bound them.",
+    }),
+  ),
+  workflowTimeoutMs: Type.Optional(
+    Type.Integer({
+      minimum: 1,
+      maximum: MAX_WORKFLOW_TIMEOUT_MS,
+      description: `Finite wall-clock deadline for the background workflow (1-${MAX_WORKFLOW_TIMEOUT_MS}ms). The default is 30 minutes; logical settlement does not interrupt a starved event loop.`,
     }),
   ),
   tokenBudget: Type.Optional(
@@ -105,6 +111,7 @@ export type WorkflowToolInput = {
   concurrency?: number;
   agentRetries?: number;
   agentTimeoutMs?: number;
+  workflowTimeoutMs?: number;
   tokenBudget?: number;
   resumeFromRunId?: string;
 };
@@ -155,7 +162,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
     name: "workflow",
     label: "Workflow",
     description:
-      "Run a JavaScript workflow that delegates work to subagents with agent(), optionally composing calls with parallel(), pipeline(), and workflow-scoped Agent Teams via createTeam().",
+      "Run a JavaScript workflow that delegates work to subagents via agent(), optionally composing calls with parallel() and pipeline().",
     promptSnippet:
       "Delegate substantive independent or staged work to subagents with a JavaScript workflow, optionally composing agent calls with parallel(), pipeline(), or peer coordination via createTeam()",
     get promptGuidelines() {
@@ -229,6 +236,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
         concurrency: params.concurrency,
         agentRetries: params.agentRetries,
         agentTimeoutMs: params.agentTimeoutMs,
+        workflowTimeoutMs: params.workflowTimeoutMs,
         tokenBudget: params.tokenBudget,
         tools: invocationTools,
         toolset: invocationToolset,
@@ -375,7 +383,8 @@ function normalizeWorkflowToolArgs(args: unknown): WorkflowToolInput {
     maxAgents: validateInteger(value.maxAgents, "maxAgents", 1, 1000),
     concurrency: validateInteger(value.concurrency, "concurrency", 1, 16),
     agentRetries: validateInteger(value.agentRetries, "agentRetries", 0, 3),
-    agentTimeoutMs: validateInteger(value.agentTimeoutMs, "agentTimeoutMs", 1, Number.MAX_SAFE_INTEGER),
+    agentTimeoutMs: validateInteger(value.agentTimeoutMs, "agentTimeoutMs", 1, MAX_WORKFLOW_TIMEOUT_MS),
+    workflowTimeoutMs: validateInteger(value.workflowTimeoutMs, "workflowTimeoutMs", 1, MAX_WORKFLOW_TIMEOUT_MS),
     tokenBudget: validateInteger(value.tokenBudget, "tokenBudget", 1, Number.MAX_SAFE_INTEGER),
   };
 

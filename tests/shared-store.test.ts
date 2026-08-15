@@ -6,6 +6,68 @@ import { runWorkflow } from "../src/workflow.js";
 
 // ─── SharedStore unit tests ───────────────────────────────────────────────────
 
+test("SharedStore enforces finite key/value/total resource budgets before mutation", () => {
+  const store = new SharedStore({ maxKeys: 2, maxKeyBytes: 4, maxValueBytes: 8, maxTotalBytes: 12 });
+  store.put("a", "1234");
+  assert.throws(() => store.put("toolong", "x"), /key.*limit/i);
+  assert.throws(() => store.put("b", "123456789"), /value.*limit/i);
+  store.put("b", "1234");
+  assert.throws(() => store.put("c", "1"), /key.*limit/i);
+  assert.equal(store.get("a"), "1234", "rejected writes must not mutate existing state");
+});
+
+test("SharedStore rejects non-JSON values before they can enter replay state", () => {
+  const store = new SharedStore();
+  assert.throws(
+    () =>
+      store.put(
+        "cycle",
+        (() => {
+          const x: Record<string, unknown> = {};
+          x.self = x;
+          return x;
+        })(),
+      ),
+    /JSON-serializable/i,
+  );
+  assert.equal(store.has("cycle"), false);
+});
+
+test("SharedStore admission never invokes getters or toJSON and stores an owned clone", () => {
+  const store = new SharedStore();
+  let getterCalls = 0;
+  const accessor = {} as Record<string, unknown>;
+  Object.defineProperty(accessor, "secret", {
+    enumerable: true,
+    get() {
+      getterCalls++;
+      return "no";
+    },
+  });
+  assert.throws(() => store.put("accessor", accessor), /JSON-serializable/i);
+  assert.equal(getterCalls, 0);
+
+  let toJsonCalls = 0;
+  const withToJson = {
+    value: 1,
+    toJSON() {
+      toJsonCalls++;
+      return { value: 2 };
+    },
+  };
+  assert.throws(() => store.put("toJSON", withToJson), /JSON-serializable/i);
+  assert.equal(toJsonCalls, 0);
+
+  const original = { nested: { value: 1 } };
+  store.put("owned", original);
+  original.nested.value = 99;
+  assert.deepEqual(store.get("owned"), { nested: { value: 1 } });
+
+  const returned = store.get("owned") as { nested: { value: number } };
+  returned.nested.value = 500;
+  assert.deepEqual(store.get("owned"), { nested: { value: 1 } }, "get() must not expose mutable accounting state");
+});
+
 test("SharedStore.put / get / has basics", () => {
   const store = new SharedStore();
   assert.equal(store.has("x"), false);

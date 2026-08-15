@@ -425,11 +425,7 @@ function validateWorkflowControlSurface(): WorkflowReleaseDiagnostic[] {
     }
   }
   const runId = properties.runId;
-  if (
-    !isRecord(runId) ||
-    runId.type !== "string" ||
-    (typeof runId.minLength === "number" && runId.minLength > 0)
-  ) {
+  if (!isRecord(runId) || runId.type !== "string" || (typeof runId.minLength === "number" && runId.minLength > 0)) {
     diagnostics.push(
       diagnostic(
         WorkflowReleaseDiagnosticCode.TOOL_INPUT_MISMATCH,

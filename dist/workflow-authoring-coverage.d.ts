@@ -24,7 +24,7 @@ export declare const WORKFLOW_COMPREHENSION_SCENARIO_IDS: string[];
 /** Mixed guidance files that require explicit acceptance while behavioral coverage remains partial. */
 export declare const WORKFLOW_AUTHORING_FROZEN_FILES: readonly [{
     readonly path: "skills/workflow-authoring/SKILL.md";
-    readonly sha256: "d0437e6a79328628148c005e7bdfc560a35b447becb2c3bbd0ed7df52488c881";
+    readonly sha256: "fb3e369c9c6849fc38ea1c2d8e3603c9ebec770ee5f06d3d155c5a2ebdb84d0e";
 }, {
     readonly path: "skills/workflow-authoring/references/runtime.md";
     readonly sha256: "781885d793f6865158f8a097e9e9fda9a5739bd877db58757669ab8f4596bcd0";

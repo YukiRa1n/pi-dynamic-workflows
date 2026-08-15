@@ -3,9 +3,32 @@
  */
 import type { AgentUsage } from "./agent.js";
 import type { AgentHistoryEntry } from "./agent-history.js";
+import { MAX_DURABLE_RUN_BYTES } from "./config.js";
 import type { WorkflowErrorCode } from "./errors.js";
 import { type PersistenceFsLayer } from "./fs-persistence.js";
 export type RunStatus = "pending" | "running" | "paused" | "completed" | "failed" | "aborted";
+export type DeliveryOutboxStatus = "pending" | "submitted" | "projected";
+export type DeliveryOutboxKind = "explicit" | "terminal";
+/** A durable, replayable logical delivery. The provider-facing projection is
+ * deliberately not persisted here; `content` is the complete explicit text,
+ * while terminal records point at the complete run result and are projected by
+ * the host at send time. `generation` is fencing metadata, never identity. */
+export interface PersistedDeliveryRecord {
+    deliveryId: string;
+    sequence: number;
+    kind: DeliveryOutboxKind;
+    status: DeliveryOutboxStatus;
+    content?: string;
+    terminal?: boolean;
+    generation?: number;
+    createdAt: string;
+}
+export interface DeliveryBudgetState {
+    explicitCount: number;
+    explicitBytes: number;
+    windowStartedAt: number;
+    windowCount: number;
+}
 export interface PersistedAgentState {
     id: number;
     /** Runtime call identity (`${runId}:${callIndex}`), used to rehydrate journaled results. */
@@ -75,6 +98,7 @@ export interface PersistedRunState {
         runId?: string;
         hash: string;
         result: unknown;
+        model?: string;
         storeDelta?: Record<string, unknown>;
     }>;
     /**
@@ -115,6 +139,11 @@ export interface PersistedRunState {
      */
     agentTimeoutMs?: number | null;
     /**
+     * The run's finite logical wall-clock deadline, fixed at start. Legacy
+     * records without this field resume with the manager's current default.
+     */
+    workflowTimeoutMs?: number;
+    /**
      * The run's resolved concurrency, fixed at start (per-run value, else the
      * manager's concurrency at the time). Same rationale as tokenBudget.
      */
@@ -130,6 +159,12 @@ export interface PersistedRunState {
      * auto-resume attempt has been recorded yet.
      */
     autoResumeAttempts?: number;
+    /** Stable-ID at-least-once delivery outbox. Acknowledged records are removed. */
+    deliveryOutbox?: PersistedDeliveryRecord[];
+    /** Monotonic sequence allocator retained even after acknowledged records leave the outbox. */
+    nextDeliverySequence?: number;
+    /** Cumulative explicit-delivery admission accounting, retained after ack. */
+    deliveryBudget?: DeliveryBudgetState;
 }
 export interface RunPersistence {
     /**
@@ -182,11 +217,15 @@ export type FsLayer = PersistenceFsLayer;
  * per-call directory scan bounded.
  */
 export declare const DEFAULT_MAX_TERMINAL_RUNS_ON_DISK = 300;
+/** Maximum complete UTF-8 JSON size for one persisted run record. */
+export { MAX_DURABLE_RUN_BYTES };
 /** Validate IDs before they reach any filesystem or in-memory run boundary. */
 export declare function assertSafeRunId(runId: string): void;
 export interface RunPersistenceOptions {
     /** Override DEFAULT_MAX_TERMINAL_RUNS_ON_DISK (tests; advanced tuning). */
     maxTerminalRunsOnDisk?: number;
+    /** Override MAX_DURABLE_RUN_BYTES (tests; advanced tuning). */
+    maxDurableRunBytes?: number;
 }
 export declare function createRunPersistence(cwd: string, fsOverride?: Partial<FsLayer>, options?: RunPersistenceOptions): RunPersistence;
 /**

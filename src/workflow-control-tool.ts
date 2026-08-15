@@ -22,7 +22,10 @@ const workflowControlSchema = Type.Object(
         Type.Literal("resume"),
         Type.Literal("stop"),
       ],
-      { description: "list = all runs; status/pause/resume/stop act on one run and require runId." },
+      {
+        description:
+          "list = all runs; status = a one-time snapshot for user-requested inspection or suspected lifecycle trouble; pause/resume/stop act on one run. Do not poll status repeatedly—workflow notifications report progress and completion automatically.",
+      },
     ),
     runId: Type.Optional(
       Type.String({
@@ -75,10 +78,14 @@ export function createWorkflowControlTool(
     name: "workflow_control",
     label: "Workflow Control",
     description:
-      "List and inspect workflow runs, or pause, resume, and stop them without asking the user to run slash commands.",
-    promptSnippet: "Inspect and manage workflow runs directly by canonical run ID.",
+      "List or take a one-time status snapshot of workflow runs, and pause, resume, or stop them without asking the user to run slash commands. Running workflows already emit asynchronous progress, subagent-completion, and terminal notifications; status polling does not advance execution. Do not repeatedly call list/status while waiting. Inspect only when the user asks, notifications conflict, a run appears stalled after a meaningful quiet interval, or before an operation that may conflict with live repository edits.",
+    promptSnippet:
+      "Inspect workflow state sparingly or perform a lifecycle action; rely on automatic workflow notifications instead of polling.",
     promptGuidelines: [
-      "Use workflow_control for workflow lifecycle management; do not ask the user to type /workflows when this tool can perform the action.",
+      "Use workflow_control for workflow lifecycle actions; do not ask the user to type /workflows when this tool can perform the action.",
+      "Do not poll list or status. After starting or resuming a workflow, wait for asynchronous workflow-message, agent-completed, and workflow-result notifications.",
+      "Use status only for a user-requested check, contradictory/stale lifecycle notifications, suspected stalling after a meaningful quiet interval, or immediately before a conflicting pause/sync/commit operation.",
+      "A status result is a momentary snapshot and does not advance the workflow; a delivered progress message is not the same as an agent final.",
       "Use stop to terminate or quit a run. Closing the navigator does not stop a run.",
     ],
     parameters: workflowControlSchema,
@@ -212,15 +219,28 @@ function isPersistedRunState(value: unknown): value is PersistedRunState {
 }
 
 function isRunStatus(value: unknown): value is RunStatus {
-  return value === "pending" || value === "running" || value === "paused" || value === "completed" || value === "failed" || value === "aborted";
+  return (
+    value === "pending" ||
+    value === "running" ||
+    value === "paused" ||
+    value === "completed" ||
+    value === "failed" ||
+    value === "aborted"
+  );
 }
 
 function isAgentLike(value: unknown): boolean {
-  return isRecord(value) && typeof value.status === "string" && ["queued", "running", "done", "error", "skipped"].includes(value.status);
+  return (
+    isRecord(value) &&
+    typeof value.status === "string" &&
+    ["queued", "running", "done", "error", "skipped"].includes(value.status)
+  );
 }
 
 function isWorkflowSnapshot(value: unknown): value is WorkflowSnapshot {
-  return isRecord(value) && typeof value.name === "string" && Array.isArray(value.agents) && value.agents.every(isAgentLike);
+  return (
+    isRecord(value) && typeof value.name === "string" && Array.isArray(value.agents) && value.agents.every(isAgentLike)
+  );
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

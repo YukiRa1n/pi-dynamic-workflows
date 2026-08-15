@@ -1,11 +1,25 @@
+import { serializeBounded, truncateUtf8 } from "./safe-serialize.js";
 const DEFAULT_MAX_ENTRIES = 40;
 const DEFAULT_MAX_TEXT_CHARS = 2000;
 const DEFAULT_MAX_TOTAL_CHARS = 20000;
+// Callers may tune projection size, but never disable the finite-memory guard
+// with an attacker-controlled or malformedly large option.
+const HARD_MAX_ENTRIES = 1_000;
+const HARD_MAX_TEXT_CHARS = 100_000;
+const HARD_MAX_TOTAL_CHARS = 1_000_000;
 export function compactAgentHistory(messages, options = {}) {
-    const maxEntries = positiveInt(options.maxEntries, DEFAULT_MAX_ENTRIES);
-    const maxTextChars = positiveInt(options.maxTextChars, DEFAULT_MAX_TEXT_CHARS);
-    const maxTotalChars = positiveInt(options.maxTotalChars, DEFAULT_MAX_TOTAL_CHARS);
+    const maxEntries = positiveInt(options.maxEntries, DEFAULT_MAX_ENTRIES, HARD_MAX_ENTRIES);
+    const maxTextChars = positiveInt(options.maxTextChars, DEFAULT_MAX_TEXT_CHARS, HARD_MAX_TEXT_CHARS);
+    const maxTotalChars = positiveInt(options.maxTotalChars, DEFAULT_MAX_TOTAL_CHARS, HARD_MAX_TOTAL_CHARS);
     const entries = [];
+    const retain = (entry) => {
+        entries.push(entry);
+        // Keep only a small bounded candidate tail while parsing. fitEntries still
+        // applies the exact caller limits after per-entry truncation.
+        const candidateLimit = Math.max(maxEntries, 1) * 2;
+        if (entries.length > candidateLimit)
+            entries.splice(0, entries.length - candidateLimit);
+    };
     for (const raw of messages) {
         const message = asRecord(raw);
         if (!message)
@@ -15,7 +29,7 @@ export function compactAgentHistory(messages, options = {}) {
         if (role === "user") {
             const text = textFromContent(message.content);
             if (text.trim())
-                entries.push({ role: "user", kind: "text", text, timestamp });
+                retain({ role: "user", kind: "text", text: truncateText(text, maxTextChars), timestamp });
             continue;
         }
         if (role === "assistant") {
@@ -24,28 +38,34 @@ export function compactAgentHistory(messages, options = {}) {
                 if (!block || typeof block.type !== "string")
                     continue;
                 if (block.type === "text" && typeof block.text === "string" && block.text.trim()) {
-                    entries.push({ role: "assistant", kind: "text", text: block.text, timestamp });
+                    retain({ role: "assistant", kind: "text", text: truncateText(block.text, maxTextChars), timestamp });
                 }
                 else if (block.type === "toolCall" && typeof block.name === "string") {
                     const args = asRecord(block.arguments);
                     const filePath = (block.name === "write" || block.name === "edit") && typeof args?.path === "string" ? args.path : undefined;
                     const writeContent = block.name === "write" && filePath && typeof args?.content === "string" ? args.content : undefined;
-                    entries.push({
+                    retain({
                         role: "assistant",
                         kind: "toolCall",
-                        toolName: block.name,
+                        toolName: truncateText(block.name, 256),
                         // A write's JSON envelope is both noisy and likely to be truncated
                         // into invalid JSON. Preserve its source directly so the pager can
                         // render it as code. Edit calls retain their path so the pager can
                         // pair the compact call header with the result's native Pi diff.
-                        text: writeContent ?? stringifyCompact(block.arguments ?? {}),
-                        path: filePath,
+                        text: truncateText(writeContent ?? stringifyCompact(block.arguments ?? {}), maxTextChars),
+                        path: filePath ? truncateText(filePath, 1024) : undefined,
                         timestamp,
                     });
                 }
             }
             if (typeof message.errorMessage === "string" && message.errorMessage.trim()) {
-                entries.push({ role: "assistant", kind: "error", text: message.errorMessage, isError: true, timestamp });
+                retain({
+                    role: "assistant",
+                    kind: "error",
+                    text: truncateText(message.errorMessage, maxTextChars),
+                    isError: true,
+                    timestamp,
+                });
             }
             continue;
         }
@@ -54,12 +74,12 @@ export function compactAgentHistory(messages, options = {}) {
             const text = textFromContent(message.content) || "(no text output)";
             const details = asRecord(message.details);
             const diff = toolName === "edit" && typeof details?.diff === "string" ? details.diff : undefined;
-            entries.push({
+            retain({
                 role: "tool",
                 kind: message.isError ? "error" : "toolResult",
-                toolName,
-                text,
-                diff,
+                toolName: toolName ? truncateText(toolName, 256) : undefined,
+                text: truncateText(text, maxTextChars),
+                diff: diff ? truncateText(diff, maxTextChars) : undefined,
                 isError: Boolean(message.isError),
                 timestamp,
             });
@@ -87,35 +107,32 @@ function fitEntries(entries, maxEntries, maxTextChars, maxTotalChars) {
     return fitted;
 }
 function textFromContent(content) {
+    const limit = 32_000;
     if (typeof content === "string")
-        return content;
+        return truncateUtf8(content, limit, "... [truncated]");
     if (!Array.isArray(content))
         return "";
-    return content
-        .map((part) => {
+    let output = "";
+    for (const part of content) {
         const block = asRecord(part);
-        return block?.type === "text" && typeof block.text === "string" ? block.text : "";
-    })
-        .filter(Boolean)
-        .join("");
+        if (block?.type !== "text" || typeof block.text !== "string")
+            continue;
+        const remaining = limit - Buffer.byteLength(output, "utf8");
+        if (remaining <= 0)
+            break;
+        output += truncateUtf8(block.text, remaining, "");
+    }
+    return Buffer.byteLength(output, "utf8") >= limit ? `${truncateUtf8(output, limit - 15, "")}... [truncated]` : output;
 }
 function stringifyCompact(value) {
-    try {
-        return JSON.stringify(value);
-    }
-    catch {
-        return String(value);
-    }
+    return serializeBounded(value, { maxBytes: 8_000, pretty: false });
 }
 function truncateText(text, maxChars) {
-    if (text.length <= maxChars)
-        return text;
-    if (maxChars <= 20)
-        return text.slice(0, maxChars);
-    return `${text.slice(0, maxChars - 20)}... [truncated]`;
+    const bounded = truncateUtf8(text, maxChars, "... [truncated]");
+    return bounded;
 }
-function positiveInt(value, fallback) {
-    return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : fallback;
+function positiveInt(value, fallback, hardMax) {
+    return typeof value === "number" && Number.isInteger(value) && value > 0 ? Math.min(value, hardMax) : fallback;
 }
 function asRecord(value) {
     return value && typeof value === "object" ? value : undefined;

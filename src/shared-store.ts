@@ -24,9 +24,26 @@
 
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import {
+  MAX_SHARED_STORE_KEY_BYTES,
+  MAX_SHARED_STORE_KEYS,
+  MAX_SHARED_STORE_TOTAL_BYTES,
+  MAX_SHARED_STORE_VALUE_BYTES,
+} from "./config.js";
+import { serializeBounded, serializeIdentity } from "./safe-serialize.js";
+
+export interface SharedStoreOptions {
+  maxKeys?: number;
+  maxKeyBytes?: number;
+  maxValueBytes?: number;
+  maxTotalBytes?: number;
+}
 
 export class SharedStore {
   private readonly map = new Map<string, unknown>();
+  private readonly valueBytes = new Map<string, number>();
+  private totalBytes = 0;
+  private readonly limits: Required<SharedStoreOptions>;
   // Per-agent write deltas for delta-journaling; keyed by a run-unique
   // `${runId}:${callIndex}` string (see class doc) so nested workflow() runs
   // sharing this store can't collide on a bare callIndex.
@@ -53,6 +70,15 @@ export class SharedStore {
   private readonly retiredDeltas = new Set<string>();
   private disposed = false;
 
+  constructor(options: SharedStoreOptions = {}) {
+    this.limits = {
+      maxKeys: positiveLimit(options.maxKeys, MAX_SHARED_STORE_KEYS),
+      maxKeyBytes: positiveLimit(options.maxKeyBytes, MAX_SHARED_STORE_KEY_BYTES),
+      maxValueBytes: positiveLimit(options.maxValueBytes, MAX_SHARED_STORE_VALUE_BYTES),
+      maxTotalBytes: positiveLimit(options.maxTotalBytes, MAX_SHARED_STORE_TOTAL_BYTES),
+    };
+  }
+
   private assertLive(): void {
     if (this.disposed) throw new Error("shared store is disposed");
   }
@@ -66,7 +92,8 @@ export class SharedStore {
   /** Store a value under `key`. Overwrites any existing value. */
   put(key: string, value: unknown): void {
     this.assertLive();
-    this.map.set(key, value);
+    const admitted = this.admitValue(key, value);
+    this.replaceValue(key, admitted.value, admitted.bytes);
     // Untracked (script-level) writes do not participate in delta ownership.
     this.keyOwners.delete(key);
   }
@@ -79,6 +106,7 @@ export class SharedStore {
    */
   trackPut(key: string, value: unknown, deltaKey: string): void {
     this.assertDeltaLive(deltaKey, "store write belongs to a completed agent attempt");
+    const admitted = this.admitValue(key, value);
     let priors = this.priorValues.get(deltaKey);
     if (!priors) {
       priors = new Map();
@@ -93,20 +121,21 @@ export class SharedStore {
         this.map.has(key) ? { existed: true, value: this.map.get(key) } : { existed: false, value: undefined },
       );
     }
-    this.map.set(key, value);
+    this.replaceValue(key, admitted.value, admitted.bytes);
     this.keyOwners.set(key, { deltaKey });
     let delta = this.agentDeltas.get(deltaKey);
     if (!delta) {
       delta = Object.create(null) as Record<string, unknown>;
       this.agentDeltas.set(deltaKey, delta);
     }
-    delta[key] = value;
+    delta[key] = admitted.value;
   }
 
-  /** Retrieve the value for `key`, or `undefined` when absent. */
+  /** Retrieve an owned copy of `key`, or `undefined` when absent. */
   get(key: string): unknown {
     this.assertLive();
-    return this.map.get(key);
+    const value = this.map.get(key);
+    return value === undefined ? undefined : structuredClone(value);
   }
 
   /** Whether `key` is present in the store. */
@@ -139,7 +168,7 @@ export class SharedStore {
     this.priorValues.delete(deltaKey);
     // Return a normal plain object for API/test compatibility while retaining
     // null-prototype storage internally against prototype-sensitive writes.
-    return Object.fromEntries(Object.entries(delta));
+    return structuredClone(Object.fromEntries(Object.entries(delta)));
   }
 
   /**
@@ -178,8 +207,10 @@ export class SharedStore {
       // the current value (FQ-004 — same-valued sibling writes must survive).
       if (this.keyOwners.get(key)?.deltaKey !== deltaKey) continue;
       const prior = priors?.get(key);
-      if (prior?.existed) this.map.set(key, prior.value);
-      else this.map.delete(key);
+      if (prior?.existed) {
+        const admitted = this.admitValue(key, prior.value);
+        this.replaceValue(key, admitted.value, admitted.bytes);
+      } else this.removeValue(key);
       this.keyOwners.delete(key);
     }
     this.agentDeltas.delete(deltaKey);
@@ -197,7 +228,8 @@ export class SharedStore {
   applyDelta(delta: Record<string, unknown>): void {
     this.assertLive();
     for (const [k, v] of Object.entries(delta)) {
-      this.map.set(k, v);
+      const admitted = this.admitValue(k, v);
+      this.replaceValue(k, admitted.value, admitted.bytes);
     }
   }
 
@@ -213,11 +245,14 @@ export class SharedStore {
     for (const deltaKey of this.agentDeltas.keys()) this.retiredDeltas.add(deltaKey);
     for (const deltaKey of this.priorValues.keys()) this.retiredDeltas.add(deltaKey);
     this.map.clear();
+    this.valueBytes.clear();
+    this.totalBytes = 0;
     this.agentDeltas.clear();
     this.priorValues.clear();
     this.keyOwners.clear();
     for (const [k, v] of Object.entries(snap)) {
-      this.map.set(k, v);
+      const admitted = this.admitValue(k, v);
+      this.replaceValue(k, admitted.value, admitted.bytes);
     }
   }
 
@@ -225,11 +260,64 @@ export class SharedStore {
   dispose(): void {
     this.disposed = true;
     this.map.clear();
+    this.valueBytes.clear();
+    this.totalBytes = 0;
     this.agentDeltas.clear();
     this.priorValues.clear();
     this.keyOwners.clear();
     this.retiredDeltas.clear();
   }
+
+  private admitValue(key: string, value: unknown): { bytes: number; value: unknown } {
+    if (typeof key !== "string" || Buffer.byteLength(key, "utf8") > this.limits.maxKeyBytes) {
+      throw new Error(`SharedStore key exceeds its ${this.limits.maxKeyBytes}-byte limit`);
+    }
+    if (!this.map.has(key) && this.map.size >= this.limits.maxKeys) {
+      throw new Error(`SharedStore reached its ${this.limits.maxKeys}-key limit`);
+    }
+    let json: string;
+    try {
+      // Descriptor-only, finite validation: never invoke getters, toJSON, or a
+      // custom conversion hook, and fail before materializing an oversized value.
+      json = serializeIdentity(value, {
+        maxBytes: this.limits.maxValueBytes,
+        maxItems: 100_000,
+        maxNodes: 100_000,
+        maxDepth: 128,
+        maxStringBytes: this.limits.maxValueBytes,
+      });
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : "";
+      if (/overflow|limit exceeded/i.test(reason)) {
+        throw new Error(`SharedStore value exceeds its ${this.limits.maxValueBytes}-byte limit`);
+      }
+      throw new Error("SharedStore values must be JSON-serializable finite plain data without accessors or cycles");
+    }
+    const bytes = Buffer.byteLength(json, "utf8");
+    const nextTotal = this.totalBytes - (this.valueBytes.get(key) ?? 0) + bytes;
+    if (nextTotal > this.limits.maxTotalBytes) {
+      throw new Error(`SharedStore exceeds its ${this.limits.maxTotalBytes}-byte limit`);
+    }
+    // Store an owned immutable-by-reference JSON clone so caller mutation cannot
+    // invalidate aggregate byte accounting or introduce a later getter/toJSON.
+    return { bytes, value: JSON.parse(json) };
+  }
+
+  private replaceValue(key: string, value: unknown, bytes: number): void {
+    this.totalBytes += bytes - (this.valueBytes.get(key) ?? 0);
+    this.valueBytes.set(key, bytes);
+    this.map.set(key, value);
+  }
+
+  private removeValue(key: string): void {
+    this.totalBytes -= this.valueBytes.get(key) ?? 0;
+    this.valueBytes.delete(key);
+    this.map.delete(key);
+  }
+}
+
+function positiveLimit(value: number | undefined, fallback: number): number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : fallback;
 }
 
 /**
@@ -276,7 +364,7 @@ export function createAgentStoreTools(store: SharedStore, deltaKey: string): Too
       const found = store.has(params.key);
       const value = store.get(params.key);
       const text = found
-        ? `Value for key "${params.key}": ${JSON.stringify(value)}`
+        ? `Value for key "${params.key}": ${serializeBounded(value, { maxBytes: 8_000, pretty: false })}`
         : `Key "${params.key}" not found in store.`;
       return {
         content: [{ type: "text", text }],

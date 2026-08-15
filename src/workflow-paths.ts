@@ -66,9 +66,7 @@ function canonicalProjectPath(cwd: string): string {
     cwd[2] === "?" &&
     cwd[3] === "\\" &&
     cwd.slice(4, 8).toLowerCase() === "unc\\";
-  const withoutNamespace = isUncNamespace
-    ? cwd.slice(0, 2) + cwd.slice(8)
-    : cwd.replace(/^\\\\[?\\.]\\/i, "");
+  const withoutNamespace = isUncNamespace ? cwd.slice(0, 2) + cwd.slice(8) : cwd.replace(/^\\\\[?\\.]\\/i, "");
   const normalized = win32.normalize(win32.resolve(withoutNamespace));
   const trimmed = normalized
     .split("\\")

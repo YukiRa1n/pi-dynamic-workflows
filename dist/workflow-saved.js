@@ -23,7 +23,7 @@ export function isSafeSavedWorkflowName(name) {
     // Reject path separators, NUL/control characters, ADS/drive qualifiers,
     // and characters that Windows cannot represent in a filename.  The extra
     // Windows checks are intentional even on POSIX so a saved name is portable.
-    if (/[\\/\0\u0000-\u001f<>:"|?*]/.test(name) || /[. ]$/.test(name))
+    if ([...name].some((character) => character.charCodeAt(0) <= 0x1f) || /[\\/<>:"|?*]/.test(name) || /[. ]$/.test(name))
         return false;
     // Windows interprets the first path component before a dot as a device
     // name, and trims trailing dots/spaces before doing so.  Check that Windows

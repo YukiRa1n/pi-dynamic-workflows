@@ -1,4 +1,4 @@
-import { safeStringify } from "./safe-serialize.js";
+import { safeStringify, truncateUtf8 } from "./safe-serialize.js";
 /**
  * Displayable fresh/cached figures from a usage breakdown and/or a scalar
  * estimate. The token pipeline has two sources that don't always agree: the
@@ -247,5 +247,5 @@ export function preview(value, max = 80) {
     const text = typeof value === "string" ? value : safeStringify(value);
     if (!text)
         return "";
-    return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+    return truncateUtf8(text, max, "…");
 }

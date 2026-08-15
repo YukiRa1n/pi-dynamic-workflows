@@ -189,7 +189,8 @@ Important globals include:
 | maxAgents | workflow-tool-input | `maxAgents?: number = 1000` | — |
 | concurrency | workflow-tool-input | `concurrency?: number` | — |
 | agentRetries | workflow-tool-input | `agentRetries?: number = configured value or 0` | — |
-| agentTimeoutMs | workflow-tool-input | `agentTimeoutMs?: number = configured default or unbounded` | — |
+| agentTimeoutMs | workflow-tool-input | `agentTimeoutMs?: number = configured default or no per-agent limit` | — |
+| workflowTimeoutMs | workflow-tool-input | `workflowTimeoutMs?: number = 30 minute default, up to 24 hours` | — |
 | tokenBudget | workflow-tool-input | `tokenBudget?: number = configured default or unlimited` | — |
 | resumeFromRunId | workflow-tool-input | `resumeFromRunId?: string` | — |
 <!-- END GENERATED SUPPORTED WORKFLOW CAPABILITIES -->
@@ -205,10 +206,12 @@ skills/workflow-patterns/
 
 - Workflow tool invocations always start in the background; use the returned run ID with `/workflows` or `workflow_control` to inspect, pause, resume, or stop them.
 - `concurrency` is bounded by the runtime maximum.
-- `maxAgents`, retry counts, timeouts, and optional token budgets can be set per run.
+- `maxAgents`, retry counts, per-agent timeouts, and optional token budgets can be set per run. Every workflow also has a finite logical wall-clock deadline (30 minutes by default, configurable up to 24 hours with `workflowTimeoutMs`).
+- A deadline races the complete script frame, closes admission, and aborts cooperative provider attempts. It cannot interrupt a pending Promise or a microtask-starved event loop; late provider settlement is observed and bounded drain cleanup is best effort.
 - Completed calls are journaled. A resumed workflow replays the unchanged completed prefix and runs changed/new calls live.
 - `isolation: "worktree"` is fail-closed: if a Git worktree cannot be created, that agent does not silently edit the shared checkout.
-- Explicit child-to-parent `deliver()` messages and the single terminal workflow result use `deliverAs: "steer"`. They are queued for the next safe point and do not abort an already-running provider request.
+- Explicit child-to-parent `deliver()` messages and the single terminal workflow result use `deliverAs: "steer"` with `triggerTurn: true`. They are queued for the next safe point and do not abort an already-running provider request.
+- Explicit delivery admission is finite per run: at most 32 messages, 256 KiB of UTF-8 payload, and 8 messages per 10-second window. A rejected delivery reports `DELIVERY_BUDGET_EXCEEDED`; terminal lifecycle delivery is reserved and is never downgraded or displaced by an explicit burst.
 - Automatic per-subagent final reports are retained in `/workflows` details and persisted run JSON, but are not injected into the parent model context by default. Execution order is not used to guess that the last agent is the final product.
 - The workflow's explicit return value is the semantic terminal product. Its provider projection prioritizes conventional `report`, `synthesis`, `summary`, or `answer` fields and is bounded to 12,000 characters; omitted content remains in the persisted run.
 - Workflow custom messages are converted to synthetic tool-call/tool-result semantics for normal provider context. Compaction and branch-summary preparation sanitizes workflow custom entries so they do not become user-authored text.
@@ -231,6 +234,10 @@ This can include:
 
 Full subagent transcripts are in memory by default. Enabling `persistAgentSessions` stores full child sessions in Pi's session directory and may retain sensitive source or prompt material. Enable it only when that retention is desired.
 
+Accepted explicit deliveries and terminal notifications are written to the run's durable at-least-once outbox before safe-point submission. Delivery IDs remain stable across reloads and retries; provider-context projection is acknowledged at `before_provider_request`, while transport confirmation is best effort after the provider response. This provides stable-ID projection deduplication and durable at-least-once delivery, not provider-side or end-to-end exactly-once processing. Outbox records are removed only after the generation-fenced acknowledgement; uncertain sends remain replayable from the persisted run.
+
+Resource admission is finite by default: each run allows at most 1,000 logical agents and 16 concurrent agents, each `parallel()`/`pipeline()` fan-out is capped at 10,000 items, logs are capped at 10,000 entries/2 MiB, provider prompts at 512 KiB, shared-store state at 2,048 keys/4 MiB, and one durable run record at 16 MiB. Team members/tasks/messages and paused in-memory snapshots also have bounded defaults. These are admission/retention failures, not truncation: complete durable results are either committed as native JSON or publication fails observably. Paused runs evicted from memory remain resumable from disk.
+
 Before sharing run-state files or session files, inspect them separately. They are deliberately not part of this Git repository.
 
 ## Security notes
@@ -239,7 +246,7 @@ Pi packages execute with the current user's system permissions. Review extension
 
 Additional boundaries:
 
-- Workflow orchestration uses Node's `vm` for determinism and synchronous execution limits, **not as a hostile-code security sandbox**. Run scripts only from trusted users or trusted model output.
+- Workflow orchestration uses Node's `vm` for determinism and synchronous execution limits, **not as a hostile-code security sandbox**. Run scripts only from trusted users or trusted model output. Host-provided arguments are copied into the VM realm without host constructors.
 - The orchestration script cannot directly call `require`, import modules, or use nondeterministic `Date.now()`/`Math.random()` globals, but subagents can use whatever tools the host grants them.
 - Built-in web fetch tools restrict protocols, credentials, redirects, private/local IP ranges, timeout, and response size. These controls reduce risk but do not make arbitrary web content trustworthy.
 - Worktree isolation requires a Git repository and does not automatically merge changes.

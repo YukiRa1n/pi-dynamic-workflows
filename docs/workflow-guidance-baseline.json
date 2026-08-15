@@ -2,7 +2,7 @@
   "formatVersion": 1,
   "algorithm": "sha256",
   "surfaces": {
-    "compactGuidance": "5ca43c444a7264edef4a0cca797ec1ae495a4abc4685d8b6ff5cd7dfa1d0ef3e",
-    "detailedProse": "64dad4fd28544a584463483904df4c1b14f7ba817f0d135eb81d26f486150eb4"
+    "compactGuidance": "b87e0712b8d9c365c9c6f2902ff28afe661948aafc577824025c13100afc1aa4",
+    "detailedProse": "b2cb6bc7ea749fe260ea089e9ec11df9d7e0a459f4a524954ccbc9466e9b2888"
   }
 }

@@ -4,16 +4,16 @@ export type { AgentRunOptions, AgentRunResult, WorkflowAgentOptions } from "./ag
 export { listAvailableModelSpecs, listAvailableModels, WorkflowAgent } from "./agent.js";
 export type { AgentHistoryEntry, AgentHistoryKind, AgentHistoryRole } from "./agent-history.js";
 export { compactAgentHistory } from "./agent-history.js";
+export type { AgentDefinition, AgentRegistry } from "./agent-registry.js";
+export { applyToolPolicy, listAgentTypes, loadAgentRegistry, resolveAgentType } from "./agent-registry.js";
 export {
-  WorkflowAgentTeam,
   type AgentTeamMemberSnapshot,
   type AgentTeamMessage,
   type AgentTeamSnapshot,
   type AgentTeamSpawnSpec,
   type AgentTeamTaskSnapshot,
+  WorkflowAgentTeam,
 } from "./agent-team.js";
-export type { AgentDefinition, AgentRegistry } from "./agent-registry.js";
-export { applyToolPolicy, listAgentTypes, loadAgentRegistry, resolveAgentType } from "./agent-registry.js";
 export { registerBuiltinWorkflows } from "./builtin-commands.js";
 export { generateCodeReviewWorkflow, MAX_DIFF_CHARS } from "./code-review.js";
 export * from "./config.js";
@@ -74,14 +74,31 @@ export {
   saveModelTierConfig,
   sortedTierNames,
 } from "./model-tier-config.js";
-export type { PersistedAgentState, PersistedRunState, RunLease, RunPersistence, RunStatus } from "./run-persistence.js";
-export { PersistenceRevisionConflict, createRunPersistence, generateRunId } from "./run-persistence.js";
+export type {
+  DeliveryBudgetState,
+  DeliveryOutboxKind,
+  DeliveryOutboxStatus,
+  PersistedAgentState,
+  PersistedDeliveryRecord,
+  PersistedRunState,
+  RunLease,
+  RunPersistence,
+  RunStatus,
+} from "./run-persistence.js";
+export { createRunPersistence, generateRunId, PersistenceRevisionConflict } from "./run-persistence.js";
+export {
+  DEFAULT_SERIALIZATION_LIMITS,
+  type SerializationLimits,
+  safeStringify,
+  serializeBounded,
+  serializeIdentity,
+  truncateUtf8,
+} from "./safe-serialize.js";
 export {
   parseCommandArgs,
   registerAllSavedWorkflows,
   registerSavedWorkflow,
 } from "./saved-commands.js";
-export { safeStringify } from "./safe-serialize.js";
 export { SharedStore } from "./shared-store.js";
 export type { StructuredOutputCapture, StructuredOutputToolOptions } from "./structured-output.js";
 export { createStructuredOutputTool } from "./structured-output.js";
@@ -157,7 +174,13 @@ export {
   type WorkflowModeState,
 } from "./workflow-editor.js";
 export type { ManagedRun, WorkflowManagerOptions } from "./workflow-manager.js";
-export { WorkflowManager } from "./workflow-manager.js";
+export {
+  EXPLICIT_DELIVERY_RATE_WINDOW_MS,
+  MAX_EXPLICIT_DELIVERIES_PER_RUN,
+  MAX_EXPLICIT_DELIVERIES_PER_WINDOW,
+  MAX_EXPLICIT_DELIVERY_BYTES_PER_RUN,
+  WorkflowManager,
+} from "./workflow-manager.js";
 export type { WorkflowProjectPaths } from "./workflow-paths.js";
 export {
   WORKFLOW_HOME_RELATIVE_DIR,

@@ -3,8 +3,8 @@
  * command that runs its script, passing parsed arguments through as `args`.
  */
 import { createCodingTools } from "@earendil-works/pi-coding-agent";
-import { runWorkflow } from "./workflow.js";
 import { safeStringify } from "./safe-serialize.js";
+import { runWorkflow } from "./workflow.js";
 function isRegistered(pi, name) {
     try {
         return (pi.getCommands?.() ?? []).some((c) => c.name === name);

@@ -4,7 +4,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { createWorktree as createWorktreeLive, removeWorktree } from "../src/worktree.js";
+import { createWorktree as createWorktreeLive, reapOrphanedWorktrees, removeWorktree } from "../src/worktree.js";
 
 // ── Existing tests (unchanged) ──
 
@@ -50,6 +50,28 @@ test("createWorktree isolates in a git repo, then removeWorktree cleans up", asy
 });
 
 // ── NEW TESTS ──
+
+test("startup reaping removes missing workflow worktree metadata and its branch", async () => {
+  const repo = mkdtempSync(join(tmpdir(), "pi-wt-reap-"));
+  const git = (...args: string[]) => execFileSync("git", ["-C", repo, ...args], { stdio: "pipe" });
+  try {
+    git("init", "-q");
+    git("config", "user.email", "t@t.t");
+    git("config", "user.name", "t");
+    writeFileSync(join(repo, "file.txt"), "base\\n");
+    git("add", ".");
+    git("commit", "-q", "-m", "init");
+    const wt = await createWorktreeLive(repo, "orphaned-run");
+    assert.equal(wt.isolated, true);
+    rmSync(wt.cwd, { recursive: true, force: true });
+    const reaped = await reapOrphanedWorktrees(repo);
+    assert.equal(reaped, 1);
+    const branches = execFileSync("git", ["-C", repo, "branch", "--list", wt.branch ?? ""], { encoding: "utf8" });
+    assert.equal(branches.trim(), "");
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
 
 test("createWorktree falls back when git fails (non-git directory)", async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-wt-noexec-"));

@@ -1,5 +1,7 @@
 import { defineTool } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { DEFAULT_MAX_TEAM_MEMBERS, DEFAULT_MAX_TEAM_MESSAGES, DEFAULT_MAX_TEAM_TASKS } from "./config.js";
+import { serializeBounded } from "./safe-serialize.js";
 /**
  * In-process coordination state for one workflow agent team.
  *
@@ -11,21 +13,30 @@ import { Type } from "typebox";
 export class WorkflowAgentTeam {
     id;
     name;
-    maxMembers;
     members = new Map();
     inboxes = new Map();
     tasks = new Map();
     memberSeq = 0;
     messageSeq = 0;
     taskSeq = 0;
-    constructor(id, name, maxMembers = 100) {
+    messageCount = 0;
+    maxMembers;
+    maxTasks;
+    maxMessages;
+    constructor(id, name, maxMembers = DEFAULT_MAX_TEAM_MEMBERS, options = {}) {
         this.id = id;
         this.name = name;
-        this.maxMembers = maxMembers;
+        this.maxMembers = positiveLimit(maxMembers, DEFAULT_MAX_TEAM_MEMBERS);
+        this.maxTasks = positiveLimit(options.maxTasks, DEFAULT_MAX_TEAM_TASKS);
+        this.maxMessages = positiveLimit(options.maxMessages, DEFAULT_MAX_TEAM_MESSAGES);
     }
     addMember(label, role, requestedId) {
         const cleanLabel = String(label || "member").trim() || "member";
         const cleanRole = role == null ? undefined : String(role).trim() || undefined;
+        if (Buffer.byteLength(cleanLabel, "utf8") > 16_384 ||
+            (cleanRole !== undefined && Buffer.byteLength(cleanRole, "utf8") > 16_384)) {
+            throw new Error("Team member metadata exceeds its resource limit");
+        }
         const id = requestedId?.trim() || `${this.id}:member:${++this.memberSeq}`;
         const existing = this.members.get(id);
         if (existing) {
@@ -169,13 +180,20 @@ export class WorkflowAgentTeam {
         const cleanTitle = String(title ?? "").trim();
         if (!cleanTitle)
             throw new Error("Team task title must not be empty");
+        if (this.tasks.size >= this.maxTasks)
+            throw new Error(`Team ${this.name} reached its task limit`);
+        const cleanDescription = description == null ? undefined : String(description);
+        if (Buffer.byteLength(cleanTitle, "utf8") > 16_384 ||
+            (cleanDescription !== undefined && Buffer.byteLength(cleanDescription, "utf8") > 64_000)) {
+            throw new Error("Team task text exceeds its resource limit");
+        }
         if (assignee)
             this.member(assignee);
         const id = `${this.id}:task:${++this.taskSeq}`;
         this.tasks.set(id, {
             id,
             title: cleanTitle,
-            description: description == null ? undefined : String(description),
+            description: cleanDescription,
             status: assignee ? "claimed" : "pending",
             assignee,
         });
@@ -190,47 +208,44 @@ export class WorkflowAgentTeam {
         this.assertMemberAttempt(from, attemptGen);
         this.member(to);
         const text = String(message ?? "").trim();
-        if (!text || text.length > 100_000)
-            throw new Error("Team message must be 1..100000 characters");
-        const inbox = this.inboxes.get(to);
-        if (!inbox || inbox.length >= 256 || inbox.reduce((total, item) => total + item.message.length, 0) + text.length > 1_000_000) {
-            throw new Error(`Team inbox for ${to} is full`);
-        }
+        if (!text || Buffer.byteLength(text, "utf8") > 100_000)
+            throw new Error("Team message is empty or too large");
+        this.ensureMessageCapacity(to, text);
         const entry = { id: `${this.id}:message:${++this.messageSeq}`, from, to, message: text };
-        inbox.push(entry);
+        this.inboxes.get(to)?.push(entry);
+        this.messageCount++;
         return entry;
     }
     broadcast(from, message, attemptGen) {
         this.assertMemberAttempt(from, attemptGen);
+        const recipients = [...this.members.keys()].filter((id) => id !== from);
+        this.ensureBroadcastCapacity(recipients, message);
         let count = 0;
-        for (const member of this.members.values()) {
-            if (member.id === from)
-                continue;
-            this.send(from, member.id, message, attemptGen);
+        for (const memberId of recipients) {
+            this.send(from, memberId, message, attemptGen);
             count++;
         }
         return count;
     }
     sendFromWorkflow(to, message) {
         const text = String(message ?? "").trim();
-        if (!text || text.length > 100_000)
-            throw new Error("Team message must be 1..100000 characters");
-        this.member(to);
-        const inbox = this.inboxes.get(to);
-        if (!inbox || inbox.length >= 256 || inbox.reduce((total, item) => total + item.message.length, 0) + text.length > 1_000_000) {
-            throw new Error(`Team inbox for ${to} is full`);
-        }
+        if (!text || Buffer.byteLength(text, "utf8") > 100_000)
+            throw new Error("Team message is empty or too large");
+        this.ensureMessageCapacity(to, text);
         const entry = { id: `${this.id}:message:${++this.messageSeq}`, from: "workflow", to, message: text };
-        inbox.push(entry);
+        this.inboxes.get(to)?.push(entry);
+        this.messageCount++;
         return entry;
     }
     broadcastFromWorkflow(message) {
         const text = String(message ?? "").trim();
         if (!text)
             throw new Error("Team message must not be empty");
+        const recipients = [...this.members.keys()];
+        this.ensureBroadcastCapacity(recipients, text);
         let count = 0;
-        for (const member of this.members.values()) {
-            this.sendFromWorkflow(member.id, text);
+        for (const memberId of recipients) {
+            this.sendFromWorkflow(memberId, text);
             count++;
         }
         return count;
@@ -239,6 +254,7 @@ export class WorkflowAgentTeam {
         this.assertMemberAttempt(memberId, attemptGen);
         const inbox = this.inboxes.get(memberId) ?? [];
         this.inboxes.set(memberId, []);
+        this.messageCount = Math.max(0, this.messageCount - inbox.length);
         return inbox;
     }
     listMembers() {
@@ -272,9 +288,13 @@ export class WorkflowAgentTeam {
             throw new Error(`Task ${taskId} is already completed`);
         if (task.assignee && task.assignee !== memberId)
             throw new Error(`Task ${taskId} is assigned to ${task.assignee}`);
+        const cleanResult = result == null ? undefined : String(result);
+        if (cleanResult !== undefined && Buffer.byteLength(cleanResult, "utf8") > 64_000) {
+            throw new Error("Team task result exceeds its resource limit");
+        }
         task.assignee = memberId;
         task.status = "completed";
-        task.result = result == null ? undefined : String(result);
+        task.result = cleanResult;
         return { ...task };
     }
     snapshot() {
@@ -318,7 +338,7 @@ export class WorkflowAgentTeam {
                 parameters: Type.Object({}, { additionalProperties: false }),
                 async execute() {
                     const messages = thisTeam.readInbox(memberId, attemptGen);
-                    return toolResult(JSON.stringify(messages), { messages });
+                    return toolResult(serializeBounded(messages, { maxBytes: 16_000, pretty: false }), { messages });
                 },
             }),
             defineTool({
@@ -329,7 +349,7 @@ export class WorkflowAgentTeam {
                 async execute() {
                     thisTeam.assertMemberAttempt(memberId, attemptGen);
                     const members = thisTeam.listMembers();
-                    return toolResult(JSON.stringify(members), { members });
+                    return toolResult(serializeBounded(members, { maxBytes: 16_000, pretty: false }), { members });
                 },
             }),
             defineTool({
@@ -340,7 +360,7 @@ export class WorkflowAgentTeam {
                 async execute() {
                     thisTeam.assertMemberAttempt(memberId, attemptGen);
                     const tasks = thisTeam.listTasks();
-                    return toolResult(JSON.stringify(tasks), { tasks });
+                    return toolResult(serializeBounded(tasks, { maxBytes: 16_000, pretty: false }), { tasks });
                 },
             }),
             defineTool({
@@ -393,10 +413,28 @@ export class WorkflowAgentTeam {
         // Agent-bound tool surfaces always pass a generation. Public workflow-side
         // methods may omit it deliberately; supplied generations are strict and,
         // for tool operations, require the member to remain live/running.
-        if (attemptGen !== undefined && (member.attemptGen !== attemptGen || (requireRunning && member.status !== "running"))) {
+        if (attemptGen !== undefined &&
+            (member.attemptGen !== attemptGen || (requireRunning && member.status !== "running"))) {
             throw new Error(`Team member ${memberId} attempt is no longer current`);
         }
         return member;
+    }
+    ensureMessageCapacity(to, text) {
+        const inbox = this.inboxes.get(to);
+        const bytes = inbox?.reduce((total, item) => total + Buffer.byteLength(item.message, "utf8"), 0) ?? 0;
+        if (!inbox ||
+            inbox.length >= 256 ||
+            bytes + Buffer.byteLength(text, "utf8") > 1_000_000 ||
+            this.messageCount >= this.maxMessages) {
+            throw new Error(`Team inbox for ${to} is full`);
+        }
+    }
+    ensureBroadcastCapacity(recipients, message) {
+        const text = String(message ?? "").trim();
+        for (const recipient of recipients)
+            this.ensureMessageCapacity(recipient, text);
+        if (this.messageCount + recipients.length > this.maxMessages)
+            throw new Error(`Team ${this.name} reached its message limit`);
     }
     member(id) {
         const member = this.members.get(id);
@@ -410,4 +448,7 @@ export class WorkflowAgentTeam {
             throw new Error(`Unknown team task ${id}`);
         return task;
     }
+}
+function positiveLimit(value, fallback) {
+    return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : fallback;
 }

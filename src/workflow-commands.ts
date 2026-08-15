@@ -218,7 +218,9 @@ export function registerWorkflowCommands(
           }
           const runs = manager.listRuns();
           if (!runs.length) {
-            await print("No workflow runs yet. Start one with the workflow tool; new invocations always run in the background.");
+            await print(
+              "No workflow runs yet. Start one with the workflow tool; new invocations always run in the background.",
+            );
             return;
           }
           await print(["Workflow runs:", ...runs.map(summarizeRun), "", USAGE].join("\n"));

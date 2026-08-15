@@ -16,8 +16,8 @@
 
 import { lookup } from "node:dns/promises";
 import { request as httpRequest } from "node:http";
-import { isIP } from "node:net";
 import { request as httpsRequest } from "node:https";
+import { isIP } from "node:net";
 import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
@@ -48,7 +48,10 @@ function blockedIpv4(address: string): boolean {
 
 /** Convert every IPv4-mapped IPv6 spelling, including ::ffff:7f00:1, to dotted IPv4. */
 function mappedIpv4(address: string): string | undefined {
-  const normalized = address.replace(/^\[|\]$/g, "").toLowerCase().split("%")[0];
+  const normalized = address
+    .replace(/^\[|\]$/g, "")
+    .toLowerCase()
+    .split("%")[0];
   if (!normalized.startsWith("::ffff:")) return undefined;
   const tail = normalized.slice("::ffff:".length);
   if (isIP(tail) === 4) return tail;
@@ -60,7 +63,10 @@ function mappedIpv4(address: string): string | undefined {
 }
 
 export function blockedAddress(address: string): boolean {
-  const normalized = address.replace(/^\[|\]$/g, "").toLowerCase().split("%")[0];
+  const normalized = address
+    .replace(/^\[|\]$/g, "")
+    .toLowerCase()
+    .split("%")[0];
   const mapped = mappedIpv4(normalized);
   if (mapped) return blockedIpv4(mapped);
   if (isIP(normalized) === 4) return blockedIpv4(normalized);
@@ -155,7 +161,11 @@ function requestPinned(
   });
 }
 
-async function fetchText(url: string, timeoutMs = 15_000, maxBytes = 2_000_000): Promise<{ status: number; body: string }> {
+async function fetchText(
+  url: string,
+  timeoutMs = 15_000,
+  maxBytes = 2_000_000,
+): Promise<{ status: number; body: string }> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(new Error(`web request timed out after ${timeoutMs}ms`)), timeoutMs);
   try {
@@ -194,7 +204,7 @@ export function htmlToText(html: string): string {
 export function parseBingResults(html: string, limit: number): Array<{ url: string; title: string }> {
   const out: Array<{ url: string; title: string }> = [];
   const seen = new Set<string>();
-  for (const m of html.matchAll(/<h2[^>]*>\s*<a[^>]+href="(https?:\/\/[^\"]+)"[^>]*>([\s\S]*?)<\/a>/g)) {
+  for (const m of html.matchAll(/<h2[^>]*>\s*<a[^>]+href="(https?:\/\/[^"]+)"[^>]*>([\s\S]*?)<\/a>/g)) {
     const url = m[1];
     if (/\.bing\.com|go\.microsoft\.com/.test(url) || seen.has(url)) continue;
     seen.add(url);
@@ -252,7 +262,12 @@ export function createWebFetchTool(maxChars = 6000): ToolDefinition {
         };
       } catch (error) {
         return {
-          content: [{ type: "text", text: `web_fetch failed for ${params.url}: ${error instanceof Error ? error.message : error}` }],
+          content: [
+            {
+              type: "text",
+              text: `web_fetch failed for ${params.url}: ${error instanceof Error ? error.message : error}`,
+            },
+          ],
           details: { status: 0, url: params.url },
         };
       }

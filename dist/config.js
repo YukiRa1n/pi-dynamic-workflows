@@ -3,8 +3,37 @@
  */
 /** Maximum number of agents allowed per workflow run. */
 export const MAX_AGENTS_PER_RUN = 1000;
-/** Default timeout for a single agent in milliseconds. null means no hard timeout. */
+/** Maximum number of items materialized by one parallel()/pipeline() fan-out. */
+export const MAX_FANOUT_ITEMS = 10_000;
+/** Maximum log entries retained by one workflow run. */
+export const MAX_WORKFLOW_LOG_ENTRIES = 10_000;
+/** Maximum UTF-8 bytes retained by one workflow run's logs. */
+export const MAX_WORKFLOW_LOG_BYTES = 2 * 1024 * 1024;
+/** Maximum UTF-8 bytes admitted to one provider-facing agent prompt. */
+export const MAX_AGENT_PROMPT_BYTES = 512 * 1024;
+/** Maximum complete JSON bytes published for one durable workflow record. */
+export const MAX_DURABLE_RUN_BYTES = 16 * 1024 * 1024;
+/** Default in-memory paused-run retention; persisted paused runs remain resumable. */
+export const DEFAULT_MAX_PAUSED_RUNS_IN_MEMORY = 20;
+/** Maximum members/tasks/messages retained by one workflow team by default. */
+export const DEFAULT_MAX_TEAM_MEMBERS = 100;
+export const DEFAULT_MAX_TEAM_TASKS = 2_000;
+export const DEFAULT_MAX_TEAM_MESSAGES = 4_096;
+/** SharedStore resource ceilings. Values are rejected before they enter the store. */
+export const MAX_SHARED_STORE_KEYS = 2_048;
+export const MAX_SHARED_STORE_KEY_BYTES = 4 * 1024;
+export const MAX_SHARED_STORE_VALUE_BYTES = 256 * 1024;
+export const MAX_SHARED_STORE_TOTAL_BYTES = 4 * 1024 * 1024;
+/** Default timeout for a single agent in milliseconds. null means no per-agent hard timeout. */
 export const DEFAULT_AGENT_TIMEOUT_MS = null;
+/** Finite logical wall-clock deadline for one workflow frame (30 minutes). */
+export const DEFAULT_WORKFLOW_TIMEOUT_MS = 30 * 60 * 1000;
+/** Maximum accepted workflow/agent deadline (24 hours). */
+export const MAX_WORKFLOW_TIMEOUT_MS = 24 * 60 * 60 * 1000;
+/** Maximum time spent draining cooperative provider attempts after logical close. */
+export const WORKFLOW_DRAIN_GRACE_MS = 5_000;
+/** Maximum uninterrupted synchronous VM execution before yielding/aborting. */
+export const VM_EXECUTION_TIMEOUT_MS = 1_000;
 /** Maximum concurrent agents (matches Claude Code limit). */
 export const MAX_CONCURRENCY = 16;
 /** Maximum automatic retry attempts after a recoverable agent failure. */

@@ -235,7 +235,10 @@ test(
   "createWorkflowStorage rejects path-unsafe workflow names",
   withIsolatedHome(async (cwd) => {
     const storage = createWorkflowStorage(cwd);
-    assert.throws(() => storage.save({ name: "../escape", description: "bad", script: "bad" }), /portable filename|path-safe name/);
+    assert.throws(
+      () => storage.save({ name: "../escape", description: "bad", script: "bad" }),
+      /portable filename|path-safe name/,
+    );
     assert.equal(storage.load("../escape"), null);
     assert.equal(storage.delete("../escape"), false);
     assert.equal(existsSync(join(workflowProjectPaths(cwd).rootDir, "escape.json")), false);

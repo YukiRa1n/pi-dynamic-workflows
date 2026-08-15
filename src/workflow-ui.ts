@@ -27,10 +27,10 @@ import type { AgentUsage } from "./agent.js";
 import type { ThemeLike, WorkflowAgentSnapshot, WorkflowSnapshot } from "./display.js";
 import { aggregateAgentUsage, fmtCost, fmtTokenSegment, tokenFigures } from "./display.js";
 import type { PersistedRunState } from "./run-persistence.js";
+import { safeStringify, serializeBounded } from "./safe-serialize.js";
 import { registerSavedWorkflow } from "./saved-commands.js";
 import type { WorkflowManager } from "./workflow-manager.js";
 import type { SavedWorkflow, WorkflowStorage } from "./workflow-saved.js";
-import { safeStringify } from "./safe-serialize.js";
 
 const STATUS_ICON: Record<string, string> = {
   pending: "·",
@@ -1181,7 +1181,7 @@ function renderNavigatorFrame(
       if (w.description) body.push(dim("Description: ") + asText(w.description));
       body.push(dim("Location: ") + (w.location === "user" ? "user (~/.pi)" : "project (.pi)"));
       body.push(dim("Saved at: ") + asText(w.savedAt));
-      if (w.parameters) body.push(dim("Parameters: ") + JSON.stringify(w.parameters));
+      if (w.parameters) body.push(dim("Parameters: ") + safeStringify(w.parameters));
       body.push("", theme.fg("accent", theme.bold("Script:")));
       // Coerce (#110): corrupt saved-workflow JSON can carry a non-string script.
       body.push(...renderCodeLines(asText(w.script), "javascript", width, markdownTheme, renderCache));
@@ -1250,7 +1250,9 @@ function historyLabel(entry: NonNullable<WorkflowAgentSnapshot["history"]>[numbe
   return asText(entry.role);
 }
 
-function toolCallArguments(entry: NonNullable<WorkflowAgentSnapshot["history"]>[number]): Record<string, unknown> | undefined {
+function toolCallArguments(
+  entry: NonNullable<WorkflowAgentSnapshot["history"]>[number],
+): Record<string, unknown> | undefined {
   if (entry.kind !== "toolCall") return undefined;
   try {
     const value = JSON.parse(asText(entry.text));
@@ -1265,13 +1267,10 @@ function toolCallArguments(entry: NonNullable<WorkflowAgentSnapshot["history"]>[
 function redactCommandSecrets(command: string): string {
   return command
     .replace(/\b(?:gh[opusr]_[A-Za-z0-9_]{12,}|github_pat_[A-Za-z0-9_]{12,}|sk-[A-Za-z0-9_-]{12,})\b/g, "[REDACTED]")
-    .replace(/((?:authorization|api[-_]?key|access[-_]?token|password)\s*[:=]\s*)([^\s;'\"]+)/gi, "$1[REDACTED]");
+    .replace(/((?:authorization|api[-_]?key|access[-_]?token|password)\s*[:=]\s*)([^\s;'"]+)/gi, "$1[REDACTED]");
 }
 
-function compactHistoryLine(
-  entry: NonNullable<WorkflowAgentSnapshot["history"]>[number],
-  width: number,
-): string {
+function compactHistoryLine(entry: NonNullable<WorkflowAgentSnapshot["history"]>[number], width: number): string {
   const label = historyLabel(entry);
   if (entry.kind !== "toolCall") {
     const text = asText(entry.text).replace(/\s+/g, " ").trim();
@@ -1284,7 +1283,13 @@ function compactHistoryLine(
   switch (entry.toolName) {
     case "bash":
       detail = value("command");
-      if (detail) detail = redactCommandSecrets(detail.replace(/\s*\r?\n\s*/g, " ⏎ ").replace(/[ \t]+/g, " ").trim());
+      if (detail)
+        detail = redactCommandSecrets(
+          detail
+            .replace(/\s*\r?\n\s*/g, " ⏎ ")
+            .replace(/[ \t]+/g, " ")
+            .trim(),
+        );
       break;
     case "read": {
       const path = value("path");
@@ -1296,11 +1301,13 @@ function compactHistoryLine(
     case "grep": {
       const pattern = value("pattern");
       const path = value("path");
-      detail = [pattern ? `/${pattern}/` : undefined, path ? `in ${path}` : undefined].filter(Boolean).join(" ") || undefined;
+      detail =
+        [pattern ? `/${pattern}/` : undefined, path ? `in ${path}` : undefined].filter(Boolean).join(" ") || undefined;
       break;
     }
     case "find":
-      detail = [value("pattern"), value("path") ? `in ${value("path")}` : undefined].filter(Boolean).join(" ") || undefined;
+      detail =
+        [value("pattern"), value("path") ? `in ${value("path")}` : undefined].filter(Boolean).join(" ") || undefined;
       break;
     case "ls":
       detail = value("path") ?? ".";
@@ -1323,7 +1330,7 @@ function compactHistoryLine(
     if (raw) {
       try {
         const parsed = JSON.parse(raw) as unknown;
-        detail = JSON.stringify(parsed);
+        detail = serializeBounded(parsed, { pretty: false, maxBytes: 8_000 });
       } catch {
         detail = raw;
       }

@@ -36,7 +36,16 @@ See [Workflow prompt guidance rationale](workflow-prompt-guidance-rationale.md) 
 | maxAgents | workflow-tool-input | `maxAgents?: number = 1000` | — |
 | concurrency | workflow-tool-input | `concurrency?: number` | — |
 | agentRetries | workflow-tool-input | `agentRetries?: number = configured value or 0` | — |
-| agentTimeoutMs | workflow-tool-input | `agentTimeoutMs?: number = configured default or unbounded` | — |
+| agentTimeoutMs | workflow-tool-input | `agentTimeoutMs?: number = configured default or no per-agent limit` | — |
+| workflowTimeoutMs | workflow-tool-input | `workflowTimeoutMs?: number = 30 minute default, up to 24 hours` | — |
 | tokenBudget | workflow-tool-input | `tokenBudget?: number = configured default or unlimited` | — |
 | resumeFromRunId | workflow-tool-input | `resumeFromRunId?: string` | — |
 <!-- END GENERATED SUPPORTED WORKFLOW CAPABILITIES -->
+
+## Logical lifecycle deadline
+
+Each workflow frame has a finite wall-clock deadline: 30 minutes by default, configurable up to 24 hours with the workflow tool's `workflowTimeoutMs` input. The deadline races the complete script frame, closes admission to new orchestration work, and aborts provider attempts that honor `AbortSignal`. A Promise race cannot interrupt a pending Promise or a microtask-starved event loop; abandoned provider promises remain observed and bounded drain cleanup is best effort. `node:vm` provides deterministic execution controls, not a hostile-code security boundary.
+
+`deliver()` is explicit safe-point steering, not an inline or follow-up channel. Each run admits at most 32 explicit deliveries, 256 KiB total UTF-8 payload, and 8 deliveries per 10-second window; a budget rejection is observable to the workflow. Terminal lifecycle delivery has reserved priority. Accepted messages are persisted in a stable-ID outbox before submission, replayed across reloads, and retained after uncertain sends. `before_provider_request` acknowledges projection/inclusion only; provider transport acknowledgement is best effort, so the contract is durable at-least-once delivery with stable-ID projection deduplication, not provider-side exactly-once processing.
+
+Finite resource defaults also bound fan-out (10,000 items per `parallel()`/`pipeline()` call), provider prompts (512 KiB), logs (10,000 entries/2 MiB), shared-store state (2,048 keys/4 MiB), team boards/inboxes, and durable run records (16 MiB). Admission rejects excess data before provider submission or durable publication; it never truncates complete results. Paused snapshots evicted from memory remain resumable from their persisted journal.

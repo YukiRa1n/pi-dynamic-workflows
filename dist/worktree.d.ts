@@ -21,5 +21,7 @@ export interface Worktree {
  * never wall-clock) so resume keys stay stable. Returns a no-op Worktree on any failure.
  */
 export declare function createWorktree(baseCwd: string, name: string): Promise<Worktree>;
+/** Reap provably orphaned workflow worktrees at startup. */
+export declare function reapOrphanedWorktrees(repoRoot: string): Promise<number>;
 /** Remove a worktree and its branch. Best-effort; safe to call on a no-op Worktree. */
 export declare function removeWorktree(wt: Worktree): Promise<void>;

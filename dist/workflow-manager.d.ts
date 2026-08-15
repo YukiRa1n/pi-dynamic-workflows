@@ -6,7 +6,7 @@ import type { ModelRegistry, ToolDefinition } from "@earendil-works/pi-coding-ag
 import type { WorkflowAgent } from "./agent.js";
 import { type WorkflowAgentSnapshot, type WorkflowSnapshot } from "./display.js";
 import { WorkflowError } from "./errors.js";
-import { type PersistedRunState, type RunLease, type RunPersistence, type RunStatus } from "./run-persistence.js";
+import { type DeliveryBudgetState, type PersistedDeliveryRecord, type PersistedRunState, type RunLease, type RunPersistence, type RunStatus } from "./run-persistence.js";
 import { type JournalEntry, type WorkflowRunResult } from "./workflow.js";
 export interface ManagedRun {
     runId: string;
@@ -108,6 +108,8 @@ export interface ManagedRun {
      * CURRENT defaultAgentTimeoutMs.
      */
     agentTimeoutMs?: number | null;
+    /** Finite logical wall-clock deadline, fixed at run start and carried through resume. */
+    workflowTimeoutMs?: number;
     /**
      * The run's resolved concurrency (per-run value, else the manager's
      * concurrency at the time), fixed at run start/resume for the same reason
@@ -124,6 +126,12 @@ export interface ManagedRun {
     revision?: number;
     /** Stop already emitted its lifecycle event; prevents success/abort duplicates. */
     stopRequested?: boolean;
+    /** Durable explicit/terminal delivery records for this run. */
+    deliveryOutbox: PersistedDeliveryRecord[];
+    /** Monotonic stable-ID sequence, retained after acknowledgements remove records. */
+    nextDeliverySequence: number;
+    /** Finite explicit-delivery accounting, retained after acknowledgements. */
+    deliveryBudget: DeliveryBudgetState;
 }
 /** Per-execution options shared by sync, background, and resume runs. */
 export interface ExecOptions {
@@ -135,8 +143,10 @@ export interface ExecOptions {
     resumeJournal?: Map<string, JournalEntry>;
     /** Cap on total agents for this run. */
     maxAgents?: number;
-    /** Per-agent timeout in milliseconds. null/omitted means no hard timeout. */
+    /** Per-agent timeout in milliseconds. null/omitted means no per-agent hard timeout. */
     agentTimeoutMs?: number | null;
+    /** Finite logical wall-clock deadline for this execution. */
+    workflowTimeoutMs?: number;
     /** Host signal (e.g. tool/Esc) that should abort this run when fired. */
     externalSignal?: AbortSignal;
     /** Called with the live snapshot on every progress event. */
@@ -202,8 +212,10 @@ export interface WorkflowManagerOptions {
     modelRegistry?: ModelRegistry;
     /** The pi session id to tag runs with (see setSessionId). */
     sessionId?: string;
-    /** Default per-agent timeout when a run does not pass agentTimeoutMs. null means no hard timeout. */
+    /** Default per-agent timeout when a run does not pass agentTimeoutMs. null means no per-agent hard timeout. */
     defaultAgentTimeoutMs?: number | null;
+    /** Default finite logical wall-clock deadline for a workflow frame. */
+    defaultWorkflowTimeoutMs?: number;
     /** Default retry attempts after recoverable agent failures. */
     defaultAgentRetries?: number;
     /** Default hard token budget when a run does not pass tokenBudget. null/omitted means no budget. */
@@ -225,11 +237,14 @@ export interface WorkflowManagerOptions {
     /**
      * Bridge for the workflow runtime's deliver(message) global. Host wiring
      * (extensions/workflow.ts) sets this per generation so messages land in the
-     * current session's conversation.
+     * current session's conversation. Delivery identity is supplied by the
+     * manager's durable outbox and must be preserved by the host.
      */
     onDeliver?: (message: string, source?: {
         runId: string;
         workflowName: string;
+        deliveryId?: string;
+        sequence?: number;
     }) => void | Promise<void>;
     /** Optional observer for each live subagent result. Hosts should normally keep this persistence/UI-only. */
     onAgentMessage?: (event: {
@@ -253,11 +268,19 @@ export interface WorkflowManagerOptions {
      * to observe eviction without creating dozens of runs.
      */
     maxTerminalRunsInMemory?: number;
+    /** How many settled paused run snapshots to retain in memory; disk remains resumable. */
+    maxPausedRunsInMemory?: number;
 }
 /** Options that a fresh extension generation may safely refresh on a live
  * manager handed across `/reload`. Execution identity (`cwd`, persistence,
  * injected agent, and in-memory runs) is intentionally excluded. */
-export type WorkflowManagerReloadOptions = Pick<WorkflowManagerOptions, "concurrency" | "loadSavedWorkflow" | "defaultAgentTimeoutMs" | "defaultAgentRetries" | "defaultTokenBudget" | "toolsets" | "excludeSubagentTools" | "persistAgentSessions">;
+export type WorkflowManagerReloadOptions = Pick<WorkflowManagerOptions, "concurrency" | "loadSavedWorkflow" | "defaultAgentTimeoutMs" | "defaultWorkflowTimeoutMs" | "defaultAgentRetries" | "defaultTokenBudget" | "toolsets" | "excludeSubagentTools" | "persistAgentSessions">;
+/** Explicit deliver() admission budgets. Terminal lifecycle records do not
+ * consume these budgets and are always admitted with priority. */
+export declare const MAX_EXPLICIT_DELIVERIES_PER_RUN = 32;
+export declare const MAX_EXPLICIT_DELIVERY_BYTES_PER_RUN: number;
+export declare const MAX_EXPLICIT_DELIVERIES_PER_WINDOW = 8;
+export declare const EXPLICIT_DELIVERY_RATE_WINDOW_MS = 10000;
 export declare class WorkflowManager extends EventEmitter {
     /**
      * Lifecycle contract for `runs`:
@@ -308,7 +331,9 @@ export declare class WorkflowManager extends EventEmitter {
      * are harmless.
      */
     private terminalRunQueue;
+    private pausedRunQueue;
     private maxTerminalRunsInMemory;
+    private maxPausedRunsInMemory;
     private activitySeq;
     private persistence;
     private cwd;
@@ -322,6 +347,7 @@ export declare class WorkflowManager extends EventEmitter {
     /** The current pi session id; runs are stamped with it and listRuns() filters by it. */
     private sessionId?;
     private defaultAgentTimeoutMs;
+    private defaultWorkflowTimeoutMs;
     private defaultAgentRetries;
     private defaultTokenBudget;
     private toolsets?;
@@ -331,6 +357,8 @@ export declare class WorkflowManager extends EventEmitter {
     onDeliver?: (message: string, source?: {
         runId: string;
         workflowName: string;
+        deliveryId?: string;
+        sequence?: number;
     }) => void | Promise<void>;
     /** Optional host observer for live subagent results; not provider delivery by default. */
     onAgentMessage?: WorkflowManagerOptions["onAgentMessage"];
@@ -400,8 +428,27 @@ export declare class WorkflowManager extends EventEmitter {
      * a caller (e.g. the workflow tool) drive its own inline display.
      */
     runSync(script: string, args?: unknown, exec?: ExecOptions): Promise<WorkflowRunResult>;
+    private admitArgs;
     /** Build a fresh managed run with an empty snapshot. */
     private createManaged;
+    /** Admit an explicit deliver() call into the durable outbox. The counters
+     * are cumulative for the run, while the sliding window bounds continuation
+     * storms. Terminal notifications intentionally bypass this admission path. */
+    private admitExplicitDelivery;
+    /** Reserve one terminal record before publishing terminal state. It is
+     * idempotent, so duplicate lifecycle events cannot create duplicate wakes. */
+    private ensureTerminalDelivery;
+    private persistRunStrict;
+    /** Durable outbox records awaiting provider inclusion or acknowledgement.
+     * This reads disk so reloads and evicted terminal runs are replayable. */
+    listPendingDeliveries(): Array<PersistedDeliveryRecord & {
+        runId: string;
+        workflowName: string;
+        runStatus: RunStatus;
+    }>;
+    /** Advance outbox state under the run's CAS/lease fence. Generation is
+     * checked on every transition and never changes logical delivery identity. */
+    acknowledgeDelivery(runId: string, deliveryId: string, generation: number, phase: "submitted" | "projected" | "acknowledged"): boolean;
     private executeRun;
     /**
      * True when `managed` is still the live, current entry for its runId in
@@ -413,6 +460,9 @@ export declare class WorkflowManager extends EventEmitter {
      * behalf — see writeRunToDisk() and executeRun()'s post-await persist calls.
      */
     private isCurrent;
+    /** A bound session may only recover/control records explicitly owned by it.
+     * Legacy unowned records fail closed once a session is known. */
+    private ownsPersistedRun;
     /**
      * Emit an event on behalf of `managed`, but only while it's still the
      * current entry for its runId (see isCurrent()) — mirrors the disk/lease
@@ -451,6 +501,7 @@ export declare class WorkflowManager extends EventEmitter {
      * genuinely terminal, including one resumed back to "running" after being
      * queued here but before its turn to be evicted came up.
      */
+    private recordPausedRun;
     private recordTerminalRun;
     /**
      * Additively fold one agent-call's token cost into the run-wide persisted
@@ -462,6 +513,7 @@ export declare class WorkflowManager extends EventEmitter {
      * see WorkflowRunOptions.onRetrySpend for why that needs its own channel).
      */
     private accumulateTokenUsage;
+    private cleanupManagedSenders;
     private releaseRunLease;
     /** Trailing-edge throttle window for high-frequency progress persists (see schedulePersist). */
     private static readonly PERSIST_THROTTLE_MS;

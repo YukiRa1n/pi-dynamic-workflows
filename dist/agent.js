@@ -104,7 +104,10 @@ export function throwIfProviderExecutionError(messages, label) {
     const { matched } = classifyProviderLimit(err.errorMessage);
     if (matched)
         return; // usage/quota handled by throwIfProviderLimit.
-    throw new WorkflowError(err.errorMessage ?? "Provider execution failed", WorkflowErrorCode.AGENT_EXECUTION_ERROR, { recoverable: false, agentLabel: label });
+    throw new WorkflowError(err.errorMessage ?? "Provider execution failed", WorkflowErrorCode.AGENT_EXECUTION_ERROR, {
+        recoverable: false,
+        agentLabel: label,
+    });
 }
 /**
  * Resolve a schema agent's result. If the tool was called, return the captured

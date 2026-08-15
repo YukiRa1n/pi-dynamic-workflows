@@ -400,7 +400,11 @@ test("fan-out-and-synthesize example waits for the complete result set and prese
   assert.deepEqual(labels, ["fanout:0:alpha", "fanout:1:beta", "fanout:2:gamma", "synthesize-complete-set"]);
   assert.equal(new Set(labels).size, labels.length, "all agent labels must be unique");
   assert.deepEqual(
-    result.result.ledger.map(({ id, status, result: itemResult }) => ({ id, status, result: itemResult })),
+    JSON.parse(
+      JSON.stringify(
+        result.result.ledger.map(({ id, status, result: itemResult }) => ({ id, status, result: itemResult })),
+      ),
+    ),
     [
       { id: "alpha", status: "complete", result: "result:alpha" },
       { id: "beta", status: "failed", result: null },
@@ -441,10 +445,9 @@ test("classify-and-act classifies the complete set before routed action", async 
   assert.deepEqual(labels, ["classify:0:alpha", "classify:1:beta", "classify:2:gamma", "act:0:alpha", "act:1:gamma"]);
   assert.deepEqual([...result.result.failed.classification], ["beta"]);
   assert.deepEqual([...result.result.failed.action], ["gamma"]);
-  assert.deepEqual(
-    result.result.handled.map(({ id, category }) => ({ id, category })),
-    [{ id: "alpha", category: "direct" }],
-  );
+  assert.deepEqual(JSON.parse(JSON.stringify(result.result.handled.map(({ id, category }) => ({ id, category })))), [
+    { id: "alpha", category: "direct" },
+  ]);
   assert.doesNotThrow(() => JSON.stringify(result.result));
 });
 

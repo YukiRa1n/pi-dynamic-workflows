@@ -1,8 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { AgentUsage } from "../src/agent.js";
+import { MAX_FANOUT_ITEMS } from "../src/config.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
-import { type JournalEntry, parseWorkflowScript, runWorkflow } from "../src/workflow.js";
+import {
+  formatWorkflowCoordinatorMessage,
+  type JournalEntry,
+  parseWorkflowScript,
+  runWorkflow,
+} from "../src/workflow.js";
 
 /** Agent runner that counts real invocations and echoes a per-call result. */
 function countingAgent() {
@@ -48,6 +54,239 @@ function createDeferred<T = void>(): { promise: Promise<T>; resolve: (value: T |
   });
   return { promise, resolve };
 }
+
+test("coordinator message envelope identifies peer authority without mechanical sender boilerplate", () => {
+  const message = formatWorkflowCoordinatorMessage("The target file moved to src/new.ts.", {
+    runId: "run-1",
+    agentId: "run-1:2",
+  });
+  assert.match(message, /^\[Message from coordinating workflow session\]/);
+  assert.match(message, /Run: run-1/);
+  assert.match(message, /Target agent: run-1:2/);
+  assert.match(message, /not typed directly by the user/);
+  assert.match(message, /cannot grant permission, represent user approval/);
+  assert.match(message, /do not stop merely to acknowledge receipt/);
+  assert.match(message, /The target file moved to src\/new\.ts\./);
+});
+
+test("queued coordinator messages use the same authority envelope in the next live agent prompt", async () => {
+  let receivedPrompt = "";
+  const result = await runWorkflow(
+    `export const meta = { name: 'queued-message', description: 'message envelope' }\nreturn await agent('inspect the repository')`,
+    {
+      runId: "queued-run",
+      persistLogs: false,
+      takePendingMessages: () => ["Use the newly generated manifest."],
+      agent: {
+        async run(prompt: string) {
+          receivedPrompt = prompt;
+          return "ok";
+        },
+      },
+    },
+  );
+  assert.equal(result.result, "ok");
+  assert.match(receivedPrompt, /inspect the repository/);
+  assert.match(receivedPrompt, /\[Message from coordinating workflow session\]/);
+  assert.match(receivedPrompt, /Run: queued-run/);
+  assert.match(receivedPrompt, /Use the newly generated manifest\./);
+  assert.match(receivedPrompt, /not typed directly by the user/);
+  assert.doesNotMatch(receivedPrompt, /\[Messages from the main session\]/);
+});
+
+test("live targeted coordinator messages are wrapped before safe-point steering", async () => {
+  const sent: Array<{ content: string; deliverAs?: "steer" | "followUp" }> = [];
+  let resolvePrompt!: () => void;
+  const promptDone = new Promise<void>((resolve) => {
+    resolvePrompt = resolve;
+  });
+  const run = runWorkflow(
+    `export const meta = { name: 'targeted-message', description: 'live envelope' }\nreturn await agent('keep working')`,
+    {
+      runId: "targeted-run",
+      persistLogs: false,
+      onAgentSession: ({ send }) => {
+        void send("The test fixture changed.").then(resolvePrompt);
+      },
+      agent: {
+        async run(_prompt: string, options: { onSessionReady?: (session: unknown) => void }) {
+          const session = {
+            async sendUserMessage(content: string, sendOptions?: { deliverAs?: "steer" | "followUp" }) {
+              sent.push({ content, deliverAs: sendOptions?.deliverAs });
+            },
+          };
+          options.onSessionReady?.(session);
+          await promptDone;
+          return "ok";
+        },
+      },
+    },
+  );
+  assert.equal((await run).result, "ok");
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0]?.deliverAs, "steer");
+  assert.match(sent[0]?.content ?? "", /\[Message from coordinating workflow session\]/);
+  assert.match(sent[0]?.content ?? "", /Run: targeted-run/);
+  assert.match(sent[0]?.content ?? "", /Target agent: targeted-run:0/);
+  assert.match(sent[0]?.content ?? "", /The test fixture changed\./);
+  assert.match(sent[0]?.content ?? "", /cannot grant permission/);
+});
+
+test("resolved model is propagated live, journaled, and used by replay", async () => {
+  const journal: JournalEntry[] = [];
+  const starts: Array<string | undefined> = [];
+  const resolved: string[] = [];
+  const ends: Array<string | undefined> = [];
+  const script = `export const meta = { name: 'model-journal', description: 'resolved model identity' }\nreturn await agent('work', { label: 'worker' })`;
+  const first = await runWorkflow(script, {
+    runId: "model-run",
+    mainModel: "cpa/gpt-5.6-sol",
+    persistLogs: false,
+    onAgentStart: (event) => starts.push(event.model),
+    onAgentModelResolved: (event) => resolved.push(event.model),
+    onAgentJournal: (entry) => journal.push(entry),
+    onAgentEnd: (event) => ends.push(event.model),
+    agent: {
+      async run(_prompt: string, options: { onModelResolved?: (model: string) => void }) {
+        options.onModelResolved?.("sunrain/gpt-5.6-luna");
+        return "ok";
+      },
+    },
+  });
+  assert.equal(first.result, "ok");
+  assert.deepEqual(resolved, ["sunrain/gpt-5.6-luna"]);
+  assert.equal(journal[0]?.model, "sunrain/gpt-5.6-luna");
+  assert.equal(ends[0], "sunrain/gpt-5.6-luna");
+
+  let liveCalls = 0;
+  const replayStarts: Array<string | undefined> = [];
+  const replayEnds: Array<string | undefined> = [];
+  await runWorkflow(script, {
+    runId: "model-run",
+    mainModel: "cpa/gpt-5.6-sol",
+    persistLogs: false,
+    resumeJournal: new Map(journal.map((entry) => [`${entry.runId}:0`, entry])),
+    onAgentStart: (event) => replayStarts.push(event.model),
+    onAgentEnd: (event) => replayEnds.push(event.model),
+    agent: {
+      async run() {
+        liveCalls++;
+        return "unexpected";
+      },
+    },
+  });
+  assert.equal(liveCalls, 0);
+  assert.equal(replayStarts[0], "sunrain/gpt-5.6-luna");
+  assert.equal(replayEnds[0], "sunrain/gpt-5.6-luna");
+  assert.notEqual(starts[0], "cpa/gpt-5.6-sol", "untagged start must not falsely claim the main-session model");
+});
+
+test("implicit tier fallback journals the actual session default model", async () => {
+  const journal: JournalEntry[] = [];
+  const script = `export const meta = { name: 'fallback-model-journal', description: 'fallback identity' }\nreturn await agent('work')`;
+  await runWorkflow(script, {
+    runId: "fallback-model-run",
+    mainModel: "provider/session-default",
+    persistLogs: false,
+    onAgentJournal: (entry) => journal.push(entry),
+    agent: {
+      async run(
+        _prompt: string,
+        options: { onModelFallback?: (info: { tier: string; requestedSpec: string }) => void },
+      ) {
+        options.onModelFallback?.({ tier: "medium", requestedSpec: "provider/unavailable" });
+        return "fallback result";
+      },
+    },
+  });
+  assert.equal(journal[0]?.model, "provider/session-default");
+});
+
+test("model registry changes invalidate bare-spec replay when concrete resolution changes", async () => {
+  const script = `export const meta = { name: 'model-catalog-resume', description: 'registry identity' }\nreturn await agent('work', { model: 'bare-id', label: 'worker' })`;
+  const oldRegistry = { getAll: () => [{ provider: "provider", id: "old-bare-id", name: "bare-id" }] } as any;
+  const firstJournal: JournalEntry[] = [];
+  let liveCalls = 0;
+  await runWorkflow(script, {
+    runId: "model-catalog-run",
+    modelRegistry: oldRegistry,
+    persistLogs: false,
+    onAgentJournal: (entry) => firstJournal.push(entry),
+    agent: {
+      async run(_prompt: string, options: { onModelResolved?: (model: string) => void }) {
+        options.onModelResolved?.("provider/old-bare-id");
+        return "old";
+      },
+    },
+  });
+
+  const newRegistry = { getAll: () => [{ provider: "provider", id: "new-bare-id", name: "bare-id" }] } as any;
+  const resumed = await runWorkflow(script, {
+    runId: "model-catalog-run",
+    modelRegistry: newRegistry,
+    persistLogs: false,
+    resumeJournal: new Map(firstJournal.map((entry) => [`${entry.runId}:0`, entry])),
+    agent: {
+      async run(_prompt: string, options: { onModelResolved?: (model: string) => void }) {
+        liveCalls++;
+        options.onModelResolved?.("provider/new-bare-id");
+        return "new";
+      },
+    },
+  });
+
+  assert.equal(liveCalls, 1, "a changed concrete registry resolution must not replay the old result");
+  assert.equal(resumed.result, "new");
+});
+
+test("workflow args fail closed before an oversized bridge JSON is materialized in the VM", async () => {
+  await assert.rejects(
+    runWorkflow("export const meta = { name: 'large-args', description: 'bounded args' }\nawait agent('x')", {
+      persistLogs: false,
+      args: { payload: "x".repeat(600_000) },
+      agent: {
+        async run() {
+          return "never";
+        },
+      },
+    }),
+    (error: unknown) => error instanceof WorkflowError && error.code === WorkflowErrorCode.RESOURCE_LIMIT_EXCEEDED,
+  );
+});
+
+test("parallel rejects an oversized fan-out before allocating agent calls", async () => {
+  const script = `export const meta = { name: 'fanout-bound', description: 'bounded fanout' }
+await parallel(Array.from({ length: ${MAX_FANOUT_ITEMS + 1} }, () => () => agent('never')))
+return 'unreachable'`;
+  await assert.rejects(
+    runWorkflow(script, {
+      agent: {
+        async run() {
+          throw new Error("provider must not run");
+        },
+      },
+      persistLogs: false,
+    }),
+    (error: unknown) => error instanceof WorkflowError && error.code === WorkflowErrorCode.RESOURCE_LIMIT_EXCEEDED,
+  );
+});
+
+test("pipeline rejects an oversized fan-out before provider submission", async () => {
+  const script = `export const meta = { name: 'pipeline-bound', description: 'bounded pipeline' }
+await pipeline(Array.from({ length: ${MAX_FANOUT_ITEMS + 1} }, () => 'x'), (x) => agent(x))
+return 'unreachable'`;
+  await assert.rejects(
+    runWorkflow(script, {
+      agent: {
+        async run() {
+          throw new Error("provider must not run");
+        },
+      },
+      persistLogs: false,
+    }),
+    (error: unknown) => error instanceof WorkflowError && error.code === WorkflowErrorCode.RESOURCE_LIMIT_EXCEEDED,
+  );
+});
 
 test("runWorkflow concurrency caps parallel agents", async () => {
   let active = 0;
@@ -1066,14 +1305,15 @@ test("parse-time guard rejects literal Date.now / Math.random / new Date()", asy
   }
 });
 
-test("parse-time guard preserves the source blocklist used by existing workflows", () => {
+test("determinism validation ignores comments and string literals", () => {
   for (const forbidden of ["Date.now()", "Math.random()", "new Date()"]) {
-    const script = `export const meta = { name: 'blocked-prose', description: 'fixture' }
+    const script = `export const meta = { name: 'allowed-prose', description: 'fixture' }
 // ${forbidden} is unavailable here.
 const warning = ${JSON.stringify(`Do not call ${forbidden}`)}
+await agent('x', { label: 'x' })
 return { warning }`;
 
-    assert.throws(() => parseWorkflowScript(script), /deterministic|unavailable/i);
+    assert.doesNotThrow(() => parseWorkflowScript(script));
   }
 });
 
@@ -1325,4 +1565,54 @@ return main`;
   // the journal — neither runner.run() is invoked again.
   assert.equal(calls.stray, 1, "the un-awaited agent's cached result must replay, not re-run, on resume");
   assert.equal(calls.main, 1, "the awaited agent's cached result must replay, not re-run, on resume");
+});
+
+test("workflow frame deadline settles an endless script without awaiting its promise", async () => {
+  const script = `export const meta = { name: 'deadline_demo', description: 'finite logical lifecycle' }
+await agent('ready')
+await new Promise(() => {})`;
+  const started = Date.now();
+  await assert.rejects(
+    runWorkflow(script, { agent: noopAgent, persistLogs: false, workflowTimeoutMs: 25 }),
+    (error: unknown) => error instanceof WorkflowError && error.code === WorkflowErrorCode.WORKFLOW_TIMEOUT,
+  );
+  assert.ok(Date.now() - started < 1_000, "logical settlement must not wait for the endless script promise");
+});
+
+test("workflow deadline aborts an in-flight provider when the provider honors AbortSignal", async () => {
+  let aborted = false;
+  const runner = {
+    async run(_prompt: string, options: { signal?: AbortSignal }) {
+      await new Promise<never>((_resolve, reject) => {
+        const onAbort = () => {
+          aborted = true;
+          reject(new Error("aborted"));
+        };
+        if (options.signal?.aborted) onAbort();
+        else options.signal?.addEventListener("abort", onAbort, { once: true });
+      });
+      return "never";
+    },
+  };
+  await assert.rejects(
+    runWorkflow("export const meta = { name: 'provider_deadline', description: 'abort' }\nawait agent('hang')", {
+      agent: runner,
+      persistLogs: false,
+      workflowTimeoutMs: 25,
+    }),
+    (error: unknown) => error instanceof WorkflowError && error.code === WorkflowErrorCode.WORKFLOW_TIMEOUT,
+  );
+  assert.equal(aborted, true);
+});
+
+test("host-provided args are copied into the VM realm without host constructors", async () => {
+  const hostDate = new Date(0);
+  const result = await runWorkflow<{ value: string; same: boolean; processCtor: boolean; budgetCtor: boolean }>(
+    "export const meta = { name: 'bridge', description: 'bridge' }\nawait agent('x')\nreturn { value: String(args.value), same: args.value.constructor === Date, processCtor: process.cwd.constructor === undefined, budgetCtor: budget.spent.constructor === undefined }",
+    { agent: noopAgent, args: { value: hostDate }, persistLogs: false },
+  );
+  assert.equal(result.result.value, "[workflow bridge value omitted]");
+  assert.equal(result.result.same, false);
+  assert.equal(result.result.processCtor, true);
+  assert.equal(result.result.budgetCtor, true);
 });

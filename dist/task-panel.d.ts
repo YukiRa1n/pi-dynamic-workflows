@@ -31,6 +31,7 @@ export type WorkflowDeliveryPayload = {
         notificationKind?: "workflow-result";
         runId?: string;
         sequence?: number;
+        deliveryId?: string;
     };
 };
 /**

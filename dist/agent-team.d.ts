@@ -48,14 +48,20 @@ export interface AgentTeamSpawnSpec {
 export declare class WorkflowAgentTeam {
     readonly id: string;
     readonly name: string;
-    private readonly maxMembers;
     private readonly members;
     private readonly inboxes;
     private readonly tasks;
     private memberSeq;
     private messageSeq;
     private taskSeq;
-    constructor(id: string, name: string, maxMembers?: number);
+    private messageCount;
+    private readonly maxMembers;
+    private readonly maxTasks;
+    private readonly maxMessages;
+    constructor(id: string, name: string, maxMembers?: number, options?: {
+        maxTasks?: number;
+        maxMessages?: number;
+    });
     addMember(label: string, role?: string, requestedId?: string): string;
     /** Register a new attempt for a member; only this generation may mutate status. */
     beginAttempt(memberId: string): number;
@@ -119,6 +125,8 @@ export declare class WorkflowAgentTeam {
     /** Static tool schemas; dynamic team/member identity stays in closures. */
     createTools(memberId: string, attemptGen?: number): ToolDefinition[];
     private assertMemberAttempt;
+    private ensureMessageCapacity;
+    private ensureBroadcastCapacity;
     private member;
     private task;
 }

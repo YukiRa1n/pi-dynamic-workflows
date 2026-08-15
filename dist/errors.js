@@ -8,10 +8,16 @@ export var WorkflowErrorCode;
     WorkflowErrorCode["AGENT_TIMEOUT"] = "AGENT_TIMEOUT";
     /** Workflow was aborted by user. */
     WorkflowErrorCode["WORKFLOW_ABORTED"] = "WORKFLOW_ABORTED";
+    /** The workflow frame exceeded its finite logical wall-clock deadline. */
+    WorkflowErrorCode["WORKFLOW_TIMEOUT"] = "WORKFLOW_TIMEOUT";
     /** Agent limit exceeded. */
     WorkflowErrorCode["AGENT_LIMIT_EXCEEDED"] = "AGENT_LIMIT_EXCEEDED";
+    /** A finite run-wide resource collection or fan-out limit was exceeded. */
+    WorkflowErrorCode["RESOURCE_LIMIT_EXCEEDED"] = "RESOURCE_LIMIT_EXCEEDED";
     /** Token budget exhausted. */
     WorkflowErrorCode["TOKEN_BUDGET_EXHAUSTED"] = "TOKEN_BUDGET_EXHAUSTED";
+    /** Explicit deliver() resource budget exhausted; terminal delivery is reserved. */
+    WorkflowErrorCode["DELIVERY_BUDGET_EXCEEDED"] = "DELIVERY_BUDGET_EXCEEDED";
     /**
      * The provider's subscription/usage/quota/rate limit was hit. Distinct from the
      * user's self-imposed TOKEN_BUDGET_EXHAUSTED: a provider limit refills on its own,

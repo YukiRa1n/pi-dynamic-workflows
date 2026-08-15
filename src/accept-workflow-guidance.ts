@@ -17,8 +17,11 @@ function sha256(source: string): string {
   return createHash("sha256").update(source).digest("hex");
 }
 
-function manifestEntry(path: string, hash: string): string {
-  return `    path: ${JSON.stringify(path)},\n    sha256: ${JSON.stringify(hash)},`;
+function manifestEntryPattern(path: string, hash: string): RegExp {
+  const escapeRegex = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(
+    `(\\s*path:\\s*${escapeRegex(JSON.stringify(path))},\\r?\\n\\s*sha256:\\s*)${escapeRegex(JSON.stringify(hash))}(,)`,
+  );
 }
 
 /**
@@ -56,11 +59,11 @@ export function acceptWorkflowGuidance(root: string, requestedPaths: readonly st
   const originalManifest = readFileSync(manifestPath, "utf8");
   let nextManifest = originalManifest;
   for (const entry of entries) {
-    const previous = manifestEntry(entry.path, entry.previousSha256);
-    if (!nextManifest.includes(previous)) {
+    const previous = manifestEntryPattern(entry.path, entry.previousSha256);
+    if (!previous.test(nextManifest)) {
       throw new Error(`Coverage manifest does not contain the expected frozen entry for ${entry.path}.`);
     }
-    nextManifest = nextManifest.replace(previous, manifestEntry(entry.path, entry.sha256));
+    nextManifest = nextManifest.replace(previous, `$1${JSON.stringify(entry.sha256)}$2`);
   }
 
   if (nextManifest !== originalManifest) {

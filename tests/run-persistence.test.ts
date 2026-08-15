@@ -381,6 +381,17 @@ test("generateRunId produces unique ids", () => {
 });
 
 test(
+  "createRunPersistence rejects oversized durable records without truncating them",
+  withTempCwd(async (cwd) => {
+    const rp = createRunPersistence(cwd, undefined, { maxDurableRunBytes: 256 });
+    const state = baseRunState("too-large");
+    state.result = { complete: "x".repeat(2_000) };
+    assert.throws(() => rp.save(state), /PERSISTENCE_SIZE_LIMIT|byte.*limit/i);
+    assert.equal(rp.load("too-large"), null, "a rejected publication must not create a resumable partial record");
+  }),
+);
+
+test(
   "createRunPersistence save throws ENOSPC when disk is full",
   withTempCwd(async (cwd) => {
     const rp = createRunPersistence(cwd, {
@@ -873,6 +884,30 @@ test(
 
     rp.releaseRunLease(lease);
     assert.equal(existsSync(join(workflowProjectPaths(cwd).runsDir, "lease-1.lock")), false, "owner token releases");
+  }),
+);
+
+test(
+  "run lease rejects a same-PID lock from an earlier process nonce",
+  withTempCwd(async (cwd) => {
+    const rp = createRunPersistence(cwd);
+    const runsDir = workflowProjectPaths(cwd).runsDir;
+    mkdirSync(runsDir, { recursive: true });
+    writeFileSync(
+      join(runsDir, "reused-pid.lock"),
+      JSON.stringify({
+        runId: "reused-pid",
+        runPath: join(runsDir, "reused-pid.json"),
+        pid: process.pid,
+        startedAt: "2020-01-01T00:00:00.000Z",
+        token: "old-owner",
+        processNonce: "old-process-incarnation",
+      }),
+      "utf8",
+    );
+    const lease = rp.acquireRunLease("reused-pid");
+    assert.ok(lease, "a same-PID lock with a different process nonce is stale");
+    rp.releaseRunLease(lease);
   }),
 );
 

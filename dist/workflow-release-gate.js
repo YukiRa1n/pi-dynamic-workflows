@@ -240,9 +240,7 @@ function validateWorkflowControlSurface() {
         }
     }
     const runId = properties.runId;
-    if (!isRecord(runId) ||
-        runId.type !== "string" ||
-        (typeof runId.minLength === "number" && runId.minLength > 0)) {
+    if (!isRecord(runId) || runId.type !== "string" || (typeof runId.minLength === "number" && runId.minLength > 0)) {
         diagnostics.push(diagnostic(WorkflowReleaseDiagnosticCode.TOOL_INPUT_MISMATCH, "workflow_control.runId", "workflow_control runId must be an optional string so list wrappers may send an empty compatibility value."));
     }
     return diagnostics;

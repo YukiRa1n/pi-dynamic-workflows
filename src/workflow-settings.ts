@@ -7,8 +7,8 @@
 
 import { existsSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { readJsonWithBackupRecovery, resolvePersistenceFs, writeJsonAtomicWithBackup } from "./fs-persistence.js";
 import { MAX_AGENT_RETRIES, MAX_CONCURRENCY, normalizeKeywordTriggerWord } from "./config.js";
+import { readJsonWithBackupRecovery, resolvePersistenceFs, writeJsonAtomicWithBackup } from "./fs-persistence.js";
 import { workflowHomeDir, workflowProjectPaths } from "./workflow-paths.js";
 
 export interface WorkflowSettings {

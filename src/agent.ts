@@ -119,11 +119,10 @@ export function throwIfProviderExecutionError(messages: unknown[], label?: strin
   if (err?.stopReason !== "error") return;
   const { matched } = classifyProviderLimit(err.errorMessage);
   if (matched) return; // usage/quota handled by throwIfProviderLimit.
-  throw new WorkflowError(
-    err.errorMessage ?? "Provider execution failed",
-    WorkflowErrorCode.AGENT_EXECUTION_ERROR,
-    { recoverable: false, agentLabel: label },
-  );
+  throw new WorkflowError(err.errorMessage ?? "Provider execution failed", WorkflowErrorCode.AGENT_EXECUTION_ERROR, {
+    recoverable: false,
+    agentLabel: label,
+  });
 }
 
 /** Minimal session surface resolveStructuredOutput needs (real session or a test double). */
@@ -435,10 +434,7 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
   signal?: AbortSignal;
   /** Called after the child session is created and before its first prompt. */
   onSessionReady?: (session: {
-    sendUserMessage(
-      content: string,
-      options?: { deliverAs?: "steer" | "followUp" },
-    ): Promise<void>;
+    sendUserMessage(content: string, options?: { deliverAs?: "steer" | "followUp" }): Promise<void>;
   }) => void;
   /** Release a same-prefix fan-out gate when the first assistant response starts. */
   onFirstAssistantMessage?: () => void;
@@ -452,10 +448,7 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
   };
   /** Called when this child session is disposed, including failed attempts. */
   onSessionEnd?: (session: {
-    sendUserMessage(
-      content: string,
-      options?: { deliverAs?: "steer" | "followUp" },
-    ): Promise<void>;
+    sendUserMessage(content: string, options?: { deliverAs?: "steer" | "followUp" }): Promise<void>;
   }) => void;
   /**
    * Called once with this subagent's real usage, read from the session right
@@ -957,7 +950,9 @@ export class WorkflowAgent {
         // Cache telemetry is diagnostic only.
       }
       if (options.signal?.aborted) throw new Error("Subagent was aborted");
-      const promptPromise = session.prompt(this.buildPrompt(prompt, options as AgentRunOptions<any>, Boolean(options.schema)));
+      const promptPromise = session.prompt(
+        this.buildPrompt(prompt, options as AgentRunOptions<any>, Boolean(options.schema)),
+      );
       try {
         options.onSessionReady?.(session);
       } catch {

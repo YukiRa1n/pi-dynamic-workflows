@@ -3,9 +3,9 @@ import type { AgentUsage } from "./agent.js";
 import { type AgentRunOptions, type WorkflowAgentOptions } from "./agent.js";
 import type { AgentHistoryEntry } from "./agent-history.js";
 import { type AgentRegistry } from "./agent-registry.js";
+import { type AgentTeamSnapshot } from "./agent-team.js";
 import { WorkflowErrorCode } from "./errors.js";
 import { SharedStore } from "./shared-store.js";
-import { type AgentTeamSnapshot } from "./agent-team.js";
 export interface WorkflowMetaPhase {
     title: string;
     detail?: string;
@@ -37,6 +37,8 @@ export interface JournalEntry {
     /** sha256 of the call's identity (prompt + model + phase + agentType + schema). */
     hash: string;
     result: unknown;
+    /** Concrete provider/model used by this agent call. Absent on checkpoints and legacy journals. */
+    model?: string;
     /**
      * Per-agent write delta (keys set by this agent) for additive replay on resume.
      * Replaces the former full-map snapshot to fix parallel-agent ordering: applying
@@ -164,8 +166,12 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
     signal?: AbortSignal;
     /** Maximum number of agents allowed in this run. Default: 1000 */
     maxAgents?: number;
-    /** Timeout per agent in milliseconds. null/omitted means no hard timeout. */
+    /** Timeout per agent in milliseconds. null/omitted means no per-agent hard timeout. */
     agentTimeoutMs?: number | null;
+    /** Finite logical wall-clock deadline for this workflow frame. */
+    workflowTimeoutMs?: number;
+    /** Alias accepted by direct callers for workflowTimeoutMs. */
+    wallClockTimeoutMs?: number;
     /** Whether to persist logs to disk. Default: true */
     persistLogs?: boolean;
     /** Run ID for persistence. Auto-generated if not provided. */
@@ -181,6 +187,8 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
     resumeJournal?: Map<string, JournalEntry>;
     /** Resume: the run being resumed (informational; enables resume mode). */
     resumeFromRunId?: string;
+    /** Internal hash of a nested frame's script/args; prevents stale child replay. */
+    resumeContextHash?: string;
     /** Called after each live agent completes so the caller can persist the journal. */
     onAgentJournal?: (entry: JournalEntry) => void;
     /**
@@ -237,7 +245,7 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
      * message into the host conversation. Absent => deliver() no-ops.
      */
     onDeliver?: (message: string) => void | Promise<void>;
-    /** Consume host messages before the next live agent() call. */
+    /** Consume coordinator-session messages before the next live agent() call. */
     takePendingMessages?: () => string[];
     /** Called when a workflow-scoped Agent Team is created. */
     onTeamCreated?: (team: AgentTeamSnapshot) => void;
@@ -250,6 +258,13 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
         phase?: string;
         prompt: string;
         model?: string;
+    }) => void;
+    /** Update the live snapshot as soon as the child resolves its concrete provider/model. */
+    onAgentModelResolved?: (event: {
+        id: string;
+        label: string;
+        phase?: string;
+        model: string;
     }) => void;
     /** Register the live child session so the host can send a targeted reply. */
     onAgentSession?: (event: {
@@ -374,6 +389,10 @@ export interface CheckpointOptions {
     timeoutMs?: number;
 }
 export declare function runWorkflow<T = unknown>(script: string, options?: WorkflowRunOptions): Promise<WorkflowRunResult<T>>;
+export declare function formatWorkflowCoordinatorMessage(message: string, source: {
+    runId: string;
+    agentId?: string;
+}): string;
 export declare function parseWorkflowScript(script: string): {
     meta: WorkflowMeta;
     body: string;

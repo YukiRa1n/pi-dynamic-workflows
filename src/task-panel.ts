@@ -19,11 +19,11 @@ import {
   type WorkflowAgentSnapshot,
   type WorkflowSnapshot,
 } from "./display.js";
+import { serializeBounded, truncateUtf8 } from "./safe-serialize.js";
 import type { ManagedRun, WorkflowManager } from "./workflow-manager.js";
 import type { WorkflowStorage } from "./workflow-saved.js";
 import type { WorkflowSettings } from "./workflow-settings.js";
 import { shortModel } from "./workflow-ui.js";
-import { safeStringify } from "./safe-serialize.js";
 
 // `tokenUsage` is included so the detailed panel's live token/s counter refreshes
 // as tokens accrue (not only on agent start/end). It is harmless in compact mode —
@@ -65,39 +65,61 @@ const DEFAULT_DELIVERY_RESULT_CHARS = 12_000;
  * an explicit retrieval pointer supplied by deliverText().
  */
 function summarizeResult(result: unknown, maxChars = DEFAULT_DELIVERY_RESULT_CHARS): string {
+  const limit = Math.max(1, Math.floor(maxChars));
   let serialized: string;
   if (typeof result === "string") {
     serialized = result;
   } else if (result && typeof result === "object" && !Array.isArray(result)) {
-    const record = result as Record<string, unknown>;
-    // Built-ins and well-authored workflows conventionally expose their user-
-    // facing artifact as report/synthesis/summary/answer. Put that semantic
-    // product first so a bounded projection never spends its entire budget on
-    // large intermediate arrays that precede `report` in object insertion order.
-    const preferredKey = ["report", "synthesis", "summary", "answer"].find(
-      (key) => typeof record[key] === "string" && (record[key] as string).trim().length > 0,
-    );
-    if (preferredKey) {
-      const artifact = record[preferredKey] as string;
-      const metadata = Object.fromEntries(Object.entries(record).filter(([key]) => key !== preferredKey));
-      const metadataText = safeStringify(metadata);
-      serialized = `${artifact}\n\n[Workflow metadata]\n${metadataText}`;
+    const record = result as object;
+    // Inspect data descriptors only: a provider projection must not invoke a
+    // getter/proxy conversion merely to find the preferred report field.
+    let preferredKey: string | undefined;
+    let artifact: string | undefined;
+    try {
+      for (const key of ["report", "synthesis", "summary", "answer"]) {
+        const descriptor = Object.getOwnPropertyDescriptor(record, key);
+        if (!descriptor || descriptor.get || descriptor.set || typeof descriptor.value !== "string") continue;
+        if (descriptor.value.trim()) {
+          preferredKey = key;
+          artifact = descriptor.value;
+          break;
+        }
+      }
+    } catch {
+      // The complete value remains durable; an inaccessible projection simply
+      // falls back to the bounded descriptor traversal.
+    }
+    if (preferredKey && artifact !== undefined) {
+      const metadata: Record<string, unknown> = Object.create(null);
+      try {
+        for (const key of Reflect.ownKeys(record)) {
+          if (typeof key !== "string" || key === preferredKey) continue;
+          const descriptor = Object.getOwnPropertyDescriptor(record, key);
+          if (!descriptor) metadata[key] = "[Unserializable node]";
+          else if (descriptor.get || descriptor.set) metadata[key] = "[Accessor]";
+          else metadata[key] = descriptor.value;
+        }
+      } catch {
+        // Keep the artifact even when a proxy refuses metadata inspection.
+      }
+      serialized = `${artifact}\n\n[Workflow metadata]\n${serializeBounded(metadata, { maxBytes: limit + 512 })}`;
     } else {
-      serialized = safeStringify(result);
+      serialized = serializeBounded(result, { maxBytes: limit + 512 });
     }
   } else {
-    serialized = safeStringify(result);
+    serialized = serializeBounded(result, { maxBytes: limit + 512 });
   }
-  if (serialized.length <= maxChars) return serialized;
+  if (Buffer.byteLength(serialized, "utf8") <= limit) return serialized;
   // Keep both beginning and end: prefix-only truncation can hide conclusions,
   // caveats, or security findings placed at the tail. Exact content remains in
-  // the durable run record.
-  const marker = `\n\n[... middle omitted; final workflow result projected to ${maxChars} characters ...]\n\n`;
-  if (maxChars <= marker.length) return marker.slice(0, maxChars);
-  const available = maxChars - marker.length;
+  // the durable run record. The internal serializer cap above ensures this
+  // branch never traverses a giant value before projection.
+  const marker = `\n\n[... middle omitted; final workflow result projected to ${limit} characters ...]\n\n`;
+  if (limit <= marker.length) return truncateUtf8(marker, limit, "");
+  const available = limit - Buffer.byteLength(marker, "utf8");
   const head = Math.ceil(available * 0.7);
   const tail = available - head;
-  return `${serialized.slice(0, head)}${marker}${serialized.slice(serialized.length - tail)}`;
+  return `${truncateUtf8(serialized, head, "")}${marker}${truncateUtf8(serialized.slice(-tail), tail, "")}`;
 }
 
 function safeAgentSnapshots(value: unknown): WorkflowAgentSnapshot[] {
@@ -153,6 +175,7 @@ function persistedResultPath(manager: WorkflowManager, runId: string): string | 
  * fork). See installResultDelivery / suspendResultDelivery.
  */
 interface DeliveryHolder {
+  manager: WorkflowManager;
   pi: ExtensionAPI;
   loadSettings?: () => WorkflowSettings;
   /** Extension-level batching bridge. Standalone consumers leave this unset. */
@@ -183,6 +206,7 @@ export type WorkflowDeliveryPayload = {
     notificationKind?: "workflow-result";
     runId?: string;
     sequence?: number;
+    deliveryId?: string;
   };
 };
 
@@ -211,6 +235,19 @@ function enqueuePending(holder: DeliveryHolder, payload: WorkflowDeliveryPayload
 
 function trySend(holder: DeliveryHolder, payload: WorkflowDeliveryPayload): void {
   const startedGeneration = holder.generation;
+  const durable = Boolean(payload.details?.runId && payload.details.deliveryId);
+  if (
+    durable &&
+    !holder.manager.acknowledgeDelivery(
+      payload.details!.runId!,
+      payload.details!.deliveryId!,
+      startedGeneration,
+      "submitted",
+    )
+  ) {
+    enqueuePending(holder, payload);
+    return;
+  }
   try {
     if (holder.sendResult) {
       holder.sendResult(payload);
@@ -224,8 +261,10 @@ function trySend(holder: DeliveryHolder, payload: WorkflowDeliveryPayload): void
       { triggerTurn: true, deliverAs: "steer" },
     );
     // sendMessage may return a promise (defensive — current pi types it void).
-    // On rejection: re-queue, and if a newer generation already installed
-    // while we were in flight, flush now so the content is not stranded.
+    // Standalone delivery has no provider-response hook, so even a successful
+    // host submission remains in the durable outbox. The next generation can
+    // replay it at-least-once; only the full extension bridge can acknowledge
+    // after provider acceptance.
     void Promise.resolve(ret).catch((err: unknown) => {
       enqueuePending(holder, payload);
       const msg = err instanceof Error ? err.message : String(err);
@@ -245,6 +284,36 @@ function flushPending(holder: DeliveryHolder): void {
   if (holder.suspended || holder.pending.length === 0) return;
   const queued = holder.pending.splice(0, holder.pending.length);
   for (const payload of queued) trySend(holder, payload);
+}
+
+/** Reconstruct terminal notifications that survived a process/session restart.
+ * Standalone consumers do not have extensions/workflow.ts's richer bridge, so
+ * they must refill from the manager's durable outbox themselves. */
+function replayStandaloneOutbox(holder: DeliveryHolder): void {
+  try {
+    for (const record of holder.manager.listPendingDeliveries()) {
+      if (record.kind !== "terminal") continue;
+      if (holder.pending.some((item) => item.details?.deliveryId === record.deliveryId)) continue;
+      const run = holder.manager.getRun(record.runId);
+      const content = run
+        ? deliverText(run, { resultPath: persistedResultPath(holder.manager, record.runId) })
+        : `${record.runStatus === "completed" ? "✓" : "✗"} Background workflow ${record.runId} ${record.runStatus}.`;
+      enqueuePending(holder, {
+        content,
+        details: {
+          status: record.runStatus === "completed" ? "completed" : "failed",
+          isError: record.runStatus !== "completed",
+          notificationKind: "workflow-result",
+          runId: record.runId,
+          sequence: record.sequence,
+          deliveryId: record.deliveryId,
+        },
+      });
+    }
+  } catch {
+    // A transient persistence/read failure leaves the durable outbox untouched;
+    // the next generation can retry reconstruction.
+  }
 }
 
 /**
@@ -270,6 +339,7 @@ export function resumeResultDelivery(manager: WorkflowManager): void {
   const holder = deliveryManager(manager).__holder;
   if (!holder) return;
   holder.suspended = false;
+  replayStandaloneOutbox(holder);
   flushPending(holder);
 }
 
@@ -309,16 +379,24 @@ function installResultContextBridge(pi: ExtensionAPI): void {
         output.push(message && typeof message === "object" ? { ...message } : message);
         continue;
       }
-      const text = typeof message.content === "string" ? message.content : String(message.content ?? "");
-      const toolCallId = `workflow_result_${index}_${message.timestamp ?? 0}`;
+      const contentDescriptor =
+        message && typeof message === "object" ? Object.getOwnPropertyDescriptor(message, "content") : undefined;
+      const rawText =
+        contentDescriptor && !contentDescriptor.get && !contentDescriptor.set ? contentDescriptor.value : "";
+      const text = truncateUtf8(typeof rawText === "string" ? rawText : String(rawText ?? ""), 32_000, "…");
+      const deliveryId =
+        message.details && typeof message.details.deliveryId === "string" ? message.details.deliveryId : undefined;
+      const toolCallId = deliveryId ?? `workflow_result_${index}_${message.timestamp ?? 0}`;
       output.push({
         role: "assistant",
-        content: [{
-          type: "toolCall",
-          id: toolCallId,
-          name: "workflow_delivery",
-          arguments: { customType: "workflow-result", status: message.details?.status ?? null },
-        }],
+        content: [
+          {
+            type: "toolCall",
+            id: toolCallId,
+            name: "workflow_delivery",
+            arguments: { customType: "workflow-result", status: message.details?.status ?? null },
+          },
+        ],
         stopReason: "toolUse",
         timestamp: message.timestamp ?? Date.now(),
       });
@@ -367,6 +445,7 @@ export function installResultDelivery(
   }
   m.__deliveryInstalled = true;
   m.__holder = {
+    manager,
     pi,
     loadSettings: opts.loadSettings,
     sendResult: opts.sendResult,
@@ -386,45 +465,63 @@ export function installResultDelivery(
   };
 
   let notificationSequence = 0;
-  manager.on("complete", ({ runId }: { runId: string }) => {
-    const run = manager.getRun(runId);
-    // Only background/resumed runs are delivered: a foreground (sync) run already
-    // returns its result inline as the tool result, so re-delivering would dup it.
-    if (run?.background) {
-      let maxChars: number | undefined;
-      try {
-        maxChars = m.__holder?.loadSettings?.().deliveredResultMaxChars;
-      } catch {
-        // Settings are optional presentation input; delivery must still proceed.
+  manager.on(
+    "complete",
+    ({ runId, deliveryId, sequence }: { runId: string; deliveryId?: string; sequence?: number }) => {
+      const run = manager.getRun(runId);
+      // Only background/resumed runs are delivered: a foreground (sync) run already
+      // returns its result inline as the tool result, so re-delivering would dup it.
+      if (run?.background) {
+        let maxChars: number | undefined;
+        try {
+          maxChars = m.__holder?.loadSettings?.().deliveredResultMaxChars;
+        } catch {
+          // Settings are optional presentation input; delivery must still proceed.
+        }
+        deliver({
+          content: deliverText(run, {
+            resultPath: persistedResultPath(manager, runId),
+            maxChars,
+          }),
+          details: {
+            status: "completed",
+            isError: false,
+            notificationKind: "workflow-result",
+            runId,
+            sequence: sequence ?? notificationSequence++,
+            deliveryId,
+          },
+        });
       }
+    },
+  );
+  manager.on(
+    "error",
+    ({
+      runId,
+      error,
+      deliveryId,
+      sequence,
+    }: {
+      runId: string;
+      error?: { message?: string };
+      deliveryId?: string;
+      sequence?: number;
+    }) => {
+      if (!manager.getRun(runId)?.background) return;
       deliver({
-        content: deliverText(run, {
-          resultPath: persistedResultPath(manager, runId),
-          maxChars,
-        }),
+        content: `✗ Background workflow ${runId} failed: ${error?.message ?? "unknown error"}`,
         details: {
-          status: "completed",
-          isError: false,
+          status: "failed",
+          isError: true,
           notificationKind: "workflow-result",
           runId,
-          sequence: notificationSequence++,
+          sequence: sequence ?? notificationSequence++,
+          deliveryId,
         },
       });
-    }
-  });
-  manager.on("error", ({ runId, error }: { runId: string; error?: { message?: string } }) => {
-    if (!manager.getRun(runId)?.background) return;
-    deliver({
-      content: `✗ Background workflow ${runId} failed: ${error?.message ?? "unknown error"}`,
-      details: {
-        status: "failed",
-        isError: true,
-        notificationKind: "workflow-result",
-        runId,
-        sequence: notificationSequence++,
-      },
-    });
-  });
+    },
+  );
   // A provider usage/quota limit checkpoints the run as paused (not failed): tell the
   // user it is resumable once their budget refills, rather than letting it look dead.
   // Manual pause() also emits "paused" but with no reason — guard so only the

@@ -3,8 +3,37 @@
  */
 /** Maximum number of agents allowed per workflow run. */
 export declare const MAX_AGENTS_PER_RUN = 1000;
-/** Default timeout for a single agent in milliseconds. null means no hard timeout. */
+/** Maximum number of items materialized by one parallel()/pipeline() fan-out. */
+export declare const MAX_FANOUT_ITEMS = 10000;
+/** Maximum log entries retained by one workflow run. */
+export declare const MAX_WORKFLOW_LOG_ENTRIES = 10000;
+/** Maximum UTF-8 bytes retained by one workflow run's logs. */
+export declare const MAX_WORKFLOW_LOG_BYTES: number;
+/** Maximum UTF-8 bytes admitted to one provider-facing agent prompt. */
+export declare const MAX_AGENT_PROMPT_BYTES: number;
+/** Maximum complete JSON bytes published for one durable workflow record. */
+export declare const MAX_DURABLE_RUN_BYTES: number;
+/** Default in-memory paused-run retention; persisted paused runs remain resumable. */
+export declare const DEFAULT_MAX_PAUSED_RUNS_IN_MEMORY = 20;
+/** Maximum members/tasks/messages retained by one workflow team by default. */
+export declare const DEFAULT_MAX_TEAM_MEMBERS = 100;
+export declare const DEFAULT_MAX_TEAM_TASKS = 2000;
+export declare const DEFAULT_MAX_TEAM_MESSAGES = 4096;
+/** SharedStore resource ceilings. Values are rejected before they enter the store. */
+export declare const MAX_SHARED_STORE_KEYS = 2048;
+export declare const MAX_SHARED_STORE_KEY_BYTES: number;
+export declare const MAX_SHARED_STORE_VALUE_BYTES: number;
+export declare const MAX_SHARED_STORE_TOTAL_BYTES: number;
+/** Default timeout for a single agent in milliseconds. null means no per-agent hard timeout. */
 export declare const DEFAULT_AGENT_TIMEOUT_MS: null;
+/** Finite logical wall-clock deadline for one workflow frame (30 minutes). */
+export declare const DEFAULT_WORKFLOW_TIMEOUT_MS: number;
+/** Maximum accepted workflow/agent deadline (24 hours). */
+export declare const MAX_WORKFLOW_TIMEOUT_MS: number;
+/** Maximum time spent draining cooperative provider attempts after logical close. */
+export declare const WORKFLOW_DRAIN_GRACE_MS = 5000;
+/** Maximum uninterrupted synchronous VM execution before yielding/aborting. */
+export declare const VM_EXECUTION_TIMEOUT_MS = 1000;
 /** Maximum concurrent agents (matches Claude Code limit). */
 export declare const MAX_CONCURRENCY = 16;
 /** Maximum automatic retry attempts after a recoverable agent failure. */

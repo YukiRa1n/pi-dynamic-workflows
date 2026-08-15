@@ -101,6 +101,42 @@ describe("installResultDelivery", () => {
     assert.ok(calls[0].content.includes("1.5s"), "should contain 1.5s");
   });
 
+  it("replays a durable terminal outbox record with stable at-least-once identity", async () => {
+    const pi = createMockPi();
+    const manager = createMockManager(makeRun(), "/runs") as ReturnType<typeof createMockManager> & {
+      listPendingDeliveries: () => unknown[];
+      acknowledgeDelivery: (...args: unknown[]) => boolean;
+    };
+    let pending = true;
+    const phases: string[] = [];
+    manager.listPendingDeliveries = () =>
+      pending
+        ? [
+            {
+              runId: "test-run-1",
+              workflowName: "test-workflow",
+              runStatus: "completed",
+              kind: "terminal",
+              sequence: 4,
+              deliveryId: "delivery-4",
+            },
+          ]
+        : [];
+    manager.acknowledgeDelivery = (_runId, _id, _generation, phase) => {
+      phases.push(String(phase));
+      if (phase === "acknowledged") pending = false;
+      return true;
+    };
+
+    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
+    mod.resumeResultDelivery(manager);
+    await Promise.resolve();
+
+    assert.equal((pi as unknown as { _calls: unknown[] })._calls.length, 1);
+    assert.deepEqual(phases, ["submitted"]);
+    assert.equal(pending, true, "standalone delivery cannot acknowledge without a provider-response hook");
+  });
+
   it("shows the fresh/cache split and cost in the delivery line", () => {
     const pi = createMockPi();
     // A caching model: little fresh input+output, most of the tokens are cheap cache reads.
@@ -278,7 +314,10 @@ describe("installResultDelivery", () => {
     manager.emit("complete", { runId: "test-run-1" });
 
     const content = (pi as unknown as { _calls: { content: string }[] })._calls[0].content;
-    assert.ok(content.includes("middle omitted") || !content.includes("z".repeat(200)), "the 50-char setting bounds a sub-default dump");
+    assert.ok(
+      content.includes("middle omitted") || !content.includes("z".repeat(200)),
+      "the 50-char setting bounds a sub-default dump",
+    );
     assert.ok(!content.includes("z".repeat(200)), "the body is cut at the configured threshold");
     assert.ok(content.includes(join("/runs", "test-run-1.json")), "pointer still appended");
   });

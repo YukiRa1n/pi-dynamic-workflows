@@ -5,6 +5,7 @@
 import { join } from "node:path";
 import type { AgentUsage } from "./agent.js";
 import type { AgentHistoryEntry } from "./agent-history.js";
+import { MAX_DURABLE_RUN_BYTES } from "./config.js";
 import type { WorkflowErrorCode } from "./errors.js";
 import {
   ensureDir as ensureDirFs,
@@ -17,6 +18,31 @@ import {
 import { workflowProjectPaths } from "./workflow-paths.js";
 
 export type RunStatus = "pending" | "running" | "paused" | "completed" | "failed" | "aborted";
+
+export type DeliveryOutboxStatus = "pending" | "submitted" | "projected";
+export type DeliveryOutboxKind = "explicit" | "terminal";
+
+/** A durable, replayable logical delivery. The provider-facing projection is
+ * deliberately not persisted here; `content` is the complete explicit text,
+ * while terminal records point at the complete run result and are projected by
+ * the host at send time. `generation` is fencing metadata, never identity. */
+export interface PersistedDeliveryRecord {
+  deliveryId: string;
+  sequence: number;
+  kind: DeliveryOutboxKind;
+  status: DeliveryOutboxStatus;
+  content?: string;
+  terminal?: boolean;
+  generation?: number;
+  createdAt: string;
+}
+
+export interface DeliveryBudgetState {
+  explicitCount: number;
+  explicitBytes: number;
+  windowStartedAt: number;
+  windowCount: number;
+}
 
 export interface PersistedAgentState {
   id: number;
@@ -88,6 +114,7 @@ export interface PersistedRunState {
     runId?: string;
     hash: string;
     result: unknown;
+    model?: string;
     storeDelta?: Record<string, unknown>;
   }>;
   /**
@@ -128,6 +155,11 @@ export interface PersistedRunState {
    */
   agentTimeoutMs?: number | null;
   /**
+   * The run's finite logical wall-clock deadline, fixed at start. Legacy
+   * records without this field resume with the manager's current default.
+   */
+  workflowTimeoutMs?: number;
+  /**
    * The run's resolved concurrency, fixed at start (per-run value, else the
    * manager's concurrency at the time). Same rationale as tokenBudget.
    */
@@ -143,6 +175,12 @@ export interface PersistedRunState {
    * auto-resume attempt has been recorded yet.
    */
   autoResumeAttempts?: number;
+  /** Stable-ID at-least-once delivery outbox. Acknowledged records are removed. */
+  deliveryOutbox?: PersistedDeliveryRecord[];
+  /** Monotonic sequence allocator retained even after acknowledged records leave the outbox. */
+  nextDeliverySequence?: number;
+  /** Cumulative explicit-delivery admission accounting, retained after ack. */
+  deliveryBudget?: DeliveryBudgetState;
 }
 
 export interface RunPersistence {
@@ -191,6 +229,8 @@ interface LockFile {
   pid: number;
   startedAt: string;
   token: string;
+  /** Process-start nonce; unlike PID it changes after a process restart. */
+  processNonce?: string;
 }
 
 /**
@@ -211,10 +251,20 @@ export type FsLayer = PersistenceFsLayer;
  * per-call directory scan bounded.
  */
 export const DEFAULT_MAX_TERMINAL_RUNS_ON_DISK = 300;
+/** Maximum complete UTF-8 JSON size for one persisted run record. */
+export { MAX_DURABLE_RUN_BYTES };
+
+function boundedPositive(value: number | undefined, fallback: number): number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : fallback;
+}
 
 const TERMINAL_RUN_STATUSES: ReadonlySet<RunStatus> = new Set(["completed", "failed", "aborted"]);
 
 const SAFE_RUN_ID = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+// A PID can be reused after a crash. Locks written by this process carry a
+// nonce so a same-PID lock from an earlier process incarnation is not mistaken
+// for a live owner. Legacy locks without the field remain conservative.
+const PROCESS_LOCK_NONCE = `${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 /** Validate IDs before they reach any filesystem or in-memory run boundary. */
 export function assertSafeRunId(runId: string): void {
   if (
@@ -232,6 +282,8 @@ export function assertSafeRunId(runId: string): void {
 export interface RunPersistenceOptions {
   /** Override DEFAULT_MAX_TERMINAL_RUNS_ON_DISK (tests; advanced tuning). */
   maxTerminalRunsOnDisk?: number;
+  /** Override MAX_DURABLE_RUN_BYTES (tests; advanced tuning). */
+  maxDurableRunBytes?: number;
 }
 
 /**
@@ -261,7 +313,8 @@ export function createRunPersistence(
   const _statSync = fs.statSync;
   const _unlinkSync = fs.unlinkSync;
   const _writeFileSync = fs.writeFileSync;
-  const maxTerminalRunsOnDisk = options?.maxTerminalRunsOnDisk ?? DEFAULT_MAX_TERMINAL_RUNS_ON_DISK;
+  const maxTerminalRunsOnDisk = boundedPositive(options?.maxTerminalRunsOnDisk, DEFAULT_MAX_TERMINAL_RUNS_ON_DISK);
+  const maxDurableRunBytes = boundedPositive(options?.maxDurableRunBytes, MAX_DURABLE_RUN_BYTES);
 
   const paths = workflowProjectPaths(cwd);
   const runsDir = paths.runsDir;
@@ -280,8 +333,7 @@ export function createRunPersistence(
   const validateState = (value: unknown, expectedRunId?: string): PersistedRunState | null => {
     const isRecord = (item: unknown): item is Record<string, unknown> =>
       item !== null && typeof item === "object" && !Array.isArray(item);
-    const isText = (item: unknown, max = 1_000_000): item is string =>
-      typeof item === "string" && item.length <= max;
+    const isText = (item: unknown, max = 1_000_000): item is string => typeof item === "string" && item.length <= max;
     const isFiniteCount = (item: unknown): item is number =>
       typeof item === "number" && Number.isFinite(item) && item >= 0;
     const state = value as Partial<PersistedRunState>;
@@ -297,19 +349,38 @@ export function createRunPersistence(
     if (state.revision !== undefined && (!Number.isSafeInteger(state.revision) || state.revision < 1)) return null;
     if (!isText(state.startedAt, 200) || !isText(state.updatedAt, 200)) return null;
     if (state.completedAt !== undefined && !isText(state.completedAt, 200)) return null;
-    if (!Array.isArray(state.phases) || state.phases.length > 10_000 || state.phases.some((p) => !isText(p, 10_000))) return null;
-    if (!Array.isArray(state.logs) || state.logs.length > 100_000 || state.logs.some((entry) => !isText(entry, 1_000_000))) return null;
+    if (!Array.isArray(state.phases) || state.phases.length > 10_000 || state.phases.some((p) => !isText(p, 10_000)))
+      return null;
+    if (
+      !Array.isArray(state.logs) ||
+      state.logs.length > 100_000 ||
+      state.logs.some((entry) => !isText(entry, 1_000_000))
+    )
+      return null;
     if (!Array.isArray(state.agents) || state.agents.length > 100_000) return null;
     const agentStatuses: ReadonlySet<string> = new Set(["queued", "running", "done", "error", "skipped"]);
     for (const agent of state.agents) {
       if (!isRecord(agent) || !Number.isSafeInteger(agent.id) || agent.id < 0) return null;
-      if (!isText(agent.label, 10_000) || !isText(agent.prompt, 1_000_000) || typeof agent.status !== "string" || !agentStatuses.has(agent.status)) return null;
+      if (
+        !isText(agent.label, 10_000) ||
+        !isText(agent.prompt, 1_000_000) ||
+        typeof agent.status !== "string" ||
+        !agentStatuses.has(agent.status)
+      )
+        return null;
       if (agent.callId !== undefined && !isText(agent.callId, 1_000)) return null;
       if (agent.phase !== undefined && !isText(agent.phase, 10_000)) return null;
+      if (agent.model !== undefined && !isText(agent.model, 1_000)) return null;
       if (agent.resultPreview !== undefined && !isText(agent.resultPreview, 1_000_000)) return null;
       if (agent.error !== undefined && !isText(agent.error, 1_000_000)) return null;
       if (agent.tokens !== undefined && !isFiniteCount(agent.tokens)) return null;
-      if (agent.history !== undefined && (!Array.isArray(agent.history) || agent.history.length > 100_000 || agent.history.some((entry) => !isRecord(entry)))) return null;
+      if (
+        agent.history !== undefined &&
+        (!Array.isArray(agent.history) ||
+          agent.history.length > 100_000 ||
+          agent.history.some((entry) => !isRecord(entry)))
+      )
+        return null;
       if (agent.tokenUsage !== undefined && !isRecord(agent.tokenUsage)) return null;
     }
     if (state.tokenUsage !== undefined) {
@@ -322,8 +393,10 @@ export function createRunPersistence(
     if (state.journal !== undefined) {
       if (!Array.isArray(state.journal) || state.journal.length > 100_000) return null;
       for (const entry of state.journal) {
-        if (!isRecord(entry) || !Number.isSafeInteger(entry.index) || entry.index < 0 || !isText(entry.hash, 1_000)) return null;
+        if (!isRecord(entry) || !Number.isSafeInteger(entry.index) || entry.index < 0 || !isText(entry.hash, 1_000))
+          return null;
         if (entry.runId !== undefined && !isText(entry.runId, 300)) return null;
+        if (entry.model !== undefined && !isText(entry.model, 1_000)) return null;
         if (entry.storeDelta !== undefined && !isRecord(entry.storeDelta)) return null;
       }
     }
@@ -331,8 +404,54 @@ export function createRunPersistence(
       const amount = state[key];
       if (amount !== undefined && (!Number.isSafeInteger(amount) || amount < 0)) return null;
     }
-    if (state.agentTimeoutMs !== undefined && state.agentTimeoutMs !== null && !isFiniteCount(state.agentTimeoutMs)) return null;
+    if (state.agentTimeoutMs !== undefined && state.agentTimeoutMs !== null && !isFiniteCount(state.agentTimeoutMs))
+      return null;
     if (state.tokenBudget !== undefined && state.tokenBudget !== null && !isFiniteCount(state.tokenBudget)) return null;
+    if (
+      state.nextDeliverySequence !== undefined &&
+      (!Number.isSafeInteger(state.nextDeliverySequence) || state.nextDeliverySequence < 0)
+    )
+      return null;
+    if (state.deliveryBudget !== undefined) {
+      const budget = state.deliveryBudget;
+      if (
+        !isRecord(budget) ||
+        !Number.isSafeInteger(budget.explicitCount) ||
+        budget.explicitCount < 0 ||
+        !Number.isSafeInteger(budget.explicitBytes) ||
+        budget.explicitBytes < 0 ||
+        !Number.isFinite(budget.windowStartedAt) ||
+        budget.windowStartedAt < 0 ||
+        !Number.isSafeInteger(budget.windowCount) ||
+        budget.windowCount < 0
+      )
+        return null;
+    }
+    if (state.deliveryOutbox !== undefined) {
+      if (!Array.isArray(state.deliveryOutbox) || state.deliveryOutbox.length > 512) return null;
+      const deliveryStatuses = new Set(["pending", "submitted", "projected"]);
+      const deliveryKinds = new Set(["explicit", "terminal"]);
+      for (const delivery of state.deliveryOutbox) {
+        if (
+          !isRecord(delivery) ||
+          !isText(delivery.deliveryId, 300) ||
+          !Number.isSafeInteger(delivery.sequence) ||
+          delivery.sequence < 0 ||
+          typeof delivery.kind !== "string" ||
+          !deliveryKinds.has(delivery.kind) ||
+          typeof delivery.status !== "string" ||
+          !deliveryStatuses.has(delivery.status) ||
+          !isText(delivery.createdAt, 200)
+        )
+          return null;
+        if (delivery.content !== undefined && !isText(delivery.content, 1_000_000)) return null;
+        if (
+          delivery.generation !== undefined &&
+          (!Number.isSafeInteger(delivery.generation) || delivery.generation < 0)
+        )
+          return null;
+      }
+    }
     return state as PersistedRunState;
   };
 
@@ -341,6 +460,8 @@ export function createRunPersistence(
   const readStateAt = (path: string, expectedRunId?: string): PersistedRunState | null => {
     for (const candidate of [path, `${path}.bak`]) {
       try {
+        const stat = _statSync(candidate);
+        if (Number.isFinite(stat.size) && stat.size > maxDurableRunBytes) continue;
         const parsed = JSON.parse(_readFileSync(candidate, "utf-8")) as unknown;
         const valid = validateState(parsed, expectedRunId);
         if (valid) return valid;
@@ -381,7 +502,9 @@ export function createRunPersistence(
         (value.pid as number) <= 0 ||
         typeof value.startedAt !== "string" ||
         typeof value.token !== "string" ||
-        value.token.length < 1
+        value.token.length < 1 ||
+        (value.processNonce !== undefined &&
+          (typeof value.processNonce !== "string" || value.processNonce.length > 200))
       )
         return null;
       assertSafeRunId(value.runId);
@@ -393,8 +516,7 @@ export function createRunPersistence(
     }
   };
 
-  const readLock = (runId: string): LockFile | null =>
-    readLockAt(primaryLockPath(runId), runId, primaryRunPath(runId));
+  const readLock = (runId: string): LockFile | null => readLockAt(primaryLockPath(runId), runId, primaryRunPath(runId));
 
   // list() cache: recomputed lazily, invalidated synchronously by every
   // mutation this instance performs (save()/delete()) so a stale read can
@@ -430,6 +552,10 @@ export function createRunPersistence(
   // changes on such a rename, so adding it closes that hole for free.
   const fileStateCache = new Map<string, { mtimeMs: number; size: number; ino: number; state: PersistedRunState }>();
 
+  const lockOwnerIsStale = (lock: LockFile): boolean =>
+    !pidIsAlive(lock.pid) ||
+    (lock.pid === process.pid && lock.processNonce !== undefined && lock.processNonce !== PROCESS_LOCK_NONCE);
+
   const removeStaleLegacyLock = (runId: string): boolean => {
     const lock = legacyLockPath(runId);
     if (!_existsSync(lock)) return true;
@@ -437,7 +563,7 @@ export function createRunPersistence(
     // Unreadable/invalid locks are treated as occupied. A conservative leak is
     // safer than deleting another process's lock after a partial publication.
     if (!existing) return false;
-    if (pidIsAlive(existing.pid)) return false;
+    if (!lockOwnerIsStale(existing)) return false;
     try {
       _unlinkSync(lock);
     } catch {
@@ -454,7 +580,14 @@ export function createRunPersistence(
     if (!removeStaleLegacyLock(runId)) return null;
     for (let attempt = 0; attempt < 2; attempt++) {
       const token = `${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
-      const payload: LockFile = { runId, runPath: path, pid: process.pid, startedAt: new Date().toISOString(), token };
+      const payload: LockFile = {
+        runId,
+        runPath: path,
+        pid: process.pid,
+        startedAt: new Date().toISOString(),
+        token,
+        processNonce: PROCESS_LOCK_NONCE,
+      };
       const tmp = `${lock}.${token}.tmp`;
       try {
         _writeFileSync(tmp, JSON.stringify(payload, null, 2), { encoding: "utf-8", mode: 0o600, flag: "wx" });
@@ -480,7 +613,7 @@ export function createRunPersistence(
         if (_existsSync(lock)) {
           const existing = readLock(runId);
           if (!existing) return null;
-          if (pidIsAlive(existing.pid)) return null;
+          if (!lockOwnerIsStale(existing)) return null;
           try {
             _unlinkSync(lock);
           } catch {
@@ -604,7 +737,8 @@ export function createRunPersistence(
       try {
         lease = acquireRunLease(run.runId);
         if (!lease) continue;
-        const fresh = readStateAt(primaryRunPath(run.runId), run.runId) ?? readStateAt(legacyRunPath(run.runId), run.runId);
+        const fresh =
+          readStateAt(primaryRunPath(run.runId), run.runId) ?? readStateAt(legacyRunPath(run.runId), run.runId);
         if (!fresh || !TERMINAL_RUN_STATUSES.has(fresh.status) || fresh.revision !== run.revision) continue;
         if (deleteRun(run.runId, fresh.revision, lease)) {
           lease = null; // delete() consumes the lock when it succeeds
@@ -665,10 +799,12 @@ export function createRunPersistence(
         if (!ownedLease) throw new Error(`Could not acquire persistence lease for ${state.runId}`);
       } else {
         const held = readLock(state.runId);
-        if (!held || held.token !== ownedLease.token) throw new Error(`Persistence lease is not held for ${state.runId}`);
+        if (!held || held.token !== ownedLease.token)
+          throw new Error(`Persistence lease is not held for ${state.runId}`);
       }
       try {
-        const current = readStateAt(primaryRunPath(state.runId), state.runId) ?? readStateAt(legacyRunPath(state.runId), state.runId);
+        const current =
+          readStateAt(primaryRunPath(state.runId), state.runId) ?? readStateAt(legacyRunPath(state.runId), state.runId);
         const actualRevision = current?.revision;
         const fence = expectedRevision !== undefined ? expectedRevision : state.revision;
         if (fence !== undefined && fence !== actualRevision) {
@@ -684,7 +820,12 @@ export function createRunPersistence(
         // Publish a copy first. Mutating the caller's revision before an I/O
         // failure would make its next retry fence against a revision that was
         // never committed durably.
-        writeJsonAtomicWithBackup(fs, path, { ...state, revision: nextRevision, updatedAt: nextUpdatedAt });
+        writeJsonAtomicWithBackup(
+          fs,
+          path,
+          { ...state, revision: nextRevision, updatedAt: nextUpdatedAt },
+          maxDurableRunBytes,
+        );
         state.revision = nextRevision;
         state.updatedAt = nextUpdatedAt;
         invalidateListCache();

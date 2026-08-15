@@ -72,6 +72,10 @@ test("workflow_control exposes only list, status, pause, resume, and stop in a s
   const tool = createWorkflowControlTool({ manager });
 
   assert.equal(tool.name, "workflow_control");
+  const guidance = [tool.description, tool.promptSnippet, ...(tool.promptGuidelines ?? [])].join(" ");
+  assert.match(guidance, /do not poll|instead of polling/i);
+  assert.match(guidance, /automatic|asynchronous/i);
+  assert.match(guidance, /does not advance/i);
 
   // The top-level parameter schema MUST be `type: "object"`. A discriminated
   // Type.Union serialized to a top-level `anyOf` with no `type`, which strict

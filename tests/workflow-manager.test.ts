@@ -621,9 +621,18 @@ test(
 );
 
 test(
-  "each agent's model is recorded for /workflows: explicit opts.model, else the main model",
+  "each agent's resolved model is recorded for /workflows without falsely inheriting the main model",
   withTempCwd(async (cwd) => {
-    const manager = new WorkflowManager({ cwd, agent: fakeAgent(), mainModel: "anthropic/claude-opus-4-8" });
+    const manager = new WorkflowManager({
+      cwd,
+      mainModel: "anthropic/claude-opus-4-8",
+      agent: {
+        async run(_prompt, options) {
+          options?.onModelResolved?.(options?.model ?? "sunrain/gpt-5.6-luna");
+          return "ok";
+        },
+      },
+    });
     const script = `export const meta = { name: 'model_demo', description: 'per-agent models' }
 const a = await agent('explore', { label: 'scan', model: 'openai/gpt-5-mini' })
 const b = await agent('reason', { label: 'judge' })
@@ -633,7 +642,12 @@ return { a, b }`;
     const run = manager.listRuns().find((r) => r.workflowName === "model_demo");
     const byLabel = Object.fromEntries((run?.agents ?? []).map((a) => [a.label, a.model]));
     assert.equal(byLabel.scan, "openai/gpt-5-mini", "explicit per-agent model is recorded");
-    assert.equal(byLabel.judge, "anthropic/claude-opus-4-8", "default agent shows the main model");
+    assert.equal(byLabel.judge, "sunrain/gpt-5.6-luna", "default agent records the provider-resolved model");
+    assert.notEqual(
+      byLabel.judge,
+      "anthropic/claude-opus-4-8",
+      "main-session model is not used as an unsupported guess",
+    );
   }),
 );
 
@@ -3560,3 +3574,23 @@ test(
     );
   }),
 );
+
+test("manager applies and persists the finite workflow wall-clock deadline", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "workflow-manager-deadline-"));
+  try {
+    const manager = new WorkflowManager({ cwd, defaultWorkflowTimeoutMs: 25, agent: fakeAgent() });
+    const { runId, promise } = manager.startInBackground(
+      "export const meta = { name: 'manager_deadline', description: 'deadline' }\nawait agent('ready')\nawait new Promise(() => {})",
+    );
+    await assert.rejects(
+      promise,
+      (error: unknown) => error instanceof WorkflowError && error.code === WorkflowErrorCode.WORKFLOW_TIMEOUT,
+    );
+    const persisted = manager.getPersistence().load(runId);
+    assert.equal(manager.getRun(runId)?.status, "failed");
+    assert.equal(persisted?.status, "failed");
+    assert.equal(persisted?.workflowTimeoutMs, 25);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});

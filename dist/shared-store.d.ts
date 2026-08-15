@@ -22,13 +22,23 @@
  * mutate a retry after its attempt has been retired.
  */
 import { type ToolDefinition } from "@earendil-works/pi-coding-agent";
+export interface SharedStoreOptions {
+    maxKeys?: number;
+    maxKeyBytes?: number;
+    maxValueBytes?: number;
+    maxTotalBytes?: number;
+}
 export declare class SharedStore {
     private readonly map;
+    private readonly valueBytes;
+    private totalBytes;
+    private readonly limits;
     private readonly agentDeltas;
     private readonly priorValues;
     private readonly keyOwners;
     private readonly retiredDeltas;
     private disposed;
+    constructor(options?: SharedStoreOptions);
     private assertLive;
     /** Reject callbacks from an exhausted/committed attempt before any read/write. */
     assertDeltaLive(deltaKey: string, message?: string): void;
@@ -41,7 +51,7 @@ export declare class SharedStore {
      * writes can be journaled and replayed independently.
      */
     trackPut(key: string, value: unknown, deltaKey: string): void;
-    /** Retrieve the value for `key`, or `undefined` when absent. */
+    /** Retrieve an owned copy of `key`, or `undefined` when absent. */
     get(key: string): unknown;
     /** Whether `key` is present in the store. */
     has(key: string): boolean;
@@ -94,6 +104,9 @@ export declare class SharedStore {
     restore(snap: Record<string, unknown>): void;
     /** Clear all entries (called when the run ends). */
     dispose(): void;
+    private admitValue;
+    private replaceValue;
+    private removeValue;
 }
 /**
  * Create per-agent store tools that attribute writes to `deltaKey`, a

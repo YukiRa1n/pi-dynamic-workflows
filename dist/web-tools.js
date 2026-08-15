@@ -15,8 +15,8 @@
  */
 import { lookup } from "node:dns/promises";
 import { request as httpRequest } from "node:http";
-import { isIP } from "node:net";
 import { request as httpsRequest } from "node:https";
+import { isIP } from "node:net";
 import { defineTool } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 const UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36";
@@ -40,7 +40,10 @@ function blockedIpv4(address) {
 }
 /** Convert every IPv4-mapped IPv6 spelling, including ::ffff:7f00:1, to dotted IPv4. */
 function mappedIpv4(address) {
-    const normalized = address.replace(/^\[|\]$/g, "").toLowerCase().split("%")[0];
+    const normalized = address
+        .replace(/^\[|\]$/g, "")
+        .toLowerCase()
+        .split("%")[0];
     if (!normalized.startsWith("::ffff:"))
         return undefined;
     const tail = normalized.slice("::ffff:".length);
@@ -54,7 +57,10 @@ function mappedIpv4(address) {
     return `${high >>> 8}.${high & 0xff}.${low >>> 8}.${low & 0xff}`;
 }
 export function blockedAddress(address) {
-    const normalized = address.replace(/^\[|\]$/g, "").toLowerCase().split("%")[0];
+    const normalized = address
+        .replace(/^\[|\]$/g, "")
+        .toLowerCase()
+        .split("%")[0];
     const mapped = mappedIpv4(normalized);
     if (mapped)
         return blockedIpv4(mapped);
@@ -176,7 +182,7 @@ export function htmlToText(html) {
 export function parseBingResults(html, limit) {
     const out = [];
     const seen = new Set();
-    for (const m of html.matchAll(/<h2[^>]*>\s*<a[^>]+href="(https?:\/\/[^\"]+)"[^>]*>([\s\S]*?)<\/a>/g)) {
+    for (const m of html.matchAll(/<h2[^>]*>\s*<a[^>]+href="(https?:\/\/[^"]+)"[^>]*>([\s\S]*?)<\/a>/g)) {
         const url = m[1];
         if (/\.bing\.com|go\.microsoft\.com/.test(url) || seen.has(url))
             continue;
@@ -236,7 +242,12 @@ export function createWebFetchTool(maxChars = 6000) {
             }
             catch (error) {
                 return {
-                    content: [{ type: "text", text: `web_fetch failed for ${params.url}: ${error instanceof Error ? error.message : error}` }],
+                    content: [
+                        {
+                            type: "text",
+                            text: `web_fetch failed for ${params.url}: ${error instanceof Error ? error.message : error}`,
+                        },
+                    ],
                     details: { status: 0, url: params.url },
                 };
             }

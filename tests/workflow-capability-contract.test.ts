@@ -45,6 +45,7 @@ const EXPECTED_TOOL_INPUTS = [
   "resumeFromRunId",
   "script",
   "tokenBudget",
+  "workflowTimeoutMs",
 ] as const;
 
 function implementations(): Record<string, unknown> {
@@ -97,9 +98,7 @@ test("createTeam and deliver remain supported runtime globals", () => {
     ["createTeam", "createTeam(name, options?) => AgentTeam"],
     ["deliver", "deliver(message) => Promise<void>"],
   ] as const) {
-    const capability = WORKFLOW_CAPABILITY_DEFINITION.capabilities.find(
-      ({ id }) => id === `workflow.runtime.${name}`,
-    );
+    const capability = WORKFLOW_CAPABILITY_DEFINITION.capabilities.find(({ id }) => id === `workflow.runtime.${name}`);
     assert.equal(capability?.support, CapabilitySupport.SUPPORTED);
     assert.equal(capability?.runtimeBinding?.global, name);
     assert.equal(capability?.runtimeBinding?.implementation, name);
@@ -115,7 +114,15 @@ test("tool-input contract records configured omission defaults and soft budget a
     ({ id }) => id === "workflow.tool-input.tokenBudget",
   );
 
-  assert.equal(agentTimeoutMs?.signature, "agentTimeoutMs?: number = configured default or unbounded");
+  assert.equal(agentTimeoutMs?.signature, "agentTimeoutMs?: number = configured default or no per-agent limit");
+  const workflowTimeoutMs = WORKFLOW_CAPABILITY_DEFINITION.capabilities.find(
+    ({ id }) => id === "workflow.tool-input.workflowTimeoutMs",
+  );
+  assert.equal(workflowTimeoutMs?.signature, "workflowTimeoutMs?: number = 30 minute default, up to 24 hours");
+  assert.deepEqual(workflowTimeoutMs?.constraints, [
+    "finite logical deadline for the complete workflow frame",
+    "cannot interrupt a pending Promise or a microtask-starved event loop",
+  ]);
   assert.equal(tokenBudget?.signature, "tokenBudget?: number = configured default or unlimited");
   assert.deepEqual(tokenBudget?.constraints, ["soft pre-call gate; in-flight work can overshoot"]);
 });

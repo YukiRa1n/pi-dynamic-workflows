@@ -2,8 +2,8 @@ import type { ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import type { AgentUsage } from "./agent.js";
 import type { AgentHistoryEntry } from "./agent-history.js";
 import type { WorkflowErrorCode } from "./errors.js";
+import { safeStringify, truncateUtf8 } from "./safe-serialize.js";
 import type { WorkflowMeta } from "./workflow.js";
-import { safeStringify } from "./safe-serialize.js";
 
 export type WorkflowAgentStatus = "queued" | "running" | "done" | "error" | "skipped";
 
@@ -365,5 +365,5 @@ export function preview(value: unknown, max = 80): string {
   if (value === null || value === undefined) return "";
   const text = typeof value === "string" ? value : safeStringify(value);
   if (!text) return "";
-  return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+  return truncateUtf8(text, max, "…");
 }

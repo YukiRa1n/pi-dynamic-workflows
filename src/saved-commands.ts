@@ -4,10 +4,10 @@
  */
 
 import { createCodingTools, type ExtensionAPI, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { safeStringify } from "./safe-serialize.js";
 import { runWorkflow, type WorkflowRunResult } from "./workflow.js";
 import type { WorkflowManager } from "./workflow-manager.js";
 import type { SavedWorkflow, WorkflowStorage } from "./workflow-saved.js";
-import { safeStringify } from "./safe-serialize.js";
 
 function isRegistered(pi: ExtensionAPI, name: string): boolean {
   try {

@@ -21,7 +21,17 @@
 import { existsSync, linkSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync, } from "node:fs";
 /** The real node:fs implementations. */
 export function defaultPersistenceFs() {
-    return { existsSync, linkSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync };
+    return {
+        existsSync,
+        linkSync,
+        mkdirSync,
+        readdirSync,
+        readFileSync,
+        renameSync,
+        statSync,
+        unlinkSync,
+        writeFileSync,
+    };
 }
 /** Merge a partial test override on top of the real node:fs implementations. */
 export function resolvePersistenceFs(overrides) {
@@ -57,7 +67,7 @@ function writeTextAtomic(fs, path, text) {
         unlinkIfExistsSafe(fs, tmpPath);
     }
 }
-export function writeJsonAtomicWithBackup(fs, path, data) {
+export function writeJsonAtomicWithBackup(fs, path, data, maxBytes) {
     // Persistence must retain native JSON semantics. The display-oriented
     // safeStringify() replaces undefined/functions/symbols with marker strings;
     // using it here turns optional fields into invalid durable values and makes a
@@ -67,6 +77,11 @@ export function writeJsonAtomicWithBackup(fs, path, data) {
     const json = JSON.stringify(data, null, 2);
     if (json === undefined)
         throw new TypeError("Persistence value is not JSON-serializable");
+    if (maxBytes !== undefined && Buffer.byteLength(json, "utf8") > maxBytes) {
+        const error = new Error(`Persistence record exceeds its ${maxBytes}-byte limit`);
+        error.code = "PERSISTENCE_SIZE_LIMIT";
+        throw error;
+    }
     writeTextAtomic(fs, path, json);
     try {
         // The backup is also published atomically.  A direct write here could make

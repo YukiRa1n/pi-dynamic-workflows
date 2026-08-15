@@ -6,8 +6,9 @@ const COVERAGE_MANIFEST_PATH = "src/workflow-authoring-coverage.ts";
 function sha256(source) {
     return createHash("sha256").update(source).digest("hex");
 }
-function manifestEntry(path, hash) {
-    return `    path: ${JSON.stringify(path)},\n    sha256: ${JSON.stringify(hash)},`;
+function manifestEntryPattern(path, hash) {
+    const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return new RegExp(`(\\s*path:\\s*${escapeRegex(JSON.stringify(path))},\\r?\\n\\s*sha256:\\s*)${escapeRegex(JSON.stringify(hash))}(,)`);
 }
 /**
  * Accepts reviewed changes to explicitly named frozen workflow-authoring files.
@@ -40,11 +41,11 @@ export function acceptWorkflowGuidance(root, requestedPaths) {
     const originalManifest = readFileSync(manifestPath, "utf8");
     let nextManifest = originalManifest;
     for (const entry of entries) {
-        const previous = manifestEntry(entry.path, entry.previousSha256);
-        if (!nextManifest.includes(previous)) {
+        const previous = manifestEntryPattern(entry.path, entry.previousSha256);
+        if (!previous.test(nextManifest)) {
             throw new Error(`Coverage manifest does not contain the expected frozen entry for ${entry.path}.`);
         }
-        nextManifest = nextManifest.replace(previous, manifestEntry(entry.path, entry.sha256));
+        nextManifest = nextManifest.replace(previous, `$1${JSON.stringify(entry.sha256)}$2`);
     }
     if (nextManifest !== originalManifest) {
         writeFileSync(manifestPath, nextManifest);
