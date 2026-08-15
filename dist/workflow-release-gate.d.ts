@@ -30,7 +30,7 @@ export interface WorkflowReleaseCheckOptions {
 /** Package-relative generated hash baseline for compact and detailed guidance. */
 export declare const WORKFLOW_GUIDANCE_BASELINE_PATH = "docs/workflow-guidance-baseline.json";
 /** Skill files that must be present in the publishable npm package. */
-export declare const REQUIRED_WORKFLOW_PACKAGE_RESOURCES: readonly ["skills/workflow-authoring/SKILL.md", ...any[]];
+export declare const REQUIRED_WORKFLOW_PACKAGE_RESOURCES: readonly ["skills/workflow-authoring/SKILL.md", ...string[]];
 /** Render deterministic hashes for provider-visible and on-demand guidance surfaces. */
 export declare function renderWorkflowGuidanceBaseline(root: string): string;
 /** Refresh the committed guidance hash baseline under root. */

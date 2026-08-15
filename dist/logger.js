@@ -32,11 +32,17 @@ export function createWorkflowLogger(options = {}) {
         const timestamp = new Date().toISOString();
         const entry = `[${timestamp}] [${level}] ${message}`;
         logs.push(entry);
-        options.onLog?.(message);
+        try {
+            options.onLog?.(message);
+        }
+        catch {
+            // Logging observers are diagnostic only; they must never recursively turn
+            // a provider/workflow outcome into a logger failure.
+        }
         if (persistLogs && logFile) {
             try {
                 assertSafeLogFile();
-                appendFileSync(logFile, `${entry}\n`);
+                appendFileSync(logFile, `${entry}\n`, { encoding: "utf-8", mode: 0o600 });
                 // The live append already published this entry; persist() must not
                 // append it a second time.
                 persistedLogCount = logs.length;
@@ -63,7 +69,7 @@ export function createWorkflowLogger(options = {}) {
             if (!persistLogs)
                 return null;
             try {
-                mkdirSync(runsDir, { recursive: true });
+                mkdirSync(runsDir, { recursive: true, mode: 0o700 });
                 logFile = join(runsDir, `${runId}.log`);
                 assertSafeLogFile();
                 // A resumed execution must not clobber pre-pause history, and repeated
@@ -82,11 +88,11 @@ export function createWorkflowLogger(options = {}) {
                     // instance may have published entries after the read above. This
                     // preserves concurrent entries (at worst a retry duplicates a
                     // suffix, which is preferable to clobbering the log).
-                    appendFileSync(logFile, `${prefix}${pending.join("\n")}\n`);
+                    appendFileSync(logFile, `${prefix}${pending.join("\n")}\n`, { encoding: "utf-8", mode: 0o600 });
                     persistedLogCount = logs.length;
                 }
                 else if (!existing) {
-                    writeFileSync(logFile, "");
+                    writeFileSync(logFile, "", { encoding: "utf-8", mode: 0o600 });
                 }
                 return logFile;
             }
@@ -98,7 +104,7 @@ export function createWorkflowLogger(options = {}) {
     // Initialize log file if persisting
     if (persistLogs) {
         try {
-            mkdirSync(runsDir, { recursive: true });
+            mkdirSync(runsDir, { recursive: true, mode: 0o700 });
             logFile = join(runsDir, `${runId}.log`);
         }
         catch {

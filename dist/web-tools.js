@@ -1,88 +1,154 @@
 /**
  * Real web tools for research workflows. These execute in the extension host
- * process (which has network access), not in a subagent sandbox, so they perform
- * genuine HTTP requests via Node's fetch.
+ * process (which has network access), not in a subagent sandbox.
+ *
+ * Security properties:
+ * - only http(s), no URL credentials
+ * - every DNS answer must be globally routable
+ * - the validated address is pinned into the actual socket lookup, preventing
+ *   DNS rebinding between validation and connection
+ * - redirects are revalidated and repinned hop-by-hop
+ * - response streams are destroyed on timeout, redirect, size overflow, or error
  *
  * - web_search: best-effort Bing HTML scrape -> result {url, title}
  * - web_fetch:  fetch a URL and return readable text (HTML stripped, truncated)
  */
 import { lookup } from "node:dns/promises";
+import { request as httpRequest } from "node:http";
 import { isIP } from "node:net";
+import { request as httpsRequest } from "node:https";
 import { defineTool } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 const UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36";
-function blockedAddress(address) {
-    const normalized = address.replace(/^\[|\]$/g, "").toLowerCase();
-    if (isIP(normalized) === 4) {
-        const octets = normalized.split(".").map(Number);
-        const [a, b] = octets;
-        return (a === 0 ||
-            a === 10 ||
-            a === 127 ||
-            (a === 100 && b >= 64 && b <= 127) ||
-            (a === 169 && b === 254) ||
-            (a === 172 && b >= 16 && b <= 31) ||
-            (a === 192 && (b === 0 || b === 168)) ||
-            (a === 198 && b >= 18 && b <= 19) ||
-            (a === 203 && b === 0) ||
-            a >= 224);
-    }
-    if (isIP(normalized) === 6) {
-        return normalized === "::1" || normalized === "::" || normalized.startsWith("fc") || normalized.startsWith("fd") || normalized.startsWith("fe8") || normalized.startsWith("fe9") || normalized.startsWith("fea") || normalized.startsWith("feb") || normalized.startsWith("::ffff:127.") || normalized.startsWith("::ffff:10.") || normalized.startsWith("::ffff:192.168.");
-    }
-    return true;
+const MAX_REDIRECTS = 5;
+function blockedIpv4(address) {
+    const octets = address.split(".").map(Number);
+    if (octets.length !== 4 || octets.some((part) => !Number.isInteger(part) || part < 0 || part > 255))
+        return true;
+    const [a, b, c] = octets;
+    return (a === 0 ||
+        a === 10 ||
+        a === 127 ||
+        (a === 100 && b >= 64 && b <= 127) ||
+        (a === 169 && b === 254) ||
+        (a === 172 && b >= 16 && b <= 31) ||
+        (a === 192 && (b === 0 || b === 168)) ||
+        (a === 198 && b >= 18 && b <= 19) ||
+        (a === 198 && b === 51 && c === 100) ||
+        (a === 203 && b === 0 && c === 113) ||
+        a >= 224);
 }
-async function assertSafeFetchUrl(raw) {
+/** Convert every IPv4-mapped IPv6 spelling, including ::ffff:7f00:1, to dotted IPv4. */
+function mappedIpv4(address) {
+    const normalized = address.replace(/^\[|\]$/g, "").toLowerCase().split("%")[0];
+    if (!normalized.startsWith("::ffff:"))
+        return undefined;
+    const tail = normalized.slice("::ffff:".length);
+    if (isIP(tail) === 4)
+        return tail;
+    const words = tail.split(":");
+    if (words.length !== 2 || words.some((word) => !/^[0-9a-f]{1,4}$/.test(word)))
+        return undefined;
+    const high = Number.parseInt(words[0], 16);
+    const low = Number.parseInt(words[1], 16);
+    return `${high >>> 8}.${high & 0xff}.${low >>> 8}.${low & 0xff}`;
+}
+export function blockedAddress(address) {
+    const normalized = address.replace(/^\[|\]$/g, "").toLowerCase().split("%")[0];
+    const mapped = mappedIpv4(normalized);
+    if (mapped)
+        return blockedIpv4(mapped);
+    if (isIP(normalized) === 4)
+        return blockedIpv4(normalized);
+    if (isIP(normalized) !== 6)
+        return true;
+    // Unspecified, loopback, IPv4-compatible, NAT64 well-known prefix, unique
+    // local, link-local, multicast, and documentation ranges are not fetchable.
+    return (normalized === "::" ||
+        normalized === "::1" ||
+        normalized.startsWith("::ffff:") ||
+        normalized.startsWith("64:ff9b:") ||
+        normalized.startsWith("100:") ||
+        normalized.startsWith("2001:db8:") ||
+        normalized.startsWith("fc") ||
+        normalized.startsWith("fd") ||
+        /^fe[89ab]/.test(normalized) ||
+        normalized.startsWith("ff"));
+}
+async function resolveSafeTarget(raw) {
     const parsed = new URL(raw);
-    if (parsed.protocol !== "http:" && parsed.protocol !== "https:")
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
         throw new Error("web_fetch only permits http(s) URLs");
+    }
     if (parsed.username || parsed.password)
         throw new Error("web_fetch rejects URLs with embedded credentials");
     const host = parsed.hostname.replace(/^\[|\]$/g, "").toLowerCase();
-    if (host === "localhost" || host.endsWith(".localhost") || host.endsWith(".local") || host === "metadata.google.internal") {
+    if (host === "localhost" ||
+        host.endsWith(".localhost") ||
+        host.endsWith(".local") ||
+        host === "metadata.google.internal") {
         throw new Error("web_fetch rejects local hostnames");
     }
-    const addresses = isIP(host) ? [host] : (await lookup(host, { all: true, verbatim: true })).map((entry) => entry.address);
-    if (addresses.length === 0 || addresses.some(blockedAddress))
-        throw new Error("web_fetch rejects private or local network targets");
-    return parsed;
+    const literalFamily = isIP(host);
+    const answers = literalFamily
+        ? [{ address: host, family: literalFamily }]
+        : await lookup(host, { all: true, verbatim: true });
+    if (answers.length === 0 || answers.some((answer) => blockedAddress(answer.address))) {
+        // Fail closed if DNS mixes public and private answers. Picking only a public
+        // answer would allow an attacker to steer later retries toward the private one.
+        throw new Error("web_fetch rejects private, reserved, or local network targets");
+    }
+    const selected = answers[0];
+    return { url: parsed, address: selected.address, family: selected.family };
 }
-async function fetchText(url, timeoutMs = 15000, maxBytes = 2_000_000) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-    try {
-        let current = await assertSafeFetchUrl(url);
-        for (let hop = 0; hop <= 5; hop++) {
-            const res = await fetch(current, { headers: { "user-agent": UA }, signal: controller.signal, redirect: "manual" });
-            if (res.status >= 300 && res.status < 400) {
-                const location = res.headers.get("location");
-                if (!location)
-                    throw new Error(`redirect ${res.status} has no location`);
-                current = await assertSafeFetchUrl(new URL(location, current).toString());
-                continue;
+function requestPinned(target, signal, maxBytes) {
+    return new Promise((resolve, reject) => {
+        const request = (target.url.protocol === "https:" ? httpsRequest : httpRequest)(target.url, {
+            headers: { "user-agent": UA, accept: "text/html,text/plain;q=0.9,*/*;q=0.1", "accept-encoding": "identity" },
+            signal,
+            // Pin the socket to the exact address that passed validation. The URL's
+            // hostname remains intact for Host and TLS SNI/certificate verification.
+            lookup: (_hostname, _options, callback) => callback(null, target.address, target.family),
+        }, (response) => {
+            const status = response.statusCode ?? 0;
+            const location = response.headers.location;
+            if (status >= 300 && status < 400) {
+                response.destroy();
+                resolve({ status, body: "", location });
+                return;
             }
-            if (!res.body)
-                return { status: res.status, body: "" };
-            const reader = res.body.getReader();
-            const decoder = new TextDecoder();
-            let body = "";
+            const chunks = [];
             let bytes = 0;
-            try {
-                while (true) {
-                    const part = await reader.read();
-                    if (part.done)
-                        break;
-                    bytes += part.value.byteLength;
-                    if (bytes > maxBytes)
-                        throw new Error(`web response exceeds ${maxBytes} bytes`);
-                    body += decoder.decode(part.value, { stream: true });
+            response.on("data", (chunk) => {
+                const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+                bytes += buffer.byteLength;
+                if (bytes > maxBytes) {
+                    response.destroy(new Error(`web response exceeds ${maxBytes} bytes`));
+                    return;
                 }
-                body += decoder.decode();
-            }
-            finally {
-                reader.releaseLock();
-            }
-            return { status: res.status, body };
+                chunks.push(buffer);
+            });
+            response.once("end", () => resolve({ status, body: Buffer.concat(chunks).toString("utf8") }));
+            response.once("error", reject);
+        });
+        request.once("error", reject);
+        request.end();
+    });
+}
+async function fetchText(url, timeoutMs = 15_000, maxBytes = 2_000_000) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(new Error(`web request timed out after ${timeoutMs}ms`)), timeoutMs);
+    try {
+        let current = await resolveSafeTarget(url);
+        for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
+            const response = await requestPinned(current, controller.signal, maxBytes);
+            if (response.status < 300 || response.status >= 400)
+                return { status: response.status, body: response.body };
+            if (!response.location)
+                throw new Error(`redirect ${response.status} has no location`);
+            if (hop === MAX_REDIRECTS)
+                break;
+            current = await resolveSafeTarget(new URL(response.location, current.url).toString());
         }
         throw new Error("web_fetch redirect limit exceeded");
     }
@@ -110,7 +176,7 @@ export function htmlToText(html) {
 export function parseBingResults(html, limit) {
     const out = [];
     const seen = new Set();
-    for (const m of html.matchAll(/<h2[^>]*>\s*<a[^>]+href="(https?:\/\/[^"]+)"[^>]*>([\s\S]*?)<\/a>/g)) {
+    for (const m of html.matchAll(/<h2[^>]*>\s*<a[^>]+href="(https?:\/\/[^\"]+)"[^>]*>([\s\S]*?)<\/a>/g)) {
         const url = m[1];
         if (/\.bing\.com|go\.microsoft\.com/.test(url) || seen.has(url))
             continue;
@@ -156,11 +222,9 @@ export function createWebFetchTool(maxChars = 6000) {
     return defineTool({
         name: "web_fetch",
         label: "Web Fetch",
-        description: "Fetch a URL and return its readable text content (HTML stripped, truncated).",
-        promptSnippet: "Fetch a URL's text",
-        parameters: Type.Object({
-            url: Type.String({ description: "The absolute URL to fetch." }),
-        }),
+        description: "Fetch a public http(s) URL and return readable text (HTML stripped, truncated).",
+        promptSnippet: "Fetch a public URL's text",
+        parameters: Type.Object({ url: Type.String({ description: "The absolute public http(s) URL to fetch." }) }),
         async execute(_id, params) {
             try {
                 const { status, body } = await fetchText(params.url);
@@ -172,19 +236,14 @@ export function createWebFetchTool(maxChars = 6000) {
             }
             catch (error) {
                 return {
-                    content: [
-                        {
-                            type: "text",
-                            text: `web_fetch failed for ${params.url}: ${error instanceof Error ? error.message : error}`,
-                        },
-                    ],
+                    content: [{ type: "text", text: `web_fetch failed for ${params.url}: ${error instanceof Error ? error.message : error}` }],
                     details: { status: 0, url: params.url },
                 };
             }
         },
     });
 }
-/** Both web tools, for injecting into a research workflow's agents. */
+/** Both web tools, intentionally without shell/filesystem coding tools. */
 export function createWebTools() {
     return [createWebSearchTool(), createWebFetchTool()];
 }

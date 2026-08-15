@@ -20,14 +20,14 @@ export interface WorkflowAuthoringCoverageEntry {
     protectedGuidance: readonly ProtectedGuidanceSurface[];
 }
 /** Scenario identifiers that release checks may accept as provider-backed evidence. */
-export declare const WORKFLOW_COMPREHENSION_SCENARIO_IDS: any;
+export declare const WORKFLOW_COMPREHENSION_SCENARIO_IDS: string[];
 /** Mixed guidance files that require explicit acceptance while behavioral coverage remains partial. */
 export declare const WORKFLOW_AUTHORING_FROZEN_FILES: readonly [{
     readonly path: "skills/workflow-authoring/SKILL.md";
     readonly sha256: "d0437e6a79328628148c005e7bdfc560a35b447becb2c3bbd0ed7df52488c881";
 }, {
     readonly path: "skills/workflow-authoring/references/runtime.md";
-    readonly sha256: "13b710424bc262a3951e9ad8f7387cdf4d630b89f27c07bbcbc6b47c37e24242";
+    readonly sha256: "781885d793f6865158f8a097e9e9fda9a5739bd877db58757669ab8f4596bcd0";
 }, {
     readonly path: "skills/workflow-authoring/references/helpers.md";
     readonly sha256: "1c8d253649f00412511f17ffc08c6156797b99de72ae037e14f2ea92ac33a11e";
@@ -36,7 +36,7 @@ export declare const WORKFLOW_AUTHORING_FROZEN_FILES: readonly [{
     readonly sha256: "7597c94bbacea885697fb2d05a96ed9ec39403ca6d3a94547bf8ce5e233b2c76";
 }, {
     readonly path: "skills/workflow-authoring/references/lifecycle.md";
-    readonly sha256: "04a07ddbc03ac7b4452e4bea82418000ff84e429c4a3de602fbc47abaaae8843";
+    readonly sha256: "41f83f91d7224d8bd6d3608ad1f4b27e519afe2fa8224c7af357b092ba31faaf";
 }, {
     readonly path: "skills/workflow-authoring/references/pattern-selection.md";
     readonly sha256: "923988a1b4d506a7b330bf5e4b8ab47cf8456edcfe6674b5d8d8848264633c3d";

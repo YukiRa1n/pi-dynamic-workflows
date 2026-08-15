@@ -11,7 +11,7 @@ export const WORKFLOW_AUTHORING_FROZEN_FILES = [
     },
     {
         path: "skills/workflow-authoring/references/runtime.md",
-        sha256: "13b710424bc262a3951e9ad8f7387cdf4d630b89f27c07bbcbc6b47c37e24242",
+        sha256: "781885d793f6865158f8a097e9e9fda9a5739bd877db58757669ab8f4596bcd0",
     },
     {
         path: "skills/workflow-authoring/references/helpers.md",
@@ -23,7 +23,7 @@ export const WORKFLOW_AUTHORING_FROZEN_FILES = [
     },
     {
         path: "skills/workflow-authoring/references/lifecycle.md",
-        sha256: "04a07ddbc03ac7b4452e4bea82418000ff84e429c4a3de602fbc47abaaae8843",
+        sha256: "41f83f91d7224d8bd6d3608ad1f4b27e519afe2fa8224c7af357b092ba31faaf",
     },
     {
         path: "skills/workflow-authoring/references/pattern-selection.md",
@@ -125,7 +125,7 @@ const FROZEN_GUIDANCE_BY_CAPABILITY = {
         },
         {
             path: LIFECYCLE_PATH,
-            requiredText: "A workflow invocation is backgrounded by default, and background workflows are headless: they cannot display checkpoint confirmation.",
+            requiredText: "Public workflow tool invocations are always backgrounded and therefore headless: they cannot display checkpoint confirmation.",
         },
     ],
     "workflow.runtime.log": [
@@ -134,19 +134,19 @@ const FROZEN_GUIDANCE_BY_CAPABILITY = {
     "workflow.runtime.args": [
         {
             path: RUNTIME_PATH,
-            requiredText: "The runtime supplies `agent`, `parallel`, `pipeline`, `workflow`, quality/control helpers, `phase`, `log`, `args`, `cwd`, restricted `process.cwd()`, and `budget`.",
+            requiredText: "The runtime supplies `agent`, `parallel`, `pipeline`, `createTeam`, `workflow`, quality/control helpers, `phase`, `log`, `args`, `cwd`, restricted `process.cwd()`, and `budget`.",
         },
     ],
     "workflow.runtime.cwd": [
         {
             path: RUNTIME_PATH,
-            requiredText: "The runtime supplies `agent`, `parallel`, `pipeline`, `workflow`, quality/control helpers, `phase`, `log`, `args`, `cwd`, restricted `process.cwd()`, and `budget`.",
+            requiredText: "The runtime supplies `agent`, `parallel`, `pipeline`, `createTeam`, `workflow`, quality/control helpers, `phase`, `log`, `args`, `cwd`, restricted `process.cwd()`, and `budget`.",
         },
     ],
     "workflow.runtime.process": [
         {
             path: RUNTIME_PATH,
-            requiredText: "The runtime supplies `agent`, `parallel`, `pipeline`, `workflow`, quality/control helpers, `phase`, `log`, `args`, `cwd`, restricted `process.cwd()`, and `budget`.",
+            requiredText: "The runtime supplies `agent`, `parallel`, `pipeline`, `createTeam`, `workflow`, quality/control helpers, `phase`, `log`, `args`, `cwd`, restricted `process.cwd()`, and `budget`.",
         },
     ],
     "workflow.runtime.budget": [
@@ -163,12 +163,6 @@ const FROZEN_GUIDANCE_BY_CAPABILITY = {
         {
             path: LIFECYCLE_PATH,
             requiredText: "Pass timestamps, randomness, and external decisions through `args`.",
-        },
-    ],
-    "workflow.tool-input.background": [
-        {
-            path: LIFECYCLE_PATH,
-            requiredText: "A workflow invocation is backgrounded by default, and background workflows are headless: they cannot display checkpoint confirmation.",
         },
     ],
     "workflow.tool-input.maxAgents": [

@@ -1,8 +1,11 @@
 import { type ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { type Static } from "typebox";
+import { type Static, Type } from "typebox";
 import { type RunStatus } from "./run-persistence.js";
 import type { WorkflowManager } from "./workflow-manager.js";
-declare const workflowControlSchema: any;
+declare const workflowControlSchema: Type.TObject<{
+    action: Type.TUnion<[Type.TLiteral<"list">, Type.TLiteral<"status">, Type.TLiteral<"pause">, Type.TLiteral<"resume">, Type.TLiteral<"stop">]>;
+    runId: Type.TOptional<Type.TString>;
+}>;
 export type WorkflowControlInput = Static<typeof workflowControlSchema>;
 export interface WorkflowControlToolOptions {
     manager?: WorkflowManager;

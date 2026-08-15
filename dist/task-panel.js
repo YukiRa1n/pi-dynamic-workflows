@@ -27,15 +27,52 @@ const RUN_EVENTS = [
 ];
 /** Events after which a run is gone and its token-rate samples can be dropped. */
 const RUN_END_EVENTS = ["complete", "error", "stopped"];
+const DEFAULT_DELIVERY_RESULT_CHARS = 12_000;
 /**
- * Serialize the COMPLETE result for the model-visible delivery. Do not prefer
- * only a `summary`/`verdict` field: doing so silently drops the report body
- * (DELIVERY-PRODUCT-003). TUI folding is a renderer concern.
+ * Build a bounded provider-visible projection of the workflow's semantic return
+ * value. The complete value remains in the persisted run and interactive pager.
+ * We intentionally use the workflow return — never "the last agent" — because
+ * execution order is not a product contract. Strings are the common final-report
+ * shape; structured returns are serialized deterministically and truncated with
+ * an explicit retrieval pointer supplied by deliverText().
  */
-function summarizeResult(result) {
-    if (typeof result === "string")
-        return result;
-    return safeStringify(result);
+function summarizeResult(result, maxChars = DEFAULT_DELIVERY_RESULT_CHARS) {
+    let serialized;
+    if (typeof result === "string") {
+        serialized = result;
+    }
+    else if (result && typeof result === "object" && !Array.isArray(result)) {
+        const record = result;
+        // Built-ins and well-authored workflows conventionally expose their user-
+        // facing artifact as report/synthesis/summary/answer. Put that semantic
+        // product first so a bounded projection never spends its entire budget on
+        // large intermediate arrays that precede `report` in object insertion order.
+        const preferredKey = ["report", "synthesis", "summary", "answer"].find((key) => typeof record[key] === "string" && record[key].trim().length > 0);
+        if (preferredKey) {
+            const artifact = record[preferredKey];
+            const metadata = Object.fromEntries(Object.entries(record).filter(([key]) => key !== preferredKey));
+            const metadataText = safeStringify(metadata);
+            serialized = `${artifact}\n\n[Workflow metadata]\n${metadataText}`;
+        }
+        else {
+            serialized = safeStringify(result);
+        }
+    }
+    else {
+        serialized = safeStringify(result);
+    }
+    if (serialized.length <= maxChars)
+        return serialized;
+    // Keep both beginning and end: prefix-only truncation can hide conclusions,
+    // caveats, or security findings placed at the tail. Exact content remains in
+    // the durable run record.
+    const marker = `\n\n[... middle omitted; final workflow result projected to ${maxChars} characters ...]\n\n`;
+    if (maxChars <= marker.length)
+        return marker.slice(0, maxChars);
+    const available = maxChars - marker.length;
+    const head = Math.ceil(available * 0.7);
+    const tail = available - head;
+    return `${serialized.slice(0, head)}${marker}${serialized.slice(serialized.length - tail)}`;
 }
 function safeAgentSnapshots(value) {
     if (!Array.isArray(value))
@@ -53,9 +90,10 @@ function fitLine(line, width) {
     return truncateToWidth(line, maxWidth);
 }
 export function deliverText(run, opts = {}) {
-    // `opts.maxChars` remains accepted for API compatibility, but must not
-    // truncate the provider-visible final payload.
-    const summary = summarizeResult(run.result?.result);
+    const maxChars = typeof opts.maxChars === "number" && Number.isFinite(opts.maxChars)
+        ? Math.max(0, Math.floor(opts.maxChars))
+        : DEFAULT_DELIVERY_RESULT_CHARS;
+    const summary = summarizeResult(run.result?.result, maxChars);
     const tu = run.result?.tokenUsage;
     const cost = tu?.cost ? ` · ${fmtCost(tu.cost)}` : "";
     const segment = fmtTokenSegment(tokenFigures(tu), fmtTokensShort);
@@ -67,10 +105,10 @@ export function deliverText(run, opts = {}) {
         "",
         summary,
     ];
-    // Also point at the persisted result for users/tools that need the exact JSON;
-    // the complete serialized payload is already present in the model-visible text.
+    // The full result is intentionally not duplicated into provider context.
+    // Point at the durable run record for exact JSON and per-agent reports.
     if (opts.resultPath)
-        lines.push("", `↳ Full result: ${opts.resultPath}`);
+        lines.push("", `↳ Full result and subagent reports: ${opts.resultPath}`);
     return lines.join("\n");
 }
 /** Absolute path to a run's persisted result JSON. Undefined if the persistence
@@ -100,6 +138,10 @@ function enqueuePending(holder, payload) {
 function trySend(holder, payload) {
     const startedGeneration = holder.generation;
     try {
+        if (holder.sendResult) {
+            holder.sendResult(payload);
+            return;
+        }
         const ret = holder.pi.sendMessage({ customType: "workflow-result", content: payload.content, display: true, details: payload.details }, 
         // DELIVERY-PRODUCT-001: final results must land at the next safe point of
         // an ACTIVE turn (like activity messages and like tool results), not wait
@@ -234,12 +276,20 @@ export function installResultDelivery(pi, manager, opts = {}) {
         if (m.__holder) {
             m.__holder.pi = pi;
             m.__holder.loadSettings = opts.loadSettings;
+            m.__holder.sendResult = opts.sendResult;
             m.__holder.generation += 1;
         }
         return;
     }
     m.__deliveryInstalled = true;
-    m.__holder = { pi, loadSettings: opts.loadSettings, suspended: false, pending: [], generation: 0 };
+    m.__holder = {
+        pi,
+        loadSettings: opts.loadSettings,
+        sendResult: opts.sendResult,
+        suspended: false,
+        pending: [],
+        generation: 0,
+    };
     const deliver = (payload) => {
         const holder = m.__holder;
         if (!holder)
@@ -250,16 +300,31 @@ export function installResultDelivery(pi, manager, opts = {}) {
         }
         trySend(holder, payload);
     };
+    let notificationSequence = 0;
     manager.on("complete", ({ runId }) => {
         const run = manager.getRun(runId);
         // Only background/resumed runs are delivered: a foreground (sync) run already
         // returns its result inline as the tool result, so re-delivering would dup it.
         if (run?.background) {
+            let maxChars;
+            try {
+                maxChars = m.__holder?.loadSettings?.().deliveredResultMaxChars;
+            }
+            catch {
+                // Settings are optional presentation input; delivery must still proceed.
+            }
             deliver({
                 content: deliverText(run, {
                     resultPath: persistedResultPath(manager, runId),
+                    maxChars,
                 }),
-                details: { status: "completed", isError: false },
+                details: {
+                    status: "completed",
+                    isError: false,
+                    notificationKind: "workflow-result",
+                    runId,
+                    sequence: notificationSequence++,
+                },
             });
         }
     });
@@ -268,7 +333,13 @@ export function installResultDelivery(pi, manager, opts = {}) {
             return;
         deliver({
             content: `✗ Background workflow ${runId} failed: ${error?.message ?? "unknown error"}`,
-            details: { status: "failed", isError: true },
+            details: {
+                status: "failed",
+                isError: true,
+                notificationKind: "workflow-result",
+                runId,
+                sequence: notificationSequence++,
+            },
         });
     });
     // A provider usage/quota limit checkpoints the run as paused (not failed): tell the
@@ -285,7 +356,13 @@ export function installResultDelivery(pi, manager, opts = {}) {
         deliver({
             content: `⏸ Background workflow ${runId} paused: ${cause}${when}. ` +
                 `Completed steps are saved — run /workflows resume ${runId} once your usage limit resets.`,
-            details: { status: "paused", isError: true },
+            details: {
+                status: "paused",
+                isError: true,
+                notificationKind: "workflow-result",
+                runId,
+                sequence: notificationSequence++,
+            },
         });
     });
 }

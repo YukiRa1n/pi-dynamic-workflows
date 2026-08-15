@@ -391,8 +391,8 @@ function validateWorkflowControlSurface(): WorkflowReleaseDiagnostic[] {
       throw new Error("release inspection");
     },
   });
-  const parameters = isRecord(tool.parameters) ? tool.parameters : {};
-  const properties = isRecord(parameters.properties) ? parameters.properties : {};
+  const parameters: Record<string, unknown> = isRecord(tool.parameters) ? tool.parameters : {};
+  const properties: Record<string, unknown> = isRecord(parameters.properties) ? parameters.properties : {};
   const diagnostics: WorkflowReleaseDiagnostic[] = [];
   if (parameters.type !== "object" || parameters.additionalProperties !== false) {
     diagnostics.push(
@@ -631,7 +631,7 @@ function validatePackage(root: string, publishableFiles: readonly string[]): Wor
   )) {
     const source = readFileSync(join(root, sourcePath), "utf8");
     for (const match of source.matchAll(/\[[^\]]+\]\(([^)#]+)(?:#([^)]+))?\)/g)) {
-      const target = normalize(join(dirname(sourcePath), match[1]));
+      const target = normalize(join(dirname(sourcePath), match[1])).replaceAll("\\", "/");
       const anchor = match[2];
       const outsidePackage = relative(".", target).startsWith("..");
       const targetMissing = !files.has(target);

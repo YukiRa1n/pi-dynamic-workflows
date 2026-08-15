@@ -33,9 +33,8 @@ export interface WorkflowSettings {
      */
     persistAgentSessions?: boolean;
     /**
-     * @deprecated Retained for settings-file compatibility. Final workflow
-     * deliveries are never truncated; the TUI folds long content only at render
-     * time so the complete payload remains available to the model.
+     * Provider-visible terminal-result projection budget. The exact structured
+     * result remains in the persisted run/pager and is linked from the delivery.
      */
     deliveredResultMaxChars?: number;
     /**

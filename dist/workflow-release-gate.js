@@ -391,7 +391,7 @@ function validatePackage(root, publishableFiles) {
     for (const sourcePath of publishableFiles.filter((path) => path.startsWith(`${SKILL_ROOT}/`) && path.endsWith(".md"))) {
         const source = readFileSync(join(root, sourcePath), "utf8");
         for (const match of source.matchAll(/\[[^\]]+\]\(([^)#]+)(?:#([^)]+))?\)/g)) {
-            const target = normalize(join(dirname(sourcePath), match[1]));
+            const target = normalize(join(dirname(sourcePath), match[1])).replaceAll("\\", "/");
             const anchor = match[2];
             const outsidePackage = relative(".", target).startsWith("..");
             const targetMissing = !files.has(target);

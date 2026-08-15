@@ -177,6 +177,14 @@ Every exact fact below is projected from the installed extension's capability co
 - Support: `supported`
 - Signature: `log(message) => void`
 
+<a id="deliver"></a>
+## deliver
+
+- Classification: `runtime-global`
+- Support: `supported`
+- Signature: `deliver(message) => Promise<void>`
+- Constraint: delivers a message into the host conversation when the host wired onDeliver; no-op otherwise
+
 <a id="phase"></a>
 ## phase
 
@@ -248,15 +256,8 @@ Every exact fact below is projected from the installed extension's capability co
 
 - Classification: `workflow-tool-input`
 - Support: `supported`
-- Signature: `args?: unknown`
-
-<a id="tool-input-background"></a>
-## background
-
-- Classification: `workflow-tool-input`
-- Support: `supported`
-- Signature: `background?: boolean = true`
-- Constraint: background workflows are headless; use background false when checkpoint must show foreground confirmation
+- Signature: `args?: Record<string, unknown>`
+- Constraint: top-level JSON object; built-in workflows consume named fields
 
 <a id="tool-input-maxagents"></a>
 ## maxAgents

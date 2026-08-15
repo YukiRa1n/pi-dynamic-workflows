@@ -1,14 +1,24 @@
 import { type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 import { WorkflowManager } from "./workflow-manager.js";
 import { type WorkflowStorage } from "./workflow-saved.js";
 /** The single always-on gate that authorizes workflow use without forcing it. */
 export declare const WORKFLOW_GATE_GUIDELINE = "The `workflow` tool runs multi-agent orchestration \u2014 it fans decomposable work out across subagents, and fits tasks shaped like: repo-wide inspection, independent parallel research/checks, multi-perspective review, or fan-out/fan-in synthesis. ONLY call it when the user explicitly opts in \u2014 via the workflow trigger word, `/workflows run`, or their own words (e.g. 'run a workflow', 'fan this out', '\u5E76\u884C\u5BA1\u4E00\u904D'). For any other task \u2014 even one that would clearly benefit \u2014 do not call it; you may briefly offer it (with a rough cost) as an option instead.";
-declare const workflowToolSchema: any;
+declare const workflowToolSchema: Type.TObject<{
+    script: Type.TOptional<Type.TString>;
+    name: Type.TOptional<Type.TString>;
+    args: Type.TOptional<Type.TUnsafe<Record<string, unknown>>>;
+    maxAgents: Type.TOptional<Type.TInteger>;
+    concurrency: Type.TOptional<Type.TInteger>;
+    agentRetries: Type.TOptional<Type.TInteger>;
+    agentTimeoutMs: Type.TOptional<Type.TInteger>;
+    tokenBudget: Type.TOptional<Type.TInteger>;
+    resumeFromRunId: Type.TOptional<Type.TString>;
+}>;
 export type WorkflowToolInput = {
     script?: string;
     name?: string;
     args?: Record<string, unknown>;
-    background?: boolean;
     maxAgents?: number;
     concurrency?: number;
     agentRetries?: number;

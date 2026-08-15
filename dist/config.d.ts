@@ -4,13 +4,13 @@
 /** Maximum number of agents allowed per workflow run. */
 export declare const MAX_AGENTS_PER_RUN = 1000;
 /** Default timeout for a single agent in milliseconds. null means no hard timeout. */
-export declare const DEFAULT_AGENT_TIMEOUT_MS: any;
+export declare const DEFAULT_AGENT_TIMEOUT_MS: null;
 /** Maximum concurrent agents (matches Claude Code limit). */
 export declare const MAX_CONCURRENCY = 16;
 /** Maximum automatic retry attempts after a recoverable agent failure. */
 export declare const MAX_AGENT_RETRIES = 3;
 /** Default token budget if none specified. */
-export declare const DEFAULT_TOKEN_BUDGET: any;
+export declare const DEFAULT_TOKEN_BUDGET: null;
 /** Legacy project-relative directory for persisted workflow run state. New writes use workflowProjectPaths(). */
 export declare const WORKFLOW_RUNS_DIR = ".pi/workflows/runs";
 /** Legacy project-relative directory for saved workflow commands. New writes use workflowProjectPaths(). */

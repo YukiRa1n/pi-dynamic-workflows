@@ -236,8 +236,8 @@ export interface WorkflowManagerOptions {
    * (extensions/workflow.ts) sets this per generation so messages land in the
    * current session's conversation.
    */
-  onDeliver?: (message: string) => void | Promise<void>;
-  /** Automatically forward each completed subagent result to the host session. */
+  onDeliver?: (message: string, source?: { runId: string; workflowName: string }) => void | Promise<void>;
+  /** Optional observer for each live subagent result. Hosts should normally keep this persistence/UI-only. */
   onAgentMessage?: (event: {
     runId: string;
     id: string;
@@ -370,8 +370,8 @@ export class WorkflowManager extends EventEmitter {
   private excludeSubagentTools?: string[];
   private persistAgentSessions: boolean;
   /** Runtime deliver() bridge; refreshed by host wiring each generation. */
-  onDeliver?: (message: string) => void | Promise<void>;
-  /** Host bridge for automatic subagent-result delivery. */
+  onDeliver?: (message: string, source?: { runId: string; workflowName: string }) => void | Promise<void>;
+  /** Optional host observer for live subagent results; not provider delivery by default. */
   onAgentMessage?: WorkflowManagerOptions["onAgentMessage"];
   private pendingMessages = new Map<string, string[]>();
   private activeAgentSenders = new Map<
@@ -690,7 +690,18 @@ export class WorkflowManager extends EventEmitter {
     this.runs.set(managed.runId, managed);
     // Persist the initial state immediately so listRuns()/the task panel can see
     // the run the moment it starts, not only after the first agent journals.
-    this.persistRun(managed);
+    // This is a brand-new record: save() assigns revision 1. Using persistRun()
+    // here with a pre-filled revision would CAS against a file that does not yet
+    // exist and leave every subsequent lifecycle write fenced to a phantom rev.
+    try {
+      const initialState = this.persistedStateFor(managed);
+      this.persistence.save(initialState, undefined, lease);
+      managed.revision = initialState.revision;
+    } catch (err) {
+      this.releaseRunLease(managed);
+      this.runs.delete(managed.runId);
+      throw err;
+    }
     // Mark pending before invoking the async function: executeRun can reject
     // synchronously up to its first await, and stop() may observe the run in
     // that same turn.
@@ -828,7 +839,9 @@ export class WorkflowManager extends EventEmitter {
         excludeTools: this.excludeSubagentTools,
         confirm,
         onDeliver: (message) => {
-          if (this.isCurrent(managed)) return this.onDeliver?.(message);
+          if (this.isCurrent(managed)) {
+            return this.onDeliver?.(message, { runId: managed.runId, workflowName: managed.snapshot.name });
+          }
         },
         takePendingMessages: () => (this.isCurrent(managed) ? this.takePendingMessages(managed.runId) : []),
         onAgentSession: ({ id, session, send }) => {
@@ -990,18 +1003,21 @@ export class WorkflowManager extends EventEmitter {
       managed.status = "completed";
       managed.result = result;
       this.pendingMessages.delete(managed.runId);
+      // Persist before announcing completion. Delivery text advertises the
+      // durable run path as the retrieval channel for full structured output
+      // and subagent reports; emitting first creates a race where the model can
+      // follow a path that does not exist yet (or still contains running state).
+      // persistRun()/writeRunToDisk() no-op for superseded executions.
+      this.persistRun(managed);
+
       // Gated the same way as disk/lease below (see emitLive()): a stale
       // execution's "complete" would otherwise still deliver a result for a
       // run that's been superseded or deleted (e.g. background result
       // delivery into the conversation) even though it's no longer current.
       this.emitLive(managed, "complete", { runId: managed.runId, result });
 
-      // Persist final state. persistRun()/writeRunToDisk() already no-op if
-      // `managed` has been superseded (resume()/deleteRun() took over this
-      // runId) — see isCurrent(). Guard the lease release the same way: a
-      // stale execution settling after resume() has already acquired a NEW
-      // lease for this runId must not touch that newer lease's bookkeeping.
-      this.persistRun(managed);
+      // Guard lease release the same way: a stale execution settling after
+      // resume() acquired a new lease must not touch the newer bookkeeping.
       if (this.isCurrent(managed)) {
         this.releaseRunLease(managed);
         // Now (and only now — after the run's data is safely on disk and its
@@ -1051,10 +1067,16 @@ export class WorkflowManager extends EventEmitter {
           resetHint: workflowError.resetHint,
         });
       } else if (managed.controller.signal.aborted) {
-        // Intentional pause/stop/Esc (MG-001): pause() already emitted
-        // "paused" with the manual reason. A stop()/Esc abort reports a
-        // "stopped" lifecycle event — NEVER a generic workflow failure.
-        if (managed.status === "aborted" && !managed.stopRequested && this.listenerCount("stopped") > 0) {
+        // Manual pause()/stop() own their explicit lifecycle events. A host
+        // externalSignal abort (Esc/tool cancellation) has neither flag and is
+        // still surfaced through the traditional error channel so synchronous
+        // callers can observe WORKFLOW_ABORTED without an unhandled EventEmitter
+        // "error" when no listener is installed.
+        if (managed.status === "paused" || managed.stopRequested) {
+          // pause()/stop() already emitted.
+        } else if (externalSignal?.aborted && this.listenerCount("error") > 0) {
+          this.emitLive(managed, "error", { runId: managed.runId, error: workflowError });
+        } else if (managed.status === "aborted" && this.listenerCount("stopped") > 0) {
           this.emitLive(managed, "stopped", { runId: managed.runId });
         }
       } else if (this.listenerCount("error") > 0) {
@@ -1251,6 +1273,59 @@ export class WorkflowManager extends EventEmitter {
     this.writeRunToDisk(managed);
   }
 
+  private persistedStateFor(managed: ManagedRun): PersistedRunState {
+    // Resumable states need their journal; completed/aborted states need rich
+    // agent details. Persist exactly one full copy of each agent result instead
+    // of writing it to both agents[].result and journal[].result.
+    const keepsResumeJournal = managed.status !== "completed" && managed.status !== "aborted";
+    return {
+      runId: managed.runId,
+      workflowName: managed.snapshot.name,
+      script: managed.script,
+      args: managed.args,
+      sessionId: managed.sessionId,
+      journal: keepsResumeJournal ? managed.journal : undefined,
+      status: managed.status,
+      autoResume: managed.autoResume,
+      tokenBudget: managed.tokenBudget,
+      toolset: managed.toolset,
+      maxAgents: managed.maxAgents,
+      agentTimeoutMs: managed.agentTimeoutMs,
+      concurrency: managed.concurrency,
+      agentRetries: managed.agentRetries,
+      pauseReason: managed.status === "paused" && isProviderUsageLimit(managed.error) ? "usage_limit" : undefined,
+      resetHint: managed.status === "paused" && isProviderUsageLimit(managed.error) ? managed.error.resetHint : undefined,
+      phases: managed.snapshot.phases,
+      currentPhase: managed.snapshot.currentPhase,
+      agents: managed.snapshot.agents.map((a) => {
+        const { result, ...summary } = a;
+        const ts = managed.agentTimestamps.get(a.id);
+        return {
+          ...summary,
+          ...(keepsResumeJournal || result === undefined ? {} : { result }),
+          startedAt: ts?.startedAt,
+          endedAt: ts?.endedAt,
+        };
+      }),
+      logs: managed.snapshot.logs,
+      result: managed.result?.result,
+      tokenUsage: managed.snapshot.tokenUsage
+        ? {
+            input: managed.snapshot.tokenUsage.input,
+            output: managed.snapshot.tokenUsage.output,
+            total: managed.snapshot.tokenUsage.total,
+            cost: managed.snapshot.tokenUsage.cost,
+            cacheRead: managed.snapshot.tokenUsage.cacheRead,
+            cacheWrite: managed.snapshot.tokenUsage.cacheWrite,
+          }
+        : undefined,
+      startedAt: managed.startedAt.toISOString(),
+      updatedAt: new Date().toISOString(),
+      completedAt: managed.status === "completed" ? new Date().toISOString() : undefined,
+      durationMs: managed.result?.durationMs,
+    };
+  }
+
   private writeRunToDisk(managed: ManagedRun) {
     // The sole choke point for every disk write (both persistRun()'s direct
     // calls and schedulePersist()'s deferred timer funnel through here) — skip
@@ -1278,73 +1353,7 @@ export class WorkflowManager extends EventEmitter {
     // gate) reintroduces a producer for it.
     if (!this.isCurrent(managed)) return;
     try {
-      // Resumable states need their journal; completed/aborted states need rich
-      // agent details. Persist exactly one full copy of each agent result instead
-      // of writing it to both agents[].result and journal[].result.
-      const keepsResumeJournal = managed.status !== "completed" && managed.status !== "aborted";
-      const state: PersistedRunState = {
-        runId: managed.runId,
-        workflowName: managed.snapshot.name,
-        // Persist the real script + journal so the run can be resumed. Runs live
-        // in workflow run storage — protect via directory permissions, not blanking.
-        script: managed.script,
-        args: managed.args,
-        // Always the run's own frozen owner — never this.sessionId. A mid-flight
-        // setSessionId() (session replacement) must not re-home a still-running
-        // run out from under stranded-pause / the originating panel.
-        sessionId: managed.sessionId,
-        journal: keepsResumeJournal ? managed.journal : undefined,
-        status: managed.status,
-        // Persisted every write (not just at pause) so a stale read during the
-        // "paused" event race (see UsageLimitScheduler) is still correct — this
-        // is fixed at run-start and doesn't change over the run's lifetime.
-        autoResume: managed.autoResume,
-        // Start-time execution context, re-read by resume() (see ManagedRun).
-        tokenBudget: managed.tokenBudget,
-        toolset: managed.toolset,
-        maxAgents: managed.maxAgents,
-        agentTimeoutMs: managed.agentTimeoutMs,
-        concurrency: managed.concurrency,
-        agentRetries: managed.agentRetries,
-        // Why a usage-limit pause happened, so the navigator / a future cold start
-        // can show it and (eventually) re-arm resume after the budget refills.
-        pauseReason: managed.status === "paused" && isProviderUsageLimit(managed.error) ? "usage_limit" : undefined,
-        resetHint:
-          managed.status === "paused" && isProviderUsageLimit(managed.error) ? managed.error.resetHint : undefined,
-        phases: managed.snapshot.phases,
-        currentPhase: managed.snapshot.currentPhase,
-        // Real per-agent timestamps only (see agentTimestamps) — never the run's
-        // own startedAt or "now" stamped onto every agent on every write. A
-        // still-running agent is persisted with no endedAt.
-        agents: managed.snapshot.agents.map((a) => {
-          const { result, ...summary } = a;
-          const ts = managed.agentTimestamps.get(a.id);
-          return {
-            ...summary,
-            // Live runs keep the rich value in memory. Cold resumable runs use
-            // the journal and retain resultPreview until replay reconstructs it.
-            ...(keepsResumeJournal || result === undefined ? {} : { result }),
-            startedAt: ts?.startedAt,
-            endedAt: ts?.endedAt,
-          };
-        }),
-        logs: managed.snapshot.logs,
-        result: managed.result?.result,
-        tokenUsage: managed.snapshot.tokenUsage
-          ? {
-              input: managed.snapshot.tokenUsage.input,
-              output: managed.snapshot.tokenUsage.output,
-              total: managed.snapshot.tokenUsage.total,
-              cost: managed.snapshot.tokenUsage.cost,
-              cacheRead: managed.snapshot.tokenUsage.cacheRead,
-              cacheWrite: managed.snapshot.tokenUsage.cacheWrite,
-            }
-          : undefined,
-        startedAt: managed.startedAt.toISOString(),
-        updatedAt: new Date().toISOString(),
-        completedAt: managed.status === "completed" ? new Date().toISOString() : undefined,
-        durationMs: managed.result?.durationMs,
-      };
+      const state = this.persistedStateFor(managed);
       this.persistence.save(state, managed.revision, managed.lease);
       managed.revision = state.revision;
     } catch (err) {

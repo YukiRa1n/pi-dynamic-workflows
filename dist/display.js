@@ -242,6 +242,8 @@ export function shorten(value, max) {
     return text.length > max ? `${text.slice(0, max - 1)}…` : text;
 }
 export function preview(value, max = 80) {
+    if (value === null || value === undefined)
+        return "";
     const text = typeof value === "string" ? value : safeStringify(value);
     if (!text)
         return "";

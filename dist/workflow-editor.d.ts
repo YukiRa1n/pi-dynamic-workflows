@@ -8,8 +8,8 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { type EffortState } from "./effort-command.js";
 import { type WorkflowSettingsStore } from "./workflow-settings.js";
-export declare function hasTrigger(text: string, triggerWord?: any): boolean;
-export declare function endsWithTrigger(textBeforeCursor: string, triggerWord?: any): boolean;
+export declare function hasTrigger(text: string, triggerWord?: string): boolean;
+export declare function endsWithTrigger(textBeforeCursor: string, triggerWord?: string): boolean;
 /** Shared, mutable view of whether "workflows mode" is currently armed. */
 export interface WorkflowModeState {
     active: boolean;

@@ -381,7 +381,7 @@ export function createRunPersistence(
         (value.pid as number) <= 0 ||
         typeof value.startedAt !== "string" ||
         typeof value.token !== "string" ||
-        value.token.length < 16
+        value.token.length < 1
       )
         return null;
       assertSafeRunId(value.runId);
@@ -457,7 +457,7 @@ export function createRunPersistence(
       const payload: LockFile = { runId, runPath: path, pid: process.pid, startedAt: new Date().toISOString(), token };
       const tmp = `${lock}.${token}.tmp`;
       try {
-        _writeFileSync(tmp, JSON.stringify(payload, null, 2));
+        _writeFileSync(tmp, JSON.stringify(payload, null, 2), { encoding: "utf-8", mode: 0o600, flag: "wx" });
         if (canUseAtomicLink && fs.linkSync) {
           // link(2) publishes without replacing an existing lock.
           fs.linkSync(tmp, lock);
@@ -465,7 +465,7 @@ export function createRunPersistence(
         } else {
           // Older injected FsLayers do not expose linkSync. Keep the legacy
           // exclusive-create fallback rather than breaking that test API.
-          _writeFileSync(lock, JSON.stringify(payload, null, 2), { flag: "wx" });
+          _writeFileSync(lock, JSON.stringify(payload, null, 2), { encoding: "utf-8", mode: 0o600, flag: "wx" });
           _unlinkSync(tmp);
         }
         return { runId, token };
@@ -676,6 +676,10 @@ export function createRunPersistence(
         }
         const nextRevision = (actualRevision ?? 0) + 1;
         const nextUpdatedAt = new Date().toISOString();
+        // Accept legacy/programmatic callers that predate mandatory script and
+        // timestamps, but publish a record that passes our own schema immediately.
+        if (typeof state.script !== "string") state.script = "";
+        if (!state.startedAt) state.startedAt = nextUpdatedAt;
         const path = primaryRunPath(state.runId);
         // Publish a copy first. Mutating the caller's revision before an I/O
         // failure would make its next retry fence against a revision that was

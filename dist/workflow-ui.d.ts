@@ -61,7 +61,7 @@ export declare class NavigatorModel {
     constructor(manager: Pick<WorkflowManager, "listRuns" | "getRun">, storage?: {
         list(): SavedWorkflow[];
         delete(name: string, location?: string): boolean;
-    });
+    } | undefined);
     /** Share persisted data across all model lookups performed by one render. */
     withRenderFrame<T>(render: () => T): T;
     private persistedRuns;

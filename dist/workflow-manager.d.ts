@@ -227,8 +227,11 @@ export interface WorkflowManagerOptions {
      * (extensions/workflow.ts) sets this per generation so messages land in the
      * current session's conversation.
      */
-    onDeliver?: (message: string) => void | Promise<void>;
-    /** Automatically forward each completed subagent result to the host session. */
+    onDeliver?: (message: string, source?: {
+        runId: string;
+        workflowName: string;
+    }) => void | Promise<void>;
+    /** Optional observer for each live subagent result. Hosts should normally keep this persistence/UI-only. */
     onAgentMessage?: (event: {
         runId: string;
         id: string;
@@ -325,8 +328,11 @@ export declare class WorkflowManager extends EventEmitter {
     private excludeSubagentTools?;
     private persistAgentSessions;
     /** Runtime deliver() bridge; refreshed by host wiring each generation. */
-    onDeliver?: (message: string) => void | Promise<void>;
-    /** Host bridge for automatic subagent-result delivery. */
+    onDeliver?: (message: string, source?: {
+        runId: string;
+        workflowName: string;
+    }) => void | Promise<void>;
+    /** Optional host observer for live subagent results; not provider delivery by default. */
     onAgentMessage?: WorkflowManagerOptions["onAgentMessage"];
     private pendingMessages;
     private activeAgentSenders;
@@ -482,6 +488,7 @@ export declare class WorkflowManager extends EventEmitter {
      * pause()/resume()/stop().
      */
     private persistRun;
+    private persistedStateFor;
     private writeRunToDisk;
     /**
      * Pause a running workflow.

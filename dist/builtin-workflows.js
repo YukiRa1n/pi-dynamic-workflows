@@ -11,7 +11,6 @@
  * this one registry, so the two paths can never drift apart and the
  * per-pattern generator scripts are written exactly once.
  */
-import { createCodingTools } from "@earendil-works/pi-coding-agent";
 import { generateAdversarialReviewWorkflow, generateMultiPerspectiveWorkflow } from "./adversarial-review.js";
 import { generateCodeReviewWorkflow } from "./code-review.js";
 import { generateCodebaseAuditWorkflow, generateDeepResearchWorkflow } from "./deep-research.js";
@@ -44,14 +43,14 @@ export const BUILTIN_WORKFLOWS = [
     {
         name: "deep-research",
         description: "Research a question across the web with cross-checked sources. args: { question: string }.",
-        resolve(cwd, args) {
+        resolve(_cwd, args) {
             requireNonEmptyString(asRecord(args).question, "question", "deep-research");
             return {
                 script: generateDeepResearchWorkflow(),
-                // Research agents need real web access on top of the coding tools; the
-                // "web-research" tag is what a resumed run re-resolves (see
-                // WorkflowManagerOptions.toolsets).
-                tools: [...createCodingTools(cwd), ...createWebTools()],
+                // Research agents receive only the two network research tools. They do
+                // not need shell or filesystem mutation capabilities; the "web-research"
+                // tag is what a resumed run re-resolves (see WorkflowManagerOptions.toolsets).
+                tools: createWebTools(),
                 toolset: "web-research",
             };
         },

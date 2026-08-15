@@ -31,7 +31,7 @@ export { safeStringify } from "./safe-serialize.js";
 export { SharedStore } from "./shared-store.js";
 export type { StructuredOutputCapture, StructuredOutputToolOptions } from "./structured-output.js";
 export { createStructuredOutputTool } from "./structured-output.js";
-export { deliverText, installResultDelivery, installTaskPanel, resumeResultDelivery, suspendResultDelivery, type TaskPanelOptions, } from "./task-panel.js";
+export { deliverText, installResultDelivery, installTaskPanel, resumeResultDelivery, suspendResultDelivery, type TaskPanelOptions, type WorkflowDeliveryPayload, } from "./task-panel.js";
 export type { AutoResumeDelayParams, SchedulableWorkflowManager, TimerHandle, UsageLimitSchedulerOptions, } from "./usage-limit-scheduler.js";
 export { computeAutoResumeDelayMs, parseResetHintMs, UsageLimitScheduler } from "./usage-limit-scheduler.js";
 export { createWebFetchTool, createWebSearchTool, createWebTools } from "./web-tools.js";

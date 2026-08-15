@@ -23,6 +23,16 @@ export declare function deliverText(run: ManagedRun, opts?: {
     resultPath?: string;
     maxChars?: number;
 }): string;
+export type WorkflowDeliveryPayload = {
+    content: string;
+    details?: {
+        isError?: boolean;
+        status?: "completed" | "failed" | "paused";
+        notificationKind?: "workflow-result";
+        runId?: string;
+        sequence?: number;
+    };
+};
 /**
  * Stop live sends on this manager. In-flight completions only enqueue until
  * {@link resumeResultDelivery} runs (from session_start, after Pi has bound
@@ -42,6 +52,8 @@ export declare function resumeResultDelivery(manager: WorkflowManager): void;
 export declare function installResultDelivery(pi: ExtensionAPI, manager: WorkflowManager, opts?: {
     loadSettings?: () => WorkflowSettings;
     installContextBridge?: boolean;
+    /** Route terminal results through an extension-owned batching/dedup bridge. */
+    sendResult?: (payload: WorkflowDeliveryPayload) => void;
 }): void;
 export declare function renderPanel(manager: WorkflowManager, theme: Theme, width?: number): string[];
 /** Record a token-total sample for `runId` at time `now` (ms). */

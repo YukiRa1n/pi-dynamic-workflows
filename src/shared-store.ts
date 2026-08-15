@@ -137,7 +137,9 @@ export class SharedStore {
     }
     this.agentDeltas.delete(deltaKey);
     this.priorValues.delete(deltaKey);
-    return delta;
+    // Return a normal plain object for API/test compatibility while retaining
+    // null-prototype storage internally against prototype-sensitive writes.
+    return Object.fromEntries(Object.entries(delta));
   }
 
   /**

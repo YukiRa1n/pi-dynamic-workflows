@@ -287,9 +287,6 @@ const capabilities = [
         "mutually exclusive with resumeFromRunId",
     ]),
     toolInput("args", "args?: Record<string, unknown>", ["top-level JSON object; built-in workflows consume named fields"]),
-    toolInput("background", "background?: boolean = true", [
-        "background workflows are headless; use background false when checkpoint must show foreground confirmation",
-    ]),
     toolInput("maxAgents", "maxAgents?: number = 1000", ["default, not a hard product maximum"]),
     toolInput("concurrency", "concurrency?: number", ["runtime clamps to 1..16"]),
     toolInput("agentRetries", "agentRetries?: number = configured value or 0", ["floored and clamped to 0..3"]),

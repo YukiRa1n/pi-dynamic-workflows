@@ -25,6 +25,7 @@ export interface SchedulableWorkflowManager {
   listAllRuns(): PersistedRunState[];
   resume(runId: string): Promise<boolean>;
   getPersistence(): RunPersistence;
+  syncPersistedRevision(runId: string, revision: number | undefined): void;
 }
 
 /** Opaque timer handle so tests can inject a fake clock/timer. */

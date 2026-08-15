@@ -245,6 +245,7 @@ export async function runWorkflow(script, options = {}) {
             : { input: 0, output: 0, total: 0, cost: 0, cacheRead: 0, cacheWrite: 0 },
         depth: 0,
         nestedCallSeq: 0,
+        nestedRunIds: new Map(),
         runFatalController: new AbortController(),
         inFlight: new Set(),
     };
@@ -774,7 +775,7 @@ export async function runWorkflow(script, options = {}) {
                         // "aborted" once agentController fires; the race has already resolved,
                         // so swallow that to avoid an unhandled rejection.
                         runPromise.catch(() => { });
-                        const result = await withTimeout(runPromise, timeout, label, () => agentController.abort());
+                        const result = await withTimeout(runPromise, timeout, label, () => agentController.abort(), agentController.signal);
                         throwIfAborted();
                         if (isEmptyTextAgentResult(result, agentOptions.schema)) {
                             throw new WorkflowError("Subagent produced no assistant output", WorkflowErrorCode.AGENT_EMPTY_OUTPUT, {
@@ -1094,7 +1095,23 @@ export async function runWorkflow(script, options = {}) {
         const resolved = options.loadSavedWorkflow?.(String(nameOrScript));
         const childScript = resolved ?? String(nameOrScript);
         const workflowName = String(nameOrScript);
+        // Derive nested identity from the parent's lexical call position and keep
+        // the first assigned id stable across a pause/resume replay. A global
+        // monotonic counter alone advances again on resume and makes the child's
+        // persisted `${runId}:index` journal keys unreachable.
+        const nestedCallIndex = state.callSeq++;
+        const nestedIdentity = `${runId}:workflow:${nestedCallIndex}`;
+        let childRunId = shared.nestedRunIds.get(nestedIdentity);
+        if (!childRunId) {
+            childRunId = `${runId}-nested${++shared.nestedCallSeq}`;
+            shared.nestedRunIds.set(nestedIdentity, childRunId);
+        }
         observers.onRuntimeEvent?.({ type: "workflow", stage: "start", name: workflowName, args: childArgs });
+        // A miss before this nested call invalidates every downstream cached result,
+        // including child-frame entries whose own hashes still match. Conversely,
+        // a nested call before the first parent miss can safely consume its
+        // runId-namespaced journal.
+        const childResumeJournal = nestedCallIndex < state.firstMiss ? options.resumeJournal : undefined;
         try {
             // Nested frames deliberately do not consume the parent journal. Their
             // child script, args, and shared-store starting state are not part of the
@@ -1103,20 +1120,18 @@ export async function runWorkflow(script, options = {}) {
             // live while still sharing the parent's limiter, budget, and store.
             // Since the child can mutate that shared store, all later parent calls
             // must also run live rather than replaying an old storeDelta.
-            state.firstMiss = Math.min(state.firstMiss, state.callSeq);
             const child = await workflowDepthScope.run(workflowDepth + 1, () => runWorkflow(childScript, {
                 ...options,
                 args: childArgs,
                 sharedRuntime: shared,
-                // Propagate the parent's store so nested agents share the same key-value space.
+                // Propagate the parent's store and journal so nested agents share state
+                // and can replay their own runId-namespaced entries on resume. The child
+                // receives the same map, but its distinct derived runId prevents parent/
+                // child call-index collisions.
                 sharedStore: store,
-                resumeJournal: undefined,
-                resumeFromRunId: undefined,
-                // shared.nestedCallSeq, not shared.depth — see its doc comment: depth
-                // returns to 0 between sequential sibling calls, which would otherwise
-                // mint the same child runId (and hence colliding deltaKeys/event ids)
-                // for two different children.
-                runId: `${runId}-nested${++shared.nestedCallSeq}`,
+                resumeJournal: childResumeJournal,
+                resumeFromRunId: childResumeJournal ? options.resumeFromRunId : undefined,
+                runId: childRunId,
                 persistLogs: false,
             }));
             return child.result;
@@ -1667,29 +1682,51 @@ function normalizeAgentRetries(value) {
  * `onTimeout` fires when the deadline hits, BEFORE the timeout rejection wins the
  * race — the caller uses it to abort the underlying work (e.g. the subagent
  * session) so it can release its resources instead of streaming on in the
- * background with the whole session graph (messages, etc.) retained (#109). The
- * losing promise still settles later; the caller must swallow its rejection.
+ * background with the whole session graph (messages, etc.) retained (#109).
+ *
+ * `signal` also makes a timeout-disabled (`ms === null`) attempt abortable at
+ * the logical workflow layer. Providers are cooperative and may ignore abort;
+ * their original promise remains separately tracked by the run's bounded drain,
+ * but pause/stop must not await that promise forever before resume can proceed.
  */
-async function withTimeout(promise, ms, label, onTimeout) {
-    if (ms === null)
-        return promise;
+async function withTimeout(promise, ms, label, onTimeout, signal) {
     let timeoutId;
-    const timeoutPromise = new Promise((_, reject) => {
-        timeoutId = setTimeout(() => {
-            try {
-                onTimeout?.();
+    let onAbort;
+    const races = [promise];
+    if (ms !== null) {
+        races.push(new Promise((_, reject) => {
+            timeoutId = setTimeout(() => {
+                // Settle the logical race as a timeout before aborting the provider.
+                // Abort listeners run synchronously, so reversing this order lets the
+                // linked abort branch mask AGENT_TIMEOUT as generic WORKFLOW_ABORTED.
+                reject(new WorkflowError(`Agent "${label}" timed out after ${ms}ms; raise or omit timeoutMs/agentTimeoutMs to allow longer runs`, WorkflowErrorCode.AGENT_TIMEOUT, { recoverable: true }));
+                try {
+                    onTimeout?.();
+                }
+                catch {
+                    // Best-effort cleanup; never let it mask the timeout error.
+                }
+            }, ms);
+        }));
+    }
+    if (signal) {
+        races.push(new Promise((_, reject) => {
+            const rejectAborted = () => reject(new WorkflowError("workflow aborted", WorkflowErrorCode.WORKFLOW_ABORTED, { recoverable: true }));
+            if (signal.aborted)
+                rejectAborted();
+            else {
+                onAbort = rejectAborted;
+                signal.addEventListener("abort", onAbort, { once: true });
             }
-            catch {
-                // Best-effort cleanup; never let it mask the timeout error.
-            }
-            reject(new WorkflowError(`Agent "${label}" timed out after ${ms}ms; raise or omit timeoutMs/agentTimeoutMs to allow longer runs`, WorkflowErrorCode.AGENT_TIMEOUT, { recoverable: true }));
-        }, ms);
-    });
+        }));
+    }
     try {
-        return await Promise.race([promise, timeoutPromise]);
+        return await Promise.race(races);
     }
     finally {
         if (timeoutId)
             clearTimeout(timeoutId);
+        if (onAbort)
+            signal?.removeEventListener("abort", onAbort);
     }
 }

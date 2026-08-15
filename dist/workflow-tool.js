@@ -2,34 +2,29 @@ import { defineTool } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { BUILTIN_WORKFLOW_NAMES, resolveWorkflowInvocation } from "./builtin-workflows.js";
-import { createToolUpdateWorkflowDisplay, createWorkflowSnapshot, fmtCost, fmtFull, fmtTokenSegment, recomputeWorkflowSnapshot, renderWorkflowText, tokenFigures, } from "./display.js";
-import { WorkflowError, WorkflowErrorCode } from "./errors.js";
+import { renderWorkflowText } from "./display.js";
 import { parseWorkflowScript } from "./workflow.js";
 import { WorkflowManager } from "./workflow-manager.js";
 import { createWorkflowStorage } from "./workflow-saved.js";
 import { loadWorkflowSettings } from "./workflow-settings.js";
-import { safeStringify } from "./safe-serialize.js";
 /** The single always-on gate that authorizes workflow use without forcing it. */
 export const WORKFLOW_GATE_GUIDELINE = "The `workflow` tool runs multi-agent orchestration — it fans decomposable work out across subagents, and fits tasks shaped like: repo-wide inspection, independent parallel research/checks, multi-perspective review, or fan-out/fan-in synthesis. ONLY call it when the user explicitly opts in — via the workflow trigger word, `/workflows run`, or their own words (e.g. 'run a workflow', 'fan this out', '并行审一遍'). For any other task — even one that would clearly benefit — do not call it; you may briefly offer it (with a rough cost) as an option instead.";
 const workflowToolSchema = Type.Object({
     script: Type.Optional(Type.String({
         description: [
-            "Raw JavaScript workflow script, with no Markdown fences. Required unless `name` is given.",
-            "First statement: export const meta = { name: 'short_snake_case', description: 'non-empty description' }. Add phases: [{ title: 'Phase' }] only when the workflow has named phases, and declare only phases it will use. With multiple phases, call phase('Exact Title') before each phase's work or set `phase` in the agent options.",
-            "Use `await workflow(savedName, childArgs)` to run a saved workflow inline; nesting is limited to one level and shares the parent run's concurrency, agent, and token limits.",
-            "Optional quality helpers include verify(), judgePanel(), loopUntilDry(), and completenessCheck().",
-            "Optional control helpers include retry() and gate(); budget exposes total, spent(), and remaining(), and phase('Name', { budget: N }) sets a phase token limit.",
-            "The optional `agentType` option selects a named user or project definition that can bind tools, a model, and role instructions; use it only when its name and purpose are provided in context. Its bound model overrides `tier`; an explicit `model` overrides both.",
-            "Use plain JavaScript only; imports, require(), filesystem modules, Date.now(), Math.random(), and new Date() are unavailable.",
-            "Use phase('Name'), agent(prompt, opts), parallel(arrayOfFunctions), pipeline(items, ...stages), createTeam(name), log(message), args, cwd, process.cwd(), and budget. A team exposes spawn(), peer messages, and a shared task board while reusing the workflow scheduler. The workflow must call agent() at least once.",
-            "parallel() requires functions, not promises, and returns results in input order: await parallel(items.map(item => () => agent(...))).",
-            "pipeline(items, ...stages) runs stages sequentially for each item while items proceed concurrently; each stage receives (previousValue, originalItem, index).",
+            "Raw JavaScript workflow script; no Markdown fences. Required unless `name` is given. First statement: export const meta = { name: 'short_snake_case', description: 'non-empty description' }. Add phases: [{ title: 'Phase' }] only when the workflow has named phases, and declare only phases it will use. For multiple phases, call phase('Exact Title') before work or set `phase` in agent options.",
+            "Use await workflow(savedName, childArgs) to run a saved workflow inline; nesting is limited to one level and shares the parent run's concurrency, agent, and token limits. Optional quality helpers include verify(), judgePanel(), loopUntilDry(), and completenessCheck(). Optional control helpers include retry() and gate(); budget exposes total, spent(), and remaining(); phase('Name', { budget: N }) sets a phase token limit.",
+            "The optional `agentType` option selects a named user or project definition to bind tools, a model, and role instructions; use only when its name and purpose are provided in context. Its bound model overrides `tier`; explicit `model` overrides both.",
+            "Plain JavaScript only: imports, require(), filesystem modules, Date.now(), Math.random(), and new Date() are unavailable.",
+            "Available: phase('Name'), agent(prompt, opts), parallel(arrayOfFunctions), pipeline(items, ...stages), createTeam(name), deliver(message), args, cwd, process.cwd(), and budget. createTeam gives workflow-scoped peer messaging/task board; team.spawn() reuses scheduler/concurrency budget. deliver(message) sends to host conversation when wired; otherwise no-op. Must call agent() at least once.",
+            "parallel() requires functions, not promises; results in input order.",
+            "pipeline(items, ...stages): stages sequentially per item; items proceed concurrently; each stage receives (previousValue, originalItem, index).",
         ].join(" "),
     })),
     name: Type.Optional(Type.String({
-        description: "Run a saved or built-in workflow by name instead of `script`; its args go in `args`. " +
-            `Built-ins: ${BUILTIN_WORKFLOW_NAMES.join(", ")} — see the workflow-patterns skill for each one's args. ` +
-            "A same-named saved workflow wins. Not combinable with resumeFromRunId.",
+        description: "Run a saved or built-in workflow by name, not `script`; pass args in `args`. " +
+            `Built-ins: ${BUILTIN_WORKFLOW_NAMES.join(", ")} — see the workflow-patterns skill for args. ` +
+            "Same-named saved wins; not combinable with resumeFromRunId.",
     })),
     args: Type.Optional(
     // Must be an explicitly typed object schema, not Type.Any(). Type.Any()
@@ -47,40 +42,33 @@ const workflowToolSchema = Type.Object({
     // provider-visible tool definition's byte budget.
     Type.Unsafe({
         type: "object",
-        description: "Optional JSON value exposed to the workflow script as global `args`.",
-    })),
-    background: Type.Optional(Type.Boolean({
-        description: "Run the workflow in the background. Default: true — the tool returns immediately with a run ID, the turn ends so the user isn't blocked, and the result is delivered back into the conversation when it finishes. Set to false only when you need the result inline in this same turn (the call will block until the workflow completes).",
+        description: "Optional JSON object exposed as global `args`.",
     })),
     maxAgents: Type.Optional(Type.Integer({
         minimum: 1,
         maximum: 1000,
-        description: "Maximum number of agents allowed in this run. Default: 1000; this is a safety ceiling, not a target. Set a lower limit for dynamic or exploratory fan-out, and reserve large fan-outs for explicit user intent.",
+        description: "Maximum agents. Default: 1000; this is a safety ceiling, not a target. Use a lower limit for dynamic or exploratory fan-out; reserve large fan-outs for explicit user intent.",
     })),
     concurrency: Type.Optional(Type.Integer({
         minimum: 1,
         maximum: 16,
-        description: "Maximum concurrent agents for this run. Clamped to the runtime maximum. Use when provider/transport stability matters.",
+        description: "Maximum concurrent agents; clamped to runtime maximum. Use for provider/transport stability.",
     })),
     agentRetries: Type.Optional(Type.Integer({
         minimum: 0,
         maximum: 3,
-        description: "Retry attempts for recoverable agent failures such as timeout, connection failure, or empty assistant output. Default 0 unless configured.",
+        description: "Retry attempts for recoverable agent failures (timeout, connection, empty output). Default 0 unless configured.",
     })),
     agentTimeoutMs: Type.Optional(Type.Integer({
         minimum: 1,
-        description: "Timeout per agent in milliseconds. Omit to use configured `defaultAgentTimeoutMs`; without one, there is no hard timeout. Set only when the user asks to bound time.",
+        description: "Timeout per agent (ms). Omit to use configured `defaultAgentTimeoutMs`; without one, no hard timeout. Set only when the user asks to bound time.",
     })),
     tokenBudget: Type.Optional(Type.Integer({
         minimum: 1,
         description: "Optional user-requested soft spend gate, not a planning target. Do not set `tokenBudget` unless the user explicitly supplies a cap or asks you to choose one; never infer or invent one from task size. If omitted, the configured `defaultTokenBudget` applies; without one, the run is unlimited. Reaching the gate blocks later `agent()` calls; concurrent in-flight work can overshoot.",
     })),
     resumeFromRunId: Type.Optional(Type.String({
-        description: [
-            "Resume a prior run (this ID) with an edited `script` instead of starting a new run.",
-            "Unchanged agent() calls replay from that run's cache; the first changed/new call onward re-runs.",
-            "Calls match by position: keep earlier good calls identical and in order. Always background.",
-        ].join(" "),
+        description: "Resume a prior run (this ID) with an edited `script`. Unchanged agent() calls replay from cache; the first changed/new call onward re-runs. Calls match by position; keep earlier calls identical/in order. Always background.",
     })),
 });
 export function createWorkflowTool(options = {}) {
@@ -110,7 +98,7 @@ export function createWorkflowTool(options = {}) {
         prepareArguments(args) {
             return normalizeWorkflowToolArgs(args);
         },
-        async execute(_toolCallId, params, signal, onUpdate, ctx) {
+        async execute(_toolCallId, params) {
             const manager = getManager();
             const storage = getStorage();
             const cwd = getCwd();
@@ -158,106 +146,21 @@ export function createWorkflowTool(options = {}) {
                     details: { runId, background: true, resumedFrom: runId },
                 };
             }
-            // checkpoint() reaches the human only on a UI-bearing foreground run; a
-            // background run is detached, so checkpoint() falls back to its headless
-            // default. Map a checkpoint to ctx.ui.confirm (a yes/no gate) when available.
-            const uiCtx = ctx;
-            const uiConfirm = uiCtx?.hasUI ? uiCtx.ui?.confirm : undefined;
-            const confirm = uiConfirm
-                ? (promptText) => uiConfirm.call(uiCtx?.ui, "Workflow checkpoint", promptText)
-                : undefined;
-            // Background execution is the default: return immediately so the turn ends
-            // and the user isn't blocked. The result is delivered back into the
-            // conversation when the run finishes (see installResultDelivery). Only an
-            // explicit `background: false` blocks for the result inline.
-            if (params.background ?? true) {
-                const { runId } = manager.startInBackground(script, params.args, {
-                    maxAgents: params.maxAgents,
-                    concurrency: params.concurrency,
-                    agentRetries: params.agentRetries,
-                    agentTimeoutMs: params.agentTimeoutMs,
-                    tokenBudget: params.tokenBudget,
-                    tools: invocationTools,
-                    toolset: invocationToolset,
-                });
-                return {
-                    content: [{ type: "text", text: backgroundStartedText(parsed.meta.name, runId) }],
-                    details: { runId, background: true },
-                };
-            }
-            // Synchronous execution (blocking) — but routed through the manager so the
-            // run shows up live in the /workflows navigator and the task panel while it
-            // runs, then stays in history afterwards. We still block on the result and
-            // return it inline, so the model gets the full output in the same turn.
-            let snapshot = createWorkflowSnapshot(parsed.meta);
-            const display = createToolUpdateWorkflowDisplay(onUpdate, undefined, {
-                key: "workflow",
-                streamToolUpdates: true,
-                maxAgents: 4,
-                showResultPreviews: false,
+            // Public tool invocations are always detached. This keeps one lifecycle,
+            // delivery, acknowledgement, and context-projection path: the tool returns
+            // a run ID immediately and the bounded terminal result is delivered later.
+            const { runId } = manager.startInBackground(script, params.args, {
+                maxAgents: params.maxAgents,
+                concurrency: params.concurrency,
+                agentRetries: params.agentRetries,
+                agentTimeoutMs: params.agentTimeoutMs,
+                tokenBudget: params.tokenBudget,
+                tools: invocationTools,
+                toolset: invocationToolset,
             });
-            let result;
-            try {
-                result = await manager.runSync(script, params.args, {
-                    maxAgents: params.maxAgents,
-                    concurrency: params.concurrency,
-                    agentRetries: params.agentRetries,
-                    agentTimeoutMs: params.agentTimeoutMs,
-                    tokenBudget: params.tokenBudget,
-                    tools: invocationTools,
-                    toolset: invocationToolset,
-                    confirm,
-                    externalSignal: signal,
-                    onProgress(live) {
-                        snapshot = recomputeWorkflowSnapshot(live);
-                        display.update(snapshot);
-                    },
-                });
-            }
-            catch (error) {
-                if (signal?.aborted || (error instanceof WorkflowError && error.code === WorkflowErrorCode.WORKFLOW_ABORTED)) {
-                    for (const agent of snapshot.agents) {
-                        if (agent.status === "running") {
-                            agent.status = "skipped";
-                            agent.error = "aborted";
-                        }
-                    }
-                    snapshot = recomputeWorkflowSnapshot(snapshot);
-                    display.complete(snapshot);
-                    throw new Error("Workflow was aborted");
-                }
-                throw error;
-            }
-            if (result.agentCount === 0) {
-                throw new Error("workflow scripts must call agent() at least once; this workflow declared phases but did not run any subagents");
-            }
-            snapshot.result = result.result;
-            snapshot.durationMs = result.durationMs;
-            snapshot = recomputeWorkflowSnapshot(snapshot);
-            display.complete(snapshot);
-            // Format token usage (include cost when the provider reports it)
-            const tokenSegment = fmtTokenSegment(tokenFigures(result.tokenUsage), fmtFull);
-            const tokenInfo = tokenSegment
-                ? `\n\nToken usage: ${tokenSegment}${result.tokenUsage?.cost ? ` (${fmtCost(result.tokenUsage.cost)})` : ""}`
-                : "";
-            const formattedResult = result.result !== undefined ? `\n\`\`\`json\n${safeStringify(result.result)}\n\`\`\`` : "";
             return {
-                content: [
-                    {
-                        type: "text",
-                        text: `Workflow **${result.meta.name}** completed with **${result.agentCount}** agent(s).${tokenInfo}\n\n## Result${formattedResult}\n\n${reviseHint(result.runId)}`,
-                    },
-                ],
-                details: {
-                    ...snapshot,
-                    meta: result.meta,
-                    phases: result.phases,
-                    logs: result.logs,
-                    result: result.result,
-                    durationMs: result.durationMs,
-                    tokenUsage: result.tokenUsage,
-                    runId: result.runId,
-                },
+                content: [{ type: "text", text: backgroundStartedText(parsed.meta.name, runId) }],
+                details: { runId, background: true },
             };
         },
         renderCall(_args, theme) {
@@ -366,6 +269,9 @@ function normalizeWorkflowToolArgs(args) {
     if (!args || typeof args !== "object")
         throw new Error("workflow requires an object argument with a `script` string or a `name`");
     const value = args;
+    if (Object.hasOwn(value, "background")) {
+        throw new Error("workflow is background-only; omit the unsupported `background` argument");
+    }
     // Finite, bounded domain checks (tool-api-types-006 / LIMIT-001): the schema
     // constrains these, but a defense-in-depth pass here rejects NaN/Infinity/
     // fractional/out-of-range values even if a caller bypasses validation.
@@ -413,9 +319,4 @@ function normalizeWorkflowScript(script) {
     if (fence)
         text = fence[1].trim();
     return text;
-}
-function _isAbortError(error) {
-    if (!(error instanceof Error))
-        return false;
-    return /\babort(?:ed)?\b/i.test(error.message);
 }

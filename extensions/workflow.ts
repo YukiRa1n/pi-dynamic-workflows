@@ -1,7 +1,7 @@
 import { closeSync, existsSync, openSync, readSync } from "node:fs";
 import { resolve } from "node:path";
 import { StringDecoder } from "node:string_decoder";
-import { createCodingTools, defineTool, getMarkdownTheme, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { defineTool, getMarkdownTheme, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Box, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import {
@@ -34,6 +34,7 @@ import {
   suspendResultDelivery,
   UsageLimitScheduler,
   WorkflowManager,
+  type WorkflowDeliveryPayload,
 } from "../src/index.js";
 import type { WorkflowStorage } from "../src/workflow-saved.js";
 
@@ -106,7 +107,10 @@ function buildManagerOptions(cwd: string, storage: WorkflowStorage) {
   return {
     loadSavedWorkflow: (name: string) => storage.load(name)?.script,
     toolsets: {
-      "web-research": () => [...createCodingTools(cwd), ...createWebTools()],
+      // Least privilege: research subagents need network retrieval, not shell or
+      // filesystem mutation. WorkflowAgent uses this toolset as its complete
+      // base tool list for the run.
+      "web-research": () => createWebTools(),
     },
     excludeSubagentTools: settings.excludeSubagentTools,
     defaultAgentTimeoutMs: settings.defaultAgentTimeoutMs ?? null,
@@ -153,10 +157,14 @@ function collapsedMessageText(text: string): { text: string; omitted: boolean } 
   return { text: preview, omitted };
 }
 
-/** Display-only folding: the full custom-message content remains in LLM context. */
+/** Display-only folding. Provider-facing types retain their bounded full payload; legacy workflow-agent entries stay display-only. */
 function registerWorkflowMessageRenderers(pi: ExtensionAPI): void {
-  for (const customType of ["workflow-agent", "workflow-deliver", "workflow-result"] as const) {
-    pi.registerMessageRenderer(customType, (message, { expanded, outputPad }, theme) => {
+  // Minimal/headless hosts and older Pi test doubles may not expose renderer
+  // registration. Rendering is optional and must never prevent the delivery,
+  // persistence, or lifecycle bridges from installing.
+  if (typeof pi.registerMessageRenderer === "function") {
+    for (const customType of ["workflow-agent", "workflow-deliver", "workflow-result"] as const) {
+      pi.registerMessageRenderer(customType, (message, { expanded, outputPad }, theme) => {
       const full = customMessageText(message.content);
       const preview = expanded ? { text: full, omitted: false } : collapsedMessageText(full);
       const box = new Box(Math.max(0, outputPad), 1, (text) => theme.bg("customMessageBg", text));
@@ -169,13 +177,15 @@ function registerWorkflowMessageRenderers(pi: ExtensionAPI): void {
         box.addChild(new Spacer(1));
         box.addChild(new Text(theme.fg("dim", "… message folded; expand tool output to view the full delivery"), 0, 0));
       }
-      return box;
-    });
+        return box;
+      });
+    }
   }
 
   // Compatibility renderer for durable/display-only workflow-agent entries.
-  // Live final reports use custom messages so they can join the provider-bound
-  // workflow batch; appendEntry callers remain visible without entering context.
+  // Automatic final reports stay in run persistence/pagers and never enter the
+  // provider context; older sessions may still contain legacy custom entries.
+  if (typeof pi.registerEntryRenderer !== "function") return;
   pi.registerEntryRenderer("workflow-agent", (entry, { expanded }, theme) => {
     const data = entry.data && typeof entry.data === "object" ? (entry.data as Record<string, unknown>) : {};
     const label = typeof data.label === "string" && data.label ? ` ${data.label}` : "";
@@ -197,10 +207,12 @@ function registerWorkflowMessageRenderers(pi: ExtensionAPI): void {
 }
 
 const WORKFLOW_CUSTOM_TYPES = new Set(["workflow-agent", "workflow-deliver", "workflow-result"]);
+const PROVIDER_WORKFLOW_CUSTOM_TYPES = new Set(["workflow-deliver", "workflow-result"]);
 const WORKFLOW_BRIDGE_QUEUE_LIMIT = 64;
 const WORKFLOW_BRIDGE_DEDUP_LIMIT = 256;
-const WORKFLOW_BRIDGE_PAYLOAD_LIMIT = 256_000;
-const WORKFLOW_BRIDGE_COALESCED_LIMIT = 512_000;
+const WORKFLOW_BRIDGE_PAYLOAD_LIMIT = 32_000;
+const WORKFLOW_BRIDGE_COALESCED_LIMIT = 64_000;
+const WORKFLOW_BRIDGE_IN_FLIGHT_LIMIT = 64;
 
 type WorkflowDeliveryDetails = {
   isError?: boolean;
@@ -210,6 +222,10 @@ type WorkflowDeliveryDetails = {
   agentId?: string;
   label?: string;
   sequence?: number;
+  /** Internal acknowledgement identity; forwarded only as notification metadata. */
+  deliveryId?: string;
+  /** Generation that submitted the message to Pi's steering queue. */
+  deliveryGeneration?: number;
 };
 
 type WorkflowBridgeDelivery = {
@@ -227,6 +243,10 @@ type WorkflowBridge = {
   nextEventSeq: number;
   pending: WorkflowBridgeDelivery[];
   delivered: Set<string>;
+  /** Sent to Pi but not yet accepted by a provider request. */
+  awaitingAck: Map<string, WorkflowBridgeDelivery>;
+  /** IDs observed in the latest context projection, consumed by before_provider_request. */
+  projectedForNextRequest: Array<{ id: string; generation: number }>;
 };
 
 type ManagerWithWorkflowBridge = WorkflowManager & { __workflowBridge?: WorkflowBridge };
@@ -261,7 +281,10 @@ function rememberDelivery(bridge: WorkflowBridge, id: string): void {
 
 function boundedWorkflowContent(content: string): string {
   if (content.length <= WORKFLOW_BRIDGE_PAYLOAD_LIMIT) return content;
-  return `${content.slice(0, WORKFLOW_BRIDGE_PAYLOAD_LIMIT)}\n\n[workflow delivery truncated at ${WORKFLOW_BRIDGE_PAYLOAD_LIMIT} characters; the complete run result remains persisted on disk]`;
+  const marker = `\n\n[${content.length - WORKFLOW_BRIDGE_PAYLOAD_LIMIT} workflow-delivery characters omitted; inspect the run details for the complete artifact when available]\n\n`;
+  const available = Math.max(0, WORKFLOW_BRIDGE_PAYLOAD_LIMIT - marker.length);
+  const head = Math.ceil(available * 0.7);
+  return `${content.slice(0, head)}${marker}${content.slice(content.length - (available - head))}`;
 }
 
 function normalizedWorkflowDelivery(delivery: WorkflowBridgeDelivery): WorkflowBridgeDelivery {
@@ -270,40 +293,70 @@ function normalizedWorkflowDelivery(delivery: WorkflowBridgeDelivery): WorkflowB
 }
 
 function queueWorkflowDelivery(bridge: WorkflowBridge, rawDelivery: WorkflowBridgeDelivery): void {
+  if (rawDelivery.customType === "workflow-agent") return;
   const delivery = normalizedWorkflowDelivery(rawDelivery);
-  if (bridge.delivered.has(delivery.id) || bridge.pending.some((item) => item.id === delivery.id)) return;
+  if (
+    bridge.delivered.has(delivery.id) ||
+    bridge.awaitingAck.has(delivery.id) ||
+    bridge.pending.some((item) => item.id === delivery.id)
+  ) return;
   if (bridge.pending.length >= WORKFLOW_BRIDGE_QUEUE_LIMIT) {
-    // Bound both queue cardinality and retained text. A stalled/dying session
-    // must not become an unbounded memory sink when hundreds of agents finish.
-    const retained = bridge.pending.splice(0, bridge.pending.length);
-    const combined = [...retained, delivery]
+    // Terminal results are never folded into an ordinary workflow-deliver item:
+    // preserve their run/status provenance and reserve completion semantics over
+    // bursty explicit messages.
+    if (delivery.customType === "workflow-result") {
+      const replaceable = bridge.pending.findIndex((item) => item.customType !== "workflow-result");
+      if (replaceable >= 0) bridge.pending.splice(replaceable, 1);
+      else bridge.pending.shift();
+      bridge.pending.push(delivery);
+      return;
+    }
+
+    // Bound both queue cardinality and retained text. Coalesce only explicit
+    // messages; existing terminal results remain independent queue entries.
+    const ordinary = bridge.pending.filter((item) => item.customType !== "workflow-result");
+    const terminals = bridge.pending.filter((item) => item.customType === "workflow-result");
+    if (ordinary.length === 0) return;
+    const combined = [...ordinary, delivery]
       .map((item) => `[${item.customType}]\n${item.content}`)
       .join("\n\n");
     const content =
       combined.length <= WORKFLOW_BRIDGE_COALESCED_LIMIT
         ? combined
-        : `${combined.slice(0, WORKFLOW_BRIDGE_COALESCED_LIMIT)}\n\n[additional coalesced workflow output omitted; complete run results remain persisted on disk]`;
+        : boundedWorkflowContent(combined.slice(0, WORKFLOW_BRIDGE_COALESCED_LIMIT));
+    bridge.pending = terminals;
     bridge.pending.push({
       id: hashDeliveryId(`coalesced:${content}`),
       customType: "workflow-deliver",
-      content: `Several workflow messages were coalesced while the session was unavailable.\n\n${content}`,
-      details: { isError: retained.some((item) => item.details?.isError === true) || delivery.details?.isError === true },
-      wake: retained.some((item) => item.wake) || delivery.wake,
+      content: `Several explicit workflow messages were coalesced while the session was unavailable.\n\n${content}`,
+      details: { isError: ordinary.some((item) => item.details?.isError === true) || delivery.details?.isError === true },
+      wake: ordinary.some((item) => item.wake) || delivery.wake,
     });
     return;
   }
   bridge.pending.push(delivery);
 }
 
-function sendWorkflowDelivery(bridge: WorkflowBridge, rawDelivery: WorkflowBridgeDelivery): void {
+function sendWorkflowDeliveryNow(bridge: WorkflowBridge, rawDelivery: WorkflowBridgeDelivery): void {
   const delivery = normalizedWorkflowDelivery(rawDelivery);
   if (bridge.suspended) {
     queueWorkflowDelivery(bridge, delivery);
     return;
   }
-  if (bridge.delivered.has(delivery.id)) return;
-  rememberDelivery(bridge, delivery.id);
+  if (bridge.delivered.has(delivery.id) || bridge.awaitingAck.has(delivery.id)) return;
+  if (bridge.awaitingAck.size >= WORKFLOW_BRIDGE_IN_FLIGHT_LIMIT) {
+    queueWorkflowDelivery(bridge, delivery);
+    return;
+  }
   const startedGeneration = bridge.generation;
+  const submitted = {
+    ...delivery,
+    details: { ...delivery.details, deliveryGeneration: startedGeneration },
+  };
+  // Pi's extension sendMessage facade is fire-and-forget, so successful return
+  // is not an acknowledgement. Keep the payload until the context hook observes
+  // the custom message entering a provider-bound continuation.
+  bridge.awaitingAck.set(delivery.id, submitted);
   try {
     // All final reports and explicit parent deliveries use steer+triggerTurn.
     // Pi batches messages already present in the steering queue before the next
@@ -312,9 +365,9 @@ function sendWorkflowDelivery(bridge: WorkflowBridge, rawDelivery: WorkflowBridg
     const sent = bridge.pi.sendMessage(
       {
         customType: delivery.customType,
-        content: delivery.content,
+        content: submitted.content,
         display: true,
-        details: delivery.details,
+        details: { ...submitted.details, deliveryId: submitted.id },
       },
       // Every provider-bound workflow delivery uses the safe-point steering
       // queue. `wake` controls only whether an idle main session starts a turn.
@@ -324,27 +377,54 @@ function sendWorkflowDelivery(bridge: WorkflowBridge, rawDelivery: WorkflowBridg
     // a rejected generation-bound send cannot become an unhandled rejection or
     // silently lose the delivery.
     void Promise.resolve(sent).catch((err: unknown) => {
-      bridge.delivered.delete(delivery.id);
+      bridge.awaitingAck.delete(delivery.id);
       queueWorkflowDelivery(bridge, delivery);
       console.warn(`[workflow-delivery] async send failed; queued for retry: ${err instanceof Error ? err.message : String(err)}`);
       if (bridge.generation !== startedGeneration && !bridge.suspended) flushWorkflowBridge(bridge);
     });
   } catch (err) {
-    bridge.delivered.delete(delivery.id);
+    bridge.awaitingAck.delete(delivery.id);
     queueWorkflowDelivery(bridge, delivery);
     console.warn(`[workflow-delivery] send failed; queued for retry: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
 
+function sendWorkflowDelivery(bridge: WorkflowBridge, delivery: WorkflowBridgeDelivery): void {
+  // Automatic subagent completions remain available in the run journal, pager,
+  // and persisted JSON. They are intentionally not injected into the parent
+  // conversation: execution order does not identify which agent is the final
+  // product, and forwarding every report creates unbounded context growth and
+  // one-at-a-time turn storms. The workflow's explicit return value is the
+  // semantic final product; explicit deliver() remains the urgent live channel.
+  if (delivery.customType === "workflow-agent") return;
+  sendWorkflowDeliveryNow(bridge, delivery);
+}
+
 function flushWorkflowBridge(bridge: WorkflowBridge): void {
   if (bridge.suspended || bridge.pending.length === 0) return;
   const queued = bridge.pending.splice(0, bridge.pending.length);
-  for (const delivery of queued) sendWorkflowDelivery(bridge, delivery);
+  for (const delivery of queued) {
+    if (delivery.customType !== "workflow-agent") sendWorkflowDeliveryNow(bridge, delivery);
+  }
 }
 
 function suspendWorkflowBridge(manager: WorkflowManager): void {
   const bridge = bridgeFor(manager);
-  if (bridge) bridge.suspended = true;
+  if (!bridge) return;
+  bridge.suspended = true;
+  // Pi aborts the outgoing session before session_shutdown. Any unacknowledged
+  // submission is uncertain and must be retried by the next generation with the
+  // same stable ID but a NEW deliveryGeneration. Clear provider-tracking batches
+  // so late old-session hooks cannot acknowledge the resend.
+  const uncertain = [...bridge.awaitingAck.values()];
+  bridge.awaitingAck.clear();
+  bridge.projectedForNextRequest = [];
+  for (const delivery of uncertain) {
+    queueWorkflowDelivery(bridge, {
+      ...delivery,
+      details: { ...delivery.details, deliveryGeneration: undefined },
+    });
+  }
 }
 
 function resumeWorkflowBridge(manager: WorkflowManager): void {
@@ -352,6 +432,21 @@ function resumeWorkflowBridge(manager: WorkflowManager): void {
   if (!bridge) return;
   bridge.suspended = false;
   flushWorkflowBridge(bridge);
+}
+
+function deliverWorkflowResult(manager: WorkflowManager, payload: WorkflowDeliveryPayload): void {
+  const bridge = bridgeFor(manager);
+  if (!bridge) return;
+  const sequence = payload.details?.sequence ?? bridge.nextEventSeq++;
+  sendWorkflowDelivery(bridge, {
+    id: hashDeliveryId(
+      `result:${payload.details?.runId ?? "unknown"}:${payload.details?.status ?? "completed"}:${payload.content}`,
+    ),
+    customType: "workflow-result",
+    content: payload.content,
+    details: { ...payload.details, notificationKind: "workflow-result", sequence },
+    wake: true,
+  });
 }
 
 function bindDeliverBridge(manager: WorkflowManager, pi: ExtensionAPI): void {
@@ -365,52 +460,53 @@ function bindDeliverBridge(manager: WorkflowManager, pi: ExtensionAPI): void {
     nextEventSeq: 0,
     pending: [],
     delivered: new Set<string>(),
+    awaitingAck: new Map<string, WorkflowBridgeDelivery>(),
+    projectedForNextRequest: [],
   } satisfies WorkflowBridge;
+  // Backfill fields when handing off a manager created by an older extension
+  // generation that predates batching support.
+  bridge.awaitingAck ??= new Map<string, WorkflowBridgeDelivery>();
+  bridge.projectedForNextRequest ??= [];
+  // Handoff from the short-lived batching implementation: cancel and discard
+  // retained automatic reports so no stale timer can bypass the new default.
+  const legacy = bridge as WorkflowBridge & {
+    pendingAgentReports?: Map<string, WorkflowBridgeDelivery[]>;
+    agentReportTimers?: Map<string, ReturnType<typeof setTimeout>>;
+  };
+  if (legacy.agentReportTimers) {
+    for (const timer of legacy.agentReportTimers.values()) clearTimeout(timer);
+    legacy.agentReportTimers.clear();
+  }
+  legacy.pendingAgentReports?.clear();
+  bridge.pending = bridge.pending.filter((delivery) => delivery.customType !== "workflow-agent");
+  for (const [id, delivery] of bridge.awaitingAck) {
+    if (delivery.customType === "workflow-agent") bridge.awaitingAck.delete(id);
+  }
+  bridge.projectedForNextRequest = bridge.projectedForNextRequest.filter(({ id }) => bridge.awaitingAck.has(id));
   bridge.pi = pi;
   bridge.generation += 1;
   bridge.suspended = true;
   target.__workflowBridge = bridge;
 
-  manager.onDeliver = (message) => {
+  manager.onDeliver = (message, source) => {
     const content = typeof message === "string" ? message : String(message ?? "");
     const sequence = bridge.nextEventSeq++;
     sendWorkflowDelivery(bridge, {
-      id: hashDeliveryId(`deliver:${bridge.generation}:${sequence}:${content}`),
+      id: hashDeliveryId(`deliver:${source?.runId ?? "unknown"}:${sequence}:${content}`),
       customType: "workflow-deliver",
       content,
-      details: { notificationKind: "workflow-message", sequence },
+      details: { notificationKind: "workflow-message", runId: source?.runId, sequence },
       // Explicit child→parent deliveries are important and wake the parent.
       wake: true,
     });
   };
-  manager.onAgentMessage = ({ runId, id, label, result, error }) => {
-    let text: string;
-    try {
-      text = error ?? (typeof result === "string" ? result : JSON.stringify(result) ?? "");
-    } catch {
-      text = String(result);
-    }
-    // Claude Code models this as a task_notification synthetic turn tied to a
-    // stable task/tool identity. Pi has no native task-notification origin, so
-    // preserve the same semantics with a dedicated tool-result notification:
-    // it is real steer delivery, not a user message or a display-only entry.
-    const sequence = bridge.nextEventSeq++;
-    sendWorkflowDelivery(bridge, {
-      id: hashDeliveryId(`agent:${runId}:${id}:${error ? "failed" : "completed"}:${text}`),
-      customType: "workflow-agent",
-      content: text,
-      details: {
-        notificationKind: "agent-completed",
-        runId,
-        agentId: id,
-        label,
-        sequence,
-        isError: Boolean(error),
-        status: error ? "failed" : "completed",
-      },
-      wake: true,
-    });
-  };
+  // Automatic subagent finals are intentionally persistence/UI-only. A workflow
+  // author who needs the parent to react before terminal completion uses the
+  // explicit deliver()/workflow_send_to_parent channel. This avoids assuming
+  // the last completed agent is a summary and prevents N automatic reports from
+  // consuming N provider continuations. Keep the callback assigned (rather than
+  // leaving an older generation's function installed) but make it side-effect free.
+  manager.onAgentMessage = () => {};
 }
 
 /**
@@ -439,7 +535,7 @@ function cloneContextMessage(message: any): any {
 function workflowSummaryAssistantMessage(message: any): any | undefined {
   if (!message || typeof message !== "object") return undefined;
   const customType = message.customType;
-  if (typeof customType !== "string" || !WORKFLOW_CUSTOM_TYPES.has(customType)) return undefined;
+  if (typeof customType !== "string" || !PROVIDER_WORKFLOW_CUSTOM_TYPES.has(customType)) return undefined;
   const text = customMessageText(message.content) || "(empty workflow delivery)";
   const details = message.details as { isError?: unknown; status?: unknown } | undefined;
   const suffix = details?.isError === true ? " [error]" : "";
@@ -555,7 +651,7 @@ function workflowNotificationToolName(customType: string): string {
   return "workflow_message_notification";
 }
 
-function installWorkflowToolResultContextBridge(pi: ExtensionAPI): void {
+function installWorkflowToolResultContextBridge(pi: ExtensionAPI, getManager: () => WorkflowManager): void {
   pi.on("context", (event) => {
     const output: any[] = [];
     const sourceMessages = event.messages as any[];
@@ -569,14 +665,39 @@ function installWorkflowToolResultContextBridge(pi: ExtensionAPI): void {
         continue;
       }
 
+      // Legacy automatic-agent custom messages are display/persistence metadata,
+      // not a reason to spend provider context. Drop them from the projection.
+      if (message.customType === "workflow-agent") continue;
+
       const rawText = customMessageText(message.content) || "(empty workflow delivery)";
       const text = providerWorkflowDeliveryText(message.customType, rawText);
-      const toolCallId = hashDeliveryId(
-        `${message.customType}:${typeof message.timestamp === "number" ? message.timestamp : ""}:${messageIndex}:${rawText}`,
-      );
       const details = (message.details && typeof message.details === "object"
         ? message.details
         : {}) as WorkflowDeliveryDetails;
+      // Bridge-originated notifications carry a stable delivery ID across
+      // generation retries. Legacy persisted messages fall back to a stable
+      // content/timestamp/index digest.
+      const toolCallId = details.deliveryId ?? hashDeliveryId(
+        `${message.customType}:${typeof message.timestamp === "number" ? message.timestamp : ""}:${messageIndex}:${rawText}`,
+      );
+      // Context projection is not yet provider acceptance. Record the stable ID
+      // and submission generation; before_provider_request promotes this exact
+      // batch, and after_provider_response acknowledges only a successful HTTP
+      // response for that request. This fences late old-session context events
+      // from acknowledging a newer generation's resend.
+      if (details.deliveryId && typeof details.deliveryGeneration === "number") {
+        const bridge = bridgeFor(getManager());
+        const awaiting = bridge?.awaitingAck.get(details.deliveryId);
+        if (
+          bridge &&
+          awaiting?.details?.deliveryGeneration === details.deliveryGeneration &&
+          !bridge.projectedForNextRequest.some(
+            (item) => item.id === details.deliveryId && item.generation === details.deliveryGeneration,
+          )
+        ) {
+          bridge.projectedForNextRequest.push({ id: details.deliveryId, generation: details.deliveryGeneration });
+        }
+      }
       const toolName = workflowNotificationToolName(message.customType);
       const toolCall = {
         type: "toolCall",
@@ -635,6 +756,25 @@ function installWorkflowToolResultContextBridge(pi: ExtensionAPI): void {
     }
     return { messages: output };
   });
+
+  pi.on("before_provider_request", () => {
+    const bridge = bridgeFor(getManager());
+    if (!bridge || bridge.projectedForNextRequest.length === 0) return;
+    const batch = bridge.projectedForNextRequest.splice(0, bridge.projectedForNextRequest.length);
+    // This is the strongest acknowledgement Pi exposes: the generation-matching
+    // custom entry survived queueing, was projected as a tool result, and is in
+    // the payload about to be submitted. If transport later fails, Pi's retained
+    // session entry remains in subsequent context; independently resending the
+    // custom notification would create a duplicate logical continuation.
+    for (const item of batch) {
+      const awaiting = bridge.awaitingAck.get(item.id);
+      if (awaiting?.details?.deliveryGeneration !== item.generation) continue;
+      bridge.awaitingAck.delete(item.id);
+      bridge.pending = bridge.pending.filter((delivery) => delivery.id !== item.id);
+      rememberDelivery(bridge, item.id);
+    }
+    flushWorkflowBridge(bridge);
+  });
 }
 
 export default function extension(pi: ExtensionAPI) {
@@ -692,6 +832,7 @@ export default function extension(pi: ExtensionAPI) {
   installResultDelivery(pi, manager, {
     loadSettings: () => loadWorkflowSettings({ cwd: getCwd() }),
     installContextBridge: false,
+    sendResult: (payload) => deliverWorkflowResult(manager, payload),
   });
   suspendResultDelivery(manager);
   bindDeliverBridge(manager, pi);
@@ -716,7 +857,7 @@ export default function extension(pi: ExtensionAPI) {
   registerWorkflowMessageRenderers(pi);
   // Keep workflow history as custom entries for the UI, but expose it to the
   // provider as tool_result semantics through the context transform.
-  installWorkflowToolResultContextBridge(pi);
+  installWorkflowToolResultContextBridge(pi, getManager);
   // Pi's compaction/tree summarizers call raw convertToLlm() and do not emit
   // the normal context hook. Sanitize workflow custom messages in their mutable
   // preparation arrays so they cannot become ordinary role=user content.
@@ -727,16 +868,23 @@ export default function extension(pi: ExtensionAPI) {
       name: "workflow_send",
       label: "Workflow Send",
       description:
-        "Send a follow-up from the main session to a running workflow. With agentId, deliver immediately to that live subagent; without it, queue for the next subagent call.",
-      promptSnippet: "Send a main-session follow-up to a running workflow or a specific live subagent.",
+        "Send a narrowly scoped correction or current-state fact to a running workflow without replacing its assigned task. With agentId, deliver immediately to that live subagent; without it, queue for the next subagent call. The message must preserve the original objective and completion criteria, tell the recipient to continue the existing task, and must not ask for a mere acknowledgement, redirect it to a different task, or treat its reply as proof of completion.",
+      promptSnippet:
+        "Send a non-directive correction or current-state update that preserves a running workflow subagent's original task.",
       promptGuidelines: [
-        "Use after the user gives new direction; use the agentId shown in subagent messages for an immediate targeted reply.",
-        "Without agentId, the message is queued for the newest running workflow's next subagent call.",
+        "Use only to supply a relevant correction, changed repository fact, conflict warning, or constraint needed to finish the already-assigned task.",
+        "Do not use this tool to replace, broaden, reprioritize, or prematurely terminate the subagent's task; start another workflow or let the orchestrator assign new work instead.",
+        "Phrase the message so the subagent continues its original task and validates its original completion criteria. Never send a bare notification or request an acknowledgement, because a reply can end the current agent() call.",
+        "Use agentId only for an immediate targeted correction to a live subagent. Without agentId, the message is queued for the running workflow's next subagent call.",
       ],
       parameters: Type.Object({
-        message: Type.String({ minLength: 1, description: "Follow-up instruction for a subagent." }),
+        message: Type.String({
+          minLength: 1,
+          description:
+            "Correction or current-state fact relevant to the existing assignment. Preserve its original objective; explicitly tell the recipient to continue and complete that assignment rather than merely acknowledge this message. Do not introduce a different task.",
+        }),
         runId: Type.Optional(Type.String({ minLength: 1, description: "Specific workflow run ID; omit when agentId identifies the target." })),
-        agentId: Type.Optional(Type.String({ minLength: 1, description: "Exact live subagent ID from a workflow-agent message for immediate delivery." })),
+        agentId: Type.Optional(Type.String({ minLength: 1, description: "Exact live subagent ID for an immediate in-scope correction; omit to queue for the next subagent call." })),
       }),
       async execute(_toolCallId, params) {
         if (params.agentId) {
@@ -860,6 +1008,7 @@ export default function extension(pi: ExtensionAPI) {
       installResultDelivery(pi, manager, {
         loadSettings: () => loadWorkflowSettings({ cwd: getCwd() }),
         installContextBridge: false,
+        sendResult: (payload) => deliverWorkflowResult(manager, payload),
       });
       bindDeliverBridge(manager, pi);
       usageLimitScheduler.dispose();

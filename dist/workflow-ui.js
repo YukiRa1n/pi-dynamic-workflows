@@ -1013,17 +1013,30 @@ function renderNavigatorFrame(state, model, width, theme, viewportRows, markdown
                     body.push(dim("  … prompt continues in pager"));
                 body.push("", theme.fg("accent", theme.bold("Recent activity:")));
                 if (a.history?.length) {
-                    // Count visible summaries rather than raw history entries. A normal
-                    // tool operation is stored as toolCall + toolResult; counting the
-                    // hidden result used to leave room for only one actual command.
+                    // Keep the latest two entries that can actually produce a useful
+                    // summary. Tool results are meaningful activity too (especially for
+                    // failed/empty-output agents), so do not discard them merely because
+                    // they follow a tool call.
                     const recent = [];
                     for (let i = a.history.length - 1; i >= 0 && recent.length < 2; i--) {
-                        if (a.history[i]?.kind !== "toolResult")
-                            recent.unshift(i);
+                        const entry = a.history[i];
+                        if (!entry || typeof entry !== "object" || typeof entry.kind !== "string")
+                            continue;
+                        const text = asText(entry.text).trim();
+                        // A tool call can still be useful when its payload is carried by
+                        // the structured path/tool fields, but a completely empty corrupt
+                        // entry should not displace a meaningful activity item.
+                        if (!text && entry.kind !== "toolCall")
+                            continue;
+                        if (!text && entry.kind === "toolCall" && !entry.toolName && !entry.path)
+                            continue;
+                        recent.unshift(i);
                     }
                     for (const i of recent) {
                         body.push(...renderHistoryEntryLines(a.history, i, width, markdownTheme, dim, renderCache, true));
                     }
+                    if (recent.length === 0)
+                        body.push(dim("  Waiting for the first agent event…"));
                 }
                 else {
                     body.push(dim("  Waiting for the first agent event…"));
@@ -1165,6 +1178,23 @@ function compactHistoryLine(entry, width) {
             detail = value("path") ?? value("runId") ?? value("name") ?? value("query");
             break;
     }
+    // Preserve non-standard argument shapes as JSON instead of rendering a
+    // blank tool line (for example, a read call using `file` rather than `path`).
+    // This keeps the compact view useful while the full payload remains in the
+    // pager. Fall back to the raw payload as well for legacy/invalid JSON and
+    // array-shaped arguments.
+    if (!detail) {
+        const raw = asText(entry.text).trim();
+        if (raw) {
+            try {
+                const parsed = JSON.parse(raw);
+                detail = JSON.stringify(parsed);
+            }
+            catch {
+                detail = raw;
+            }
+        }
+    }
     return truncateToWidth(`${label}:${detail ? ` ${detail}` : ""}`, width, ELLIPSIS, false);
 }
 function editCallPath(entry) {
@@ -1235,11 +1265,11 @@ function renderHistoryEntryLines(history, index, width, markdownTheme, dim, rend
     const editPath = editCallPath(entry);
     const path = write?.path ?? editPath;
     const header = dim(`${historyLabel(entry)}:${path ? ` ${path}` : ""}`);
-    // Compact recent activity is intentionally one useful summary line per call;
+    // Compact recent activity is intentionally one useful summary line per entry;
     // payload bodies stay behind the detail pager. Include the command/target so
     // entries such as "assistant tool bash:" are no longer blank.
     if (summaryOnly) {
-        return entry.kind === "toolResult" ? [] : [dim(compactHistoryLine(entry, width))];
+        return [dim(compactHistoryLine(entry, width))];
     }
     // The edit result carries the same display-oriented diff used by Pi's built-in
     // edit renderer. Render it with Pi's native colors, line numbers, and

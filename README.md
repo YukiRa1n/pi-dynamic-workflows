@@ -15,7 +15,7 @@ After installation, Pi gains:
 - `/workflows-models` — configure `small`, `medium`, and `big` model tiers.
 - `/deep-research`, `/code-review`, `/codebase-audit`, `/adversarial-review`, and `/multi-perspective`.
 - Workflow-scoped Agent Teams with peer messages, inboxes, and a shared task board.
-- Background final reports delivered to the main session using Pi's safe-point steering queue; an active provider request is not cancelled.
+- One bounded background workflow result is delivered to the main session using Pi's safe-point steering queue; an active provider request is not cancelled. Routine per-subagent finals stay in the run journal/pager instead of consuming parent context.
 
 ## Requirements
 
@@ -120,7 +120,7 @@ Or use the explicit command path:
 /workflows run Review the current project from three independent perspectives and synthesize the findings.
 ```
 
-Workflow runs are backgrounded by default, so Pi remains usable while subagents run. Use `/workflows` or `workflow_control` to inspect them.
+Workflow tool runs are always backgrounded, so Pi remains usable while subagents run. Use `/workflows` or `workflow_control` to inspect them.
 
 ## Built-in workflow patterns
 
@@ -161,21 +161,40 @@ return await agent(
 
 Important globals include:
 
-| Global | Purpose |
-| --- | --- |
-| `agent(prompt, options?)` | Run one isolated subagent session. |
-| `parallel(thunks)` | Run independent async functions concurrently while preserving order. |
-| `pipeline(items, ...stages)` | Run stages sequentially per item while items proceed concurrently. |
-| `createTeam(name)` | Create a workflow-scoped team with peer messaging and a task board. |
-| `phase(title, { budget? })` | Mark a named phase and optionally assign a soft token sub-budget. |
-| `workflow(savedName, args?)` | Invoke a saved workflow inline. |
-| `verify`, `judgePanel` | Cross-check findings or select a best candidate. |
-| `loopUntilDry`, `completenessCheck` | Run bounded iterative discovery and completeness checks. |
-| `retry`, `gate` | Run bounded semantic retries or feedback-driven validation. |
-| `deliver(message)` | Send an important message to the parent Pi conversation. |
-| `args`, `cwd`, `budget` | Read workflow arguments, working directory, and token counters. |
+<!-- BEGIN GENERATED SUPPORTED WORKFLOW CAPABILITIES -->
+| Name | Classification | Signature | Options and defaults |
+| --- | --- | --- | --- |
+| agent | runtime-global | `agent(prompt, options?) => Promise<string \| structured value \| null>` | `label`: string (optional; default: derived from phase and call count)<br>`phase`: string (optional; default: current phase)<br>`schema`: plain JSON Schema (optional)<br>`model`: string (optional)<br>`tier`: string (optional)<br>`isolation`: "worktree" (optional)<br>`agentType`: string (optional)<br>`timeoutMs`: number \| null (optional; default: run timeout; null disables)<br>`retries`: number (optional; default: run retry count) |
+| parallel | runtime-global | `parallel(thunks) => Promise<Array<unknown \| null>>` | — |
+| pipeline | runtime-global | `pipeline(items, ...stages) => Promise<Array<unknown \| null>>` | — |
+| createTeam | runtime-global | `createTeam(name, options?) => AgentTeam` | — |
+| workflow | runtime-global | `workflow(savedName, childArgs?) => Promise<unknown>` | — |
+| verify | runtime-global | `verify(item: unknown, options?: { reviewers?: number; threshold?: number; lens?: string \| string[] }) => Promise<{ real: boolean; realCount: number; total: number; votes: Array<{ real: boolean; reason?: string }> }>` | `reviewers`: number (optional; default: 2)<br>`threshold`: number (optional; default: 0.5)<br>`lens`: string \| string[] (optional) |
+| judgePanel | runtime-global | `judgePanel(attempts: unknown[], options?: { judges?: number; rubric?: string }) => Promise<{ index: number; attempt: unknown; score: number; judgments: Array<{ score: number; reason?: string }> } \| undefined>` | `judges`: number (optional; default: 3)<br>`rubric`: string (optional; default: "overall quality and correctness") |
+| loopUntilDry | runtime-global | `loopUntilDry(options: { round: (roundIndex: number) => unknown[] \| Promise<unknown[]>; key?: (item: unknown) => string; consecutiveEmpty?: number; maxRounds?: number }) => Promise<unknown[]>` | `round`: (roundIndex: number) => unknown[] \| Promise<unknown[]> (required)<br>`key`: (item: unknown) => string (optional; default: JSON.stringify)<br>`consecutiveEmpty`: number (optional; default: 2)<br>`maxRounds`: number (optional; default: 50) |
+| completenessCheck | runtime-global | `completenessCheck(taskArgs: unknown, results: unknown) => Promise<{ complete: boolean; missing?: string[] } \| null>` | — |
+| retry | runtime-global | `retry(thunk: (attempt: number) => unknown \| Promise<unknown>, options?: { attempts?: number; until?: (result: unknown) => boolean }) => Promise<unknown>` | `attempts`: number (optional; default: 3)<br>`until`: (result: unknown) => boolean (optional; default: accept first result when omitted) |
+| gate | runtime-global | `gate(thunk: (feedback: string \| undefined, attempt: number) => unknown \| Promise<unknown>, validator: (value: unknown) => { ok: boolean; feedback?: string } \| Promise<{ ok: boolean; feedback?: string }>, options?: { attempts?: number }) => Promise<{ ok: boolean; value: unknown; attempts: number }>` | `attempts`: number (optional; default: 3) |
+| checkpoint | runtime-global | `checkpoint(prompt, options?) => Promise<unknown>` | `default`: unknown (optional; default: true when no UI and omitted)<br>`headless`: "default" \| "abort" (optional; default: "default")<br>`kind`: "confirm" \| "input" \| "select" (optional; default: "confirm")<br>`choices`: string[] (optional)<br>`timeoutMs`: number (optional) |
+| log | runtime-global | `log(message) => void` | — |
+| deliver | runtime-global | `deliver(message) => Promise<void>` | — |
+| phase | runtime-global | `phase(title, options?) => void` | `budget`: number (optional) |
+| args | runtime-global | `args: unknown` | — |
+| cwd | runtime-global | `cwd: string` | — |
+| process | runtime-global | `process: { cwd(): string }` | — |
+| budget | runtime-global | `budget: { total, spent(), remaining() }` | — |
+| script | workflow-tool-input | `script?: string` | — |
+| name | workflow-tool-input | `name?: string` | — |
+| args | workflow-tool-input | `args?: Record<string, unknown>` | — |
+| maxAgents | workflow-tool-input | `maxAgents?: number = 1000` | — |
+| concurrency | workflow-tool-input | `concurrency?: number` | — |
+| agentRetries | workflow-tool-input | `agentRetries?: number = configured value or 0` | — |
+| agentTimeoutMs | workflow-tool-input | `agentTimeoutMs?: number = configured default or unbounded` | — |
+| tokenBudget | workflow-tool-input | `tokenBudget?: number = configured default or unlimited` | — |
+| resumeFromRunId | workflow-tool-input | `resumeFromRunId?: string` | — |
+<!-- END GENERATED SUPPORTED WORKFLOW CAPABILITIES -->
 
-Detailed authoring instructions and examples ship with the package under:
+See the [workflow authoring guide](docs/workflow-authoring.md) for the generated capability contract and the packaged skill for detailed authoring instructions and examples:
 
 ```text
 skills/workflow-authoring/
@@ -184,12 +203,14 @@ skills/workflow-patterns/
 
 ## Runtime behavior
 
-- `background` defaults to `true`; pass `background: false` only when the caller must wait inline.
+- Workflow tool invocations always start in the background; use the returned run ID with `/workflows` or `workflow_control` to inspect, pause, resume, or stop them.
 - `concurrency` is bounded by the runtime maximum.
 - `maxAgents`, retry counts, timeouts, and optional token budgets can be set per run.
 - Completed calls are journaled. A resumed workflow replays the unchanged completed prefix and runs changed/new calls live.
 - `isolation: "worktree"` is fail-closed: if a Git worktree cannot be created, that agent does not silently edit the shared checkout.
-- Final subagent reports and explicit child-to-parent messages use `deliverAs: "steer"`. They are queued for the next safe point and do not abort an already-running provider request.
+- Explicit child-to-parent `deliver()` messages and the single terminal workflow result use `deliverAs: "steer"`. They are queued for the next safe point and do not abort an already-running provider request.
+- Automatic per-subagent final reports are retained in `/workflows` details and persisted run JSON, but are not injected into the parent model context by default. Execution order is not used to guess that the last agent is the final product.
+- The workflow's explicit return value is the semantic terminal product. Its provider projection prioritizes conventional `report`, `synthesis`, `summary`, or `answer` fields and is bounded to 12,000 characters; omitted content remains in the persisted run.
 - Workflow custom messages are converted to synthetic tool-call/tool-result semantics for normal provider context. Compaction and branch-summary preparation sanitizes workflow custom entries so they do not become user-authored text.
 
 ## Persistence and privacy

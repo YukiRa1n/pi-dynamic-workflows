@@ -10,8 +10,8 @@ import type { WorkflowManager } from "./workflow-manager.js";
 // reject with "schema must be type object, got type: null". So the schema is a
 // single object: `action` is the full set of verbs and `runId` is optional at
 // the schema level. The per-action requirement (runId is mandatory for every
-// action except `list`, and `list` ignores any compatibility runId) is
-// enforced at runtime in normalizeInput() and guarded again in execute().
+// action except `list`) is enforced at runtime in normalizeInput() and guarded
+// again in execute().
 const workflowControlSchema = Type.Object(
   {
     action: Type.Union(
@@ -22,11 +22,11 @@ const workflowControlSchema = Type.Object(
         Type.Literal("resume"),
         Type.Literal("stop"),
       ],
-      { description: "list = all runs (runId is ignored for wrapper compatibility); status/pause/resume/stop act on one run and require runId." },
+      { description: "list = all runs; status/pause/resume/stop act on one run and require runId." },
     ),
     runId: Type.Optional(
       Type.String({
-        description: "Canonical workflow run ID. Required for status, pause, resume, and stop; omit (or use empty) for list.",
+        description: "Canonical workflow run ID. Required for status, pause, resume, and stop; omit for list.",
       }),
     ),
   },
@@ -153,16 +153,13 @@ function normalizeInput(value: unknown): WorkflowControlInput {
     throw new Error("workflow_control requires action: list|status|pause|resume|stop");
   }
 
-  // Some generic tool dispatchers emit a uniform runId field even for list.
-  // Listing is independent of a run, so accept and ignore that compatibility
-  // field instead of failing before the useful operation can execute.
   const allowedKeys = new Set(["action", "runId"]);
   const extraKey = Object.keys(input).find((key) => !allowedKeys.has(key));
   if (extraKey) throw new Error(`workflow_control action "${input.action}" does not accept ${extraKey}`);
 
   if (input.action === "list") {
-    if (input.runId !== undefined && typeof input.runId !== "string") {
-      throw new Error('workflow_control action "list" accepts only a string runId compatibility field');
+    if (input.runId !== undefined) {
+      throw new Error('workflow_control action "list" does not accept runId');
     }
     return input as WorkflowControlInput;
   }

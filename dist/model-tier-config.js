@@ -12,7 +12,7 @@
  * coarse, user-configurable small/medium/big knob that is independent of any
  * concrete provider/model id.
  */
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { listAvailableModels } from "./agent.js";
@@ -227,9 +227,25 @@ export function saveModelTierConfig(config, configPath) {
     const path = configPath ?? getModelTierConfigPath();
     const dir = dirname(path);
     if (!existsSync(dir)) {
-        mkdirSync(dir, { recursive: true });
+        mkdirSync(dir, { recursive: true, mode: 0o700 });
     }
-    writeFileSync(path, JSON.stringify(config, null, 2), "utf-8");
+    // Publish atomically so a crash or concurrent reader never observes a
+    // half-written routing table. The file can contain private provider/model
+    // choices, so use owner-only permissions on platforms that honor mode.
+    const tmp = `${path}.${process.pid}-${Date.now().toString(36)}.tmp`;
+    try {
+        writeFileSync(tmp, JSON.stringify(config, null, 2), { encoding: "utf-8", mode: 0o600 });
+        renameSync(tmp, path);
+    }
+    finally {
+        try {
+            if (existsSync(tmp))
+                unlinkSync(tmp);
+        }
+        catch {
+            // best-effort cleanup after a failed publication
+        }
+    }
 }
 // ---------------------------------------------------------------------------
 // Resolve / helpers

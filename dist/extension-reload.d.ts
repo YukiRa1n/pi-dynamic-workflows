@@ -15,7 +15,7 @@ import type { WorkflowManager } from "./workflow-manager.js";
  * session project cwd (ctx.cwd). A cwd-keyed map made those two paths miss
  * each other. One slot + post-claim project checks is the correct model.
  */
-export declare const WORKFLOW_EXTENSION_VERSION: any;
+export declare const WORKFLOW_EXTENSION_VERSION: string;
 export interface WorkflowReloadRuntime {
     cwd: string;
     /** Package version that created this manager. Only an exact match is retained. */
@@ -81,7 +81,7 @@ export declare function pauseStrandedWorkflowRuntime(runtime: WorkflowReloadRunt
  * immediately load a fresh generation which can claim the staged runtime.
  * `quit` is intentionally absent: nothing will claim after process teardown.
  */
-export declare const SESSION_REPLACEMENT_REASONS: any;
+export declare const SESSION_REPLACEMENT_REASONS: Set<string>;
 /**
  * Test/cleanup helper. When `runtime` is provided, only clears if it is the
  * currently staged runtime (identity guard). When omitted, clears whatever is

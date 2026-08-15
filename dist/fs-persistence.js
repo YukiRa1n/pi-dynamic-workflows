@@ -18,7 +18,6 @@
  * and workflow-saved.ts both call into it rather than maintaining parallel
  * copies.
  */
-import { safeStringify } from "./safe-serialize.js";
 import { existsSync, linkSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync, } from "node:fs";
 /** The real node:fs implementations. */
 export function defaultPersistenceFs() {
@@ -32,7 +31,7 @@ export function resolvePersistenceFs(overrides) {
 /** Ensure `dir` exists (recursive mkdir), idempotent. */
 export function ensureDir(fs, dir) {
     if (!fs.existsSync(dir))
-        fs.mkdirSync(dir, { recursive: true });
+        fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
 }
 /**
  * Atomically write JSON to `path`: tmp-write + rename (atomic on the same
@@ -48,11 +47,26 @@ function writeTextAtomic(fs, path, text) {
     // only publication point and is atomic on the target filesystem.
     const unique = `${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
     const tmpPath = `${path}.${unique}.tmp`;
-    fs.writeFileSync(tmpPath, text);
-    fs.renameSync(tmpPath, path);
+    try {
+        fs.writeFileSync(tmpPath, text, { encoding: "utf-8", mode: 0o600, flag: "wx" });
+        fs.renameSync(tmpPath, path);
+    }
+    finally {
+        // A failed write/rename must not leave attacker-confusable or unbounded tmp
+        // files behind. Ignore cleanup failure; the original error still wins.
+        unlinkIfExistsSafe(fs, tmpPath);
+    }
 }
 export function writeJsonAtomicWithBackup(fs, path, data) {
-    const json = safeStringify(data);
+    // Persistence must retain native JSON semantics. The display-oriented
+    // safeStringify() replaces undefined/functions/symbols with marker strings;
+    // using it here turns optional fields into invalid durable values and makes a
+    // freshly-written record fail its own schema/CAS readback. Let JSON.stringify
+    // omit object-valued undefined (and map array holes to null), and fail loudly
+    // for cycles/BigInt rather than publishing a non-replayable approximation.
+    const json = JSON.stringify(data, null, 2);
+    if (json === undefined)
+        throw new TypeError("Persistence value is not JSON-serializable");
     writeTextAtomic(fs, path, json);
     try {
         // The backup is also published atomically.  A direct write here could make

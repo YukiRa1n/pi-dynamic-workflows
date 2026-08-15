@@ -81,6 +81,8 @@ export interface SharedRuntime {
      * when the second child starts and mints the very same id.
      */
     nestedCallSeq: number;
+    /** Stable derived child ids keyed by the parent's lexical workflow() call. */
+    nestedRunIds: Map<string, string>;
     /**
      * Fires exactly once a run-fatal error is determined: an error that escaped
      * the TOP-level script's own execution completely uncaught (see runWorkflow's

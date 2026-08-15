@@ -11,7 +11,7 @@
  * this one registry, so the two paths can never drift apart and the
  * per-pattern generator scripts are written exactly once.
  */
-import { type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { WorkflowStorage } from "./workflow-saved.js";
 /** Default perspective set used when a caller gives fewer than two. */
 export declare const DEFAULT_MULTI_PERSPECTIVES: readonly string[];

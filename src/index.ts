@@ -92,6 +92,7 @@ export {
   resumeResultDelivery,
   suspendResultDelivery,
   type TaskPanelOptions,
+  type WorkflowDeliveryPayload,
 } from "./task-panel.js";
 export type {
   AutoResumeDelayParams,

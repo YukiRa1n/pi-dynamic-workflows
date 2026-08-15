@@ -24,13 +24,6 @@ export const WORKFLOW_DELIVERY_CHOICE_SCENARIOS: readonly WorkflowDeliveryChoice
     expectedTokenBudget: null,
   },
   {
-    id: "inline-result",
-    prompt:
-      "Run a workflow to compare the two proposed designs, then use its result in your answer in this same turn. I am waiting for the result before you respond.",
-    expectedBackground: false,
-    expectedTokenBudget: null,
-  },
-  {
     id: "explicit-token-budget",
     prompt:
       "Run a workflow to audit the repository from several independent angles. Cap the run at exactly 200,000 tokens and let the result be delivered back later.",
@@ -48,8 +41,10 @@ export function evaluateWorkflowDeliveryChoice(
   const hasScript = typeof input?.script === "string" && input.script.trim().length > 0;
   const hasName = typeof input?.name === "string" && input.name.trim().length > 0;
   const hasWorkflow = hasScript || hasName;
-  const validBackground = input !== null && (input.background === undefined || typeof input.background === "boolean");
-  const resolvedBackground = validBackground ? (typeof input.background === "boolean" ? input.background : true) : null;
+  // The public tool is background-only. Any legacy foreground/background toggle
+  // is rejected so evaluations track the actual provider-visible schema.
+  const validBackground = input !== null && input.background === undefined;
+  const resolvedBackground = validBackground ? true : null;
   const validTokenBudget =
     input !== null &&
     (input.tokenBudget === undefined ||
@@ -66,14 +61,12 @@ export function evaluateWorkflowDeliveryChoice(
     {
       name: "background:valid-type",
       passed: validBackground,
-      details: "background must be omitted for its true default or supplied as a boolean",
+      details: "background is fixed true by the tool and must not be supplied",
     },
     {
       name: "background:matches-user-timing",
       passed: timingMatches,
-      details: scenario.expectedBackground
-        ? "later delivery should use the default background run"
-        : "same-turn use should pass background: false",
+      details: "workflow invocations always detach and deliver their result later",
     },
     {
       name: "tokenBudget:valid-positive-number",
