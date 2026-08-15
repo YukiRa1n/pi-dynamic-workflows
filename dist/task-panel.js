@@ -218,7 +218,11 @@ function installResultContextBridge(pi) {
     });
 }
 export function installResultDelivery(pi, manager, opts = {}) {
-    installResultContextBridge(pi);
+    // Standalone package-root consumers need this minimal bridge. The full Pi
+    // extension installs a richer task-notification bridge for all workflow
+    // message types and disables this one to avoid double transformation.
+    if (opts.installContextBridge !== false)
+        installResultContextBridge(pi);
     const m = deliveryManager(manager);
     if (m.__deliveryInstalled) {
         // The manager and listeners survive session replacement. Refresh every

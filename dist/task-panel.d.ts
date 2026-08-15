@@ -41,6 +41,7 @@ export declare function suspendResultDelivery(manager: WorkflowManager): void;
 export declare function resumeResultDelivery(manager: WorkflowManager): void;
 export declare function installResultDelivery(pi: ExtensionAPI, manager: WorkflowManager, opts?: {
     loadSettings?: () => WorkflowSettings;
+    installContextBridge?: boolean;
 }): void;
 export declare function renderPanel(manager: WorkflowManager, theme: Theme, width?: number): string[];
 /** Record a token-total sample for `runId` at time `now` (ms). */

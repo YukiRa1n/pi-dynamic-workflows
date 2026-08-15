@@ -173,15 +173,14 @@ function registerWorkflowMessageRenderers(pi: ExtensionAPI): void {
     });
   }
 
-  // Routine completions use appendEntry() deliberately so they never enter the
-  // provider context. Custom entries have a separate renderer registry from
-  // custom messages; without this renderer they are persisted but invisible in
-  // the interactive transcript.
+  // Compatibility renderer for durable/display-only workflow-agent entries.
+  // Live final reports use custom messages so they can join the provider-bound
+  // workflow batch; appendEntry callers remain visible without entering context.
   pi.registerEntryRenderer("workflow-agent", (entry, { expanded }, theme) => {
     const data = entry.data && typeof entry.data === "object" ? (entry.data as Record<string, unknown>) : {};
     const label = typeof data.label === "string" && data.label ? ` ${data.label}` : "";
     const text = typeof data.text === "string" ? data.text : customMessageText(data.text);
-    const full = `${label ? `[${label.trim()}]\\n` : ""}${text}`;
+    const full = `${label ? `[${label.trim()}]\n` : ""}${text}`;
     const preview = expanded ? { text: full, omitted: false } : collapsedMessageText(full);
     const box = new Box(0, 1, (value) => theme.bg("customMessageBg", value));
     box.addChild(new Text(theme.fg("customMessageLabel", theme.bold("[workflow-agent]")), 0, 0));
@@ -203,11 +202,21 @@ const WORKFLOW_BRIDGE_DEDUP_LIMIT = 256;
 const WORKFLOW_BRIDGE_PAYLOAD_LIMIT = 256_000;
 const WORKFLOW_BRIDGE_COALESCED_LIMIT = 512_000;
 
+type WorkflowDeliveryDetails = {
+  isError?: boolean;
+  status?: "completed" | "failed" | "paused";
+  notificationKind?: "agent-completed" | "workflow-message" | "workflow-result";
+  runId?: string;
+  agentId?: string;
+  label?: string;
+  sequence?: number;
+};
+
 type WorkflowBridgeDelivery = {
   id: string;
   customType: "workflow-agent" | "workflow-deliver" | "workflow-result";
   content: string;
-  details?: { isError?: boolean; status?: "completed" | "failed" | "paused" };
+  details?: WorkflowDeliveryDetails;
   wake: boolean;
 };
 
@@ -307,7 +316,9 @@ function sendWorkflowDelivery(bridge: WorkflowBridge, rawDelivery: WorkflowBridg
         display: true,
         details: delivery.details,
       },
-      delivery.wake ? { triggerTurn: true, deliverAs: "steer" } : { triggerTurn: false },
+      // Every provider-bound workflow delivery uses the safe-point steering
+      // queue. `wake` controls only whether an idle main session starts a turn.
+      { triggerTurn: delivery.wake, deliverAs: "steer" },
     );
     // Current Pi types this as void, but tolerate hosts returning a Promise so
     // a rejected generation-bound send cannot become an unhandled rejection or
@@ -362,10 +373,12 @@ function bindDeliverBridge(manager: WorkflowManager, pi: ExtensionAPI): void {
 
   manager.onDeliver = (message) => {
     const content = typeof message === "string" ? message : String(message ?? "");
+    const sequence = bridge.nextEventSeq++;
     sendWorkflowDelivery(bridge, {
-      id: hashDeliveryId(`deliver:${bridge.generation}:${bridge.nextEventSeq++}:${content}`),
+      id: hashDeliveryId(`deliver:${bridge.generation}:${sequence}:${content}`),
       customType: "workflow-deliver",
       content,
+      details: { notificationKind: "workflow-message", sequence },
       // Explicit child→parent deliveries are important and wake the parent.
       wake: true,
     });
@@ -377,16 +390,24 @@ function bindDeliverBridge(manager: WorkflowManager, pi: ExtensionAPI): void {
     } catch {
       text = String(result);
     }
-    // Every completed subagent produces a final report. Deliver it through the
-    // same steer path as an explicit parent message: an active main turn is not
-    // aborted, but the report is queued for the next safe point and an idle
-    // main session is woken immediately. `sendWorkflowDelivery` also retains
-    // messages across the session-generation suspension window.
+    // Claude Code models this as a task_notification synthetic turn tied to a
+    // stable task/tool identity. Pi has no native task-notification origin, so
+    // preserve the same semantics with a dedicated tool-result notification:
+    // it is real steer delivery, not a user message or a display-only entry.
+    const sequence = bridge.nextEventSeq++;
     sendWorkflowDelivery(bridge, {
-      id: hashDeliveryId(`agent:${bridge.generation}:${bridge.nextEventSeq++}:${runId}:${id}:${text}`),
+      id: hashDeliveryId(`agent:${runId}:${id}:${error ? "failed" : "completed"}:${text}`),
       customType: "workflow-agent",
-      content: `Subagent ${label} (${id}) completed in workflow ${runId}.\\n\\n${text}`,
-      details: { isError: Boolean(error), status: error ? "failed" : "completed" },
+      content: text,
+      details: {
+        notificationKind: "agent-completed",
+        runId,
+        agentId: id,
+        label,
+        sequence,
+        isError: Boolean(error),
+        status: error ? "failed" : "completed",
+      },
       wake: true,
     });
   };
@@ -424,7 +445,7 @@ function workflowSummaryAssistantMessage(message: any): any | undefined {
   const suffix = details?.isError === true ? " [error]" : "";
   return {
     role: "assistant",
-    content: [{ type: "text", text: `[Workflow ${customType}${suffix}]\\n${text}` }],
+    content: [{ type: "text", text: `[Workflow ${customType}${suffix}]\n${text}` }],
     timestamp: message.timestamp ?? Date.now(),
   };
 }
@@ -491,6 +512,49 @@ function installWorkflowSummaryBridge(pi: ExtensionAPI): void {
   });
 }
 
+function providerWorkflowDeliveryText(customType: string, text: string): string {
+  switch (customType) {
+    case "workflow-agent":
+      return (
+        "<task-notification>\n" +
+        "A background workflow subagent has just completed. Treat this notification as " +
+        "the cause of the current synthetic continuation. Respond to the NEW report below, " +
+        "not to the older user message. State what new information/action it adds; do not " +
+        "repeat an earlier acknowledgment or re-answer unrelated prior context. If several " +
+        "task notifications are present in this same batch, handle them together.\n" +
+        "</task-notification>\n\n" +
+        text
+      );
+    case "workflow-result":
+      return (
+        "<workflow-result-notification>\n" +
+        "The background workflow has just finished. Treat this final result as the cause " +
+        "of the current synthetic continuation. Give one consolidated, action-oriented " +
+        "update based on the new result; do not repeat older acknowledgments or re-answer " +
+        "an unrelated previous user message.\n" +
+        "</workflow-result-notification>\n\n" +
+        text
+      );
+    case "workflow-deliver":
+      return (
+        "<workflow-message-notification>\n" +
+        "A workflow explicitly sent this new message to the parent. Treat it as the cause " +
+        "of the current continuation and act on its latest content. Do not merely confirm " +
+        "receipt and do not repeat the previous answer.\n" +
+        "</workflow-message-notification>\n\n" +
+        text
+      );
+    default:
+      return text;
+  }
+}
+
+function workflowNotificationToolName(customType: string): string {
+  if (customType === "workflow-agent") return "workflow_task_notification";
+  if (customType === "workflow-result") return "workflow_result_notification";
+  return "workflow_message_notification";
+}
+
 function installWorkflowToolResultContextBridge(pi: ExtensionAPI): void {
   pi.on("context", (event) => {
     const output: any[] = [];
@@ -505,18 +569,29 @@ function installWorkflowToolResultContextBridge(pi: ExtensionAPI): void {
         continue;
       }
 
-      const text = customMessageText(message.content) || "(empty workflow delivery)";
+      const rawText = customMessageText(message.content) || "(empty workflow delivery)";
+      const text = providerWorkflowDeliveryText(message.customType, rawText);
       const toolCallId = hashDeliveryId(
-        `${message.customType}:${typeof message.timestamp === "number" ? message.timestamp : ""}:${messageIndex}:${text}`,
+        `${message.customType}:${typeof message.timestamp === "number" ? message.timestamp : ""}:${messageIndex}:${rawText}`,
       );
+      const details = (message.details && typeof message.details === "object"
+        ? message.details
+        : {}) as WorkflowDeliveryDetails;
+      const toolName = workflowNotificationToolName(message.customType);
       const toolCall = {
         type: "toolCall",
         id: toolCallId,
-        name: "workflow_delivery",
+        name: toolName,
         arguments: {
-        customType: message.customType,
-        status: (message.details as { status?: unknown } | undefined)?.status ?? null,
-      },
+          origin: "task-notification",
+          notificationKind: details.notificationKind ?? message.customType,
+          customType: message.customType,
+          status: details.status ?? null,
+          runId: details.runId ?? null,
+          agentId: details.agentId ?? null,
+          label: details.label ?? null,
+          sequence: details.sequence ?? null,
+        },
       };
 
       // Anthropic requires tool results to follow an assistant tool-use. Merge
@@ -552,7 +627,7 @@ function installWorkflowToolResultContextBridge(pi: ExtensionAPI): void {
       output.push({
         role: "toolResult",
         toolCallId,
-        toolName: "workflow_delivery",
+        toolName,
         content: [{ type: "text", text }],
         isError: (message.details as { isError?: unknown } | undefined)?.isError === true,
         timestamp: message.timestamp ?? Date.now(),
@@ -612,7 +687,12 @@ export default function extension(pi: ExtensionAPI) {
   // Install delivery listeners once. Keep suspended until session_start —
   // factory runs before Pi bindCore(), so sendMessage is still the
   // "runtime not initialized" stub. Flushing here would re-queue forever.
-  installResultDelivery(pi, manager, { loadSettings: () => loadWorkflowSettings({ cwd: getCwd() }) });
+  // The extension's richer task-notification context bridge is installed below;
+  // disable task-panel's standalone minimal bridge to avoid double conversion.
+  installResultDelivery(pi, manager, {
+    loadSettings: () => loadWorkflowSettings({ cwd: getCwd() }),
+    installContextBridge: false,
+  });
   suspendResultDelivery(manager);
   bindDeliverBridge(manager, pi);
 
@@ -777,7 +857,10 @@ export default function extension(pi: ExtensionAPI) {
       storage = createWorkflowStorage(cwd);
       managerOptions = buildManagerOptions(cwd, storage);
       manager = new WorkflowManager({ cwd, ...managerOptions });
-      installResultDelivery(pi, manager, { loadSettings: () => loadWorkflowSettings({ cwd: getCwd() }) });
+      installResultDelivery(pi, manager, {
+        loadSettings: () => loadWorkflowSettings({ cwd: getCwd() }),
+        installContextBridge: false,
+      });
       bindDeliverBridge(manager, pi);
       usageLimitScheduler.dispose();
       usageLimitScheduler = new UsageLimitScheduler(manager);
