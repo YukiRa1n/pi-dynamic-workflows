@@ -1013,12 +1013,16 @@ function renderNavigatorFrame(state, model, width, theme, viewportRows, markdown
                     body.push(dim("  … prompt continues in pager"));
                 body.push("", theme.fg("accent", theme.bold("Recent activity:")));
                 if (a.history?.length) {
-                    const start = Math.max(0, a.history.length - 2);
-                    for (let i = start; i < a.history.length; i++) {
-                        const eventLines = renderHistoryEntryLines(a.history, i, width, markdownTheme, dim, renderCache, true);
-                        body.push(...eventLines.slice(0, 4));
-                        if (eventLines.length > 4)
-                            body.push(dim("  … event continues in pager"));
+                    // Count visible summaries rather than raw history entries. A normal
+                    // tool operation is stored as toolCall + toolResult; counting the
+                    // hidden result used to leave room for only one actual command.
+                    const recent = [];
+                    for (let i = a.history.length - 1; i >= 0 && recent.length < 2; i--) {
+                        if (a.history[i]?.kind !== "toolResult")
+                            recent.unshift(i);
+                    }
+                    for (const i of recent) {
+                        body.push(...renderHistoryEntryLines(a.history, i, width, markdownTheme, dim, renderCache, true));
                     }
                 }
                 else {
@@ -1101,6 +1105,68 @@ function historyLabel(entry) {
         return `${asText(entry.role)} error`;
     return asText(entry.role);
 }
+function toolCallArguments(entry) {
+    if (entry.kind !== "toolCall")
+        return undefined;
+    try {
+        const value = JSON.parse(asText(entry.text));
+        return value && typeof value === "object" && !Array.isArray(value) ? value : undefined;
+    }
+    catch {
+        return undefined;
+    }
+}
+/** Keep the useful part of a command visible without allowing common credential
+ * forms to be echoed into screenshots or terminal scrollback. */
+function redactCommandSecrets(command) {
+    return command
+        .replace(/\b(?:gh[opusr]_[A-Za-z0-9_]{12,}|github_pat_[A-Za-z0-9_]{12,}|sk-[A-Za-z0-9_-]{12,})\b/g, "[REDACTED]")
+        .replace(/((?:authorization|api[-_]?key|access[-_]?token|password)\s*[:=]\s*)([^\s;'\"]+)/gi, "$1[REDACTED]");
+}
+function compactHistoryLine(entry, width) {
+    const label = historyLabel(entry);
+    if (entry.kind !== "toolCall") {
+        const text = asText(entry.text).replace(/\s+/g, " ").trim();
+        return truncateToWidth(`${label}:${text ? ` ${text}` : ""}`, width, ELLIPSIS, false);
+    }
+    const args = toolCallArguments(entry);
+    const value = (key) => (typeof args?.[key] === "string" ? asText(args[key]) : undefined);
+    let detail;
+    switch (entry.toolName) {
+        case "bash":
+            detail = value("command");
+            if (detail)
+                detail = redactCommandSecrets(detail.replace(/\s*\r?\n\s*/g, " ⏎ ").replace(/[ \t]+/g, " ").trim());
+            break;
+        case "read": {
+            const path = value("path");
+            const offset = typeof args?.offset === "number" ? args.offset : undefined;
+            const limit = typeof args?.limit === "number" ? args.limit : undefined;
+            detail = path ? `${path}${offset != null ? `:${offset}` : ""}${limit != null ? ` (+${limit})` : ""}` : undefined;
+            break;
+        }
+        case "grep": {
+            const pattern = value("pattern");
+            const path = value("path");
+            detail = [pattern ? `/${pattern}/` : undefined, path ? `in ${path}` : undefined].filter(Boolean).join(" ") || undefined;
+            break;
+        }
+        case "find":
+            detail = [value("pattern"), value("path") ? `in ${value("path")}` : undefined].filter(Boolean).join(" ") || undefined;
+            break;
+        case "ls":
+            detail = value("path") ?? ".";
+            break;
+        case "write":
+        case "edit":
+            detail = typeof entry.path === "string" ? entry.path : value("path");
+            break;
+        default:
+            detail = value("path") ?? value("runId") ?? value("name") ?? value("query");
+            break;
+    }
+    return truncateToWidth(`${label}:${detail ? ` ${detail}` : ""}`, width, ELLIPSIS, false);
+}
 function editCallPath(entry) {
     if (entry.kind !== "toolCall" || entry.toolName !== "edit")
         return undefined;
@@ -1169,12 +1235,11 @@ function renderHistoryEntryLines(history, index, width, markdownTheme, dim, rend
     const editPath = editCallPath(entry);
     const path = write?.path ?? editPath;
     const header = dim(`${historyLabel(entry)}:${path ? ` ${path}` : ""}`);
-    // Compact recent activity is intentionally one summary line per tool call;
-    // tool-result payloads and source/diff bodies stay behind the detail pager.
-    // A paired toolResult is omitted here to avoid showing the same operation
-    // twice. The full history path below still renders it when the pager opens.
+    // Compact recent activity is intentionally one useful summary line per call;
+    // payload bodies stay behind the detail pager. Include the command/target so
+    // entries such as "assistant tool bash:" are no longer blank.
     if (summaryOnly) {
-        return entry.kind === "toolResult" ? [] : [header];
+        return entry.kind === "toolResult" ? [] : [dim(compactHistoryLine(entry, width))];
     }
     // The edit result carries the same display-oriented diff used by Pi's built-in
     // edit renderer. Render it with Pi's native colors, line numbers, and
