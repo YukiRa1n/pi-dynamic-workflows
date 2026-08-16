@@ -106,6 +106,19 @@ test("createTeam and classified deliver remain supported runtime globals", () =>
   }
 });
 
+test("agent capability describes worktree isolation as fail-closed", () => {
+  const agent = WORKFLOW_CAPABILITY_DEFINITION.capabilities.find(({ id }) => id === "workflow.runtime.agent");
+  assert.ok(agent);
+  assert.equal(
+    agent.constraints.some((constraint) => /worktree isolation is fail-closed/i.test(constraint)),
+    true,
+  );
+  assert.equal(
+    agent.constraints.some((constraint) => /continues without an isolated working directory/i.test(constraint)),
+    false,
+  );
+});
+
 test("tool-input contract records configured omission defaults and soft budget accounting", () => {
   const agentTimeoutMs = WORKFLOW_CAPABILITY_DEFINITION.capabilities.find(
     ({ id }) => id === "workflow.tool-input.agentTimeoutMs",

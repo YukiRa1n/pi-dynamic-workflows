@@ -10,15 +10,23 @@ declare const stopWorkflowSchema: Type.TObject<{
     runId: Type.TString;
 }>;
 declare const listActiveWorkflowsSchema: Type.TObject<{}>;
+declare const getWorkflowOutputSchema: Type.TObject<{
+    runId: Type.TString;
+    block: Type.TOptional<Type.TBoolean>;
+    timeoutMs: Type.TOptional<Type.TInteger>;
+}>;
 export type WorkflowControlInput = Static<typeof workflowControlSchema>;
 export type StopWorkflowInput = Static<typeof stopWorkflowSchema>;
 export type ListActiveWorkflowsInput = Static<typeof listActiveWorkflowsSchema>;
+export type GetWorkflowOutputInput = Static<typeof getWorkflowOutputSchema>;
 export interface WorkflowControlToolOptions {
     manager?: WorkflowManager;
     /** Live manager accessor; prefer over a closed-over manager when the extension may replace it. */
     getManager?: () => WorkflowManager;
     /** Current host-session accessor; keeps ownership checks independent of retained manager prototypes. */
     getSessionId?: () => string | undefined;
+    /** Live result-projection limit; defaults to the same bound as automatic terminal delivery. */
+    getResultMaxChars?: () => number | undefined;
 }
 export interface WorkflowControlRunDetails {
     runId: string;
@@ -58,8 +66,20 @@ export interface ListActiveWorkflowsResultDetails {
     truncated: boolean;
     error?: string;
 }
+export interface GetWorkflowOutputResultDetails extends Record<string, unknown> {
+    runId: string;
+    status?: RunStatus;
+    completed: boolean;
+    blocked: boolean;
+    timedOut?: boolean;
+    interrupted?: boolean;
+    resultPath?: string;
+    error?: string;
+}
 /** Exact cancellation handles for active runs owned by the bound Pi session. */
 export declare function createListActiveWorkflowsTool(options: WorkflowControlToolOptions): ToolDefinition<typeof listActiveWorkflowsSchema, ListActiveWorkflowsResultDetails>;
+/** One-shot, session-owned output retrieval with an interruptible event wait. */
+export declare function createGetWorkflowOutputTool(options: WorkflowControlToolOptions): ToolDefinition<typeof getWorkflowOutputSchema, GetWorkflowOutputResultDetails>;
 /**
  * Provider-facing cancellation handle. It deliberately exposes no discovery,
  * status, pause, resume, or steering surface: the caller must use the exact ID

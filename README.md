@@ -10,6 +10,7 @@ After installation, Pi gains:
 
 - `start_workflow` — a stable, start-only tool for a generated script or curated built-in preset.
 - `list_active_workflows` — a stable, current-session list of exact cancellation handles.
+- `get_workflow_output` — a one-shot, interruptible wait for one current-session run; it replaces list/sleep polling.
 - `stop_workflow` — a stable, exact-ID cancellation handle limited to runs owned by the current Pi session.
 - `/workflows` — interactive workflow navigator.
 - `/workflows status|watch|pause|resume|stop|steer` — explicit lifecycle and existing-run commands.
@@ -18,7 +19,7 @@ After installation, Pi gains:
 - Workflow-scoped Agent Teams with peer messages, inboxes, and a shared task board.
 - One bounded background workflow result is delivered to the main session using Pi's safe-point steering queue; an active provider request is not cancelled. Routine per-subagent finals stay in the run journal/pager instead of consuming parent context.
 
-The extension uses the stock Pi extension API and keeps compact start, active-list, and exact-ID stop definitions registered. Its provider-visible prefix therefore stays stable for prompt caching; there is no per-turn tool lease or dynamic `setActiveTools` rewrite. The list returns only current-session running/paused handles, and stop requires one exact ID. Other existing-run actions stay under `/workflows`; a new requirement is never routed into an unrelated run.
+The extension uses the stock Pi extension API and keeps compact start, active-list, output-wait, and exact-ID stop definitions registered. Its provider-visible prefix therefore stays stable for prompt caching; there is no per-turn tool lease or dynamic `setActiveTools` rewrite. The list returns only current-session running/paused handles. `get_workflow_output` waits on lifecycle events once (10 minutes by default); Esc cancels only that wait, not the workflow. Stop requires one exact ID. Other existing-run actions stay under `/workflows`; a new requirement is never routed into an unrelated run.
 
 ## Requirements
 
@@ -98,7 +99,7 @@ Inside Pi, open:
 /workflows
 ```
 
-The compact `start_workflow`, `list_active_workflows`, and `stop_workflow` tools are stable across turns. Start accepts a custom `script` or curated `preset`; list returns only current-session running/paused handles; stop accepts one exact ID. Saved names, limits, replay, detailed inspection, pause, resume, and steering remain command/UI paths under `/workflows`.
+The compact `start_workflow`, `list_active_workflows`, `get_workflow_output`, and `stop_workflow` tools are stable across turns. Start accepts a custom `script` or curated `preset`; list returns only current-session running/paused handles; output waits once for an exact ID instead of polling; stop accepts one exact ID. Saved names, limits, replay, detailed inspection, pause, resume, and steering remain command/UI paths under `/workflows`.
 
 ### 2. Configure model tiers
 

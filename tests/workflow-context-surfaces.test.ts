@@ -28,7 +28,7 @@ test("workflow context measurement reports Pi-rendered prompt and provider tool 
   const artifact = measureWorkflowContextSurfaces(ROOT);
   assert.deepEqual(JSON.parse(renderWorkflowContextMeasurement()), artifact);
 
-  assert.equal(artifact.formatVersion, 8);
+  assert.equal(artifact.formatVersion, 9);
   assert.equal(artifact.encoding, "utf8");
   assert.deepEqual(artifact.sources, [
     "src/workflow-tool.ts",
@@ -41,7 +41,7 @@ test("workflow context measurement reports Pi-rendered prompt and provider tool 
   assert.match(artifact.surfaces.providerVisibleWorkflowToolDefinition.serialization, /stable/i);
   assert.deepEqual(
     artifact.surfaces.providerVisibleAlwaysOnToolDefinitions.tools.map((tool) => tool.name),
-    ["start_workflow", "list_active_workflows", "stop_workflow"],
+    ["start_workflow", "list_active_workflows", "get_workflow_output", "stop_workflow"],
   );
   assert.ok(artifact.surfaces.providerVisibleAlwaysOnToolDefinitions.bytes > 0);
   assert.equal(
@@ -148,6 +148,7 @@ test("context freshness command prints stable and on-demand byte counts", () => 
   assert.match(output, /Ordinary stable workflow tool definitions: \d+ bytes/);
   assert.match(output, /- start_workflow: \d+ bytes/);
   assert.match(output, /- list_active_workflows: \d+ bytes/);
+  assert.match(output, /- get_workflow_output: \d+ bytes/);
   assert.match(output, /- stop_workflow: \d+ bytes/);
   assert.doesNotMatch(output, /- workflow_control: \d+ bytes/);
   assert.doesNotMatch(output, /- workflow_steer: \d+ bytes/);

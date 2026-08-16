@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import test from "node:test";
 import { Check } from "typebox/value";
 import type { WorkflowSnapshot } from "../src/display.js";
 import type { PersistedRunState, RunStatus } from "../src/run-persistence.js";
 import {
+  createGetWorkflowOutputTool,
   createListActiveWorkflowsTool,
   createStopWorkflowTool,
   createWorkflowControlTool,
@@ -103,6 +105,30 @@ async function executeList(manager: WorkflowManager, params: Record<string, unkn
   return (tool.execute as any)("list-call", params, undefined, undefined, {});
 }
 
+function outputManager(item: PersistedRunState, sessionId = "session-a") {
+  class FakeOutputManager extends EventEmitter {
+    state = item;
+    getSessionId() {
+      return sessionId;
+    }
+    listRuns() {
+      return [this.state];
+    }
+    getRun() {
+      return undefined;
+    }
+    getPersistence() {
+      return { getRunsDir: () => "C:/workflow-runs" };
+    }
+  }
+  return new FakeOutputManager() as unknown as WorkflowManager & EventEmitter & { state: PersistedRunState };
+}
+
+async function executeOutput(manager: WorkflowManager, params: Record<string, unknown>, signal?: AbortSignal) {
+  const tool = createGetWorkflowOutputTool({ manager });
+  return (tool.execute as any)("output-call", params, signal, undefined, {});
+}
+
 const renderTheme = {
   fg: (_color: string, value: string) => value,
   bold: (value: string) => value,
@@ -120,7 +146,8 @@ test("list_active_workflows exposes a strict empty schema and no lifecycle contr
   const tool = createListActiveWorkflowsTool({ manager: fixture.manager });
 
   assert.equal(tool.name, "list_active_workflows");
-  assert.match(tool.description, /active workflows owned by this Pi session/i);
+  assert.match(tool.description, /cancellation only/i);
+  assert.match(tool.description, /Never poll/i);
   assert.equal(Check(tool.parameters, {}), true);
   assert.equal(Check(tool.parameters, { status: true }), false);
   assert.equal(tool.promptSnippet, undefined);
@@ -128,6 +155,128 @@ test("list_active_workflows exposes a strict empty schema and no lifecycle contr
   const prepare = tool.prepareArguments as (value: unknown) => unknown;
   assert.deepEqual(prepare({}), {});
   assert.throws(() => prepare({ status: true }), /does not accept status/);
+});
+
+test("get_workflow_output exposes a strict one-shot blocking schema", () => {
+  const manager = outputManager({ ...run("completed"), sessionId: "session-a", result: "done" });
+  const tool = createGetWorkflowOutputTool({ manager });
+
+  assert.equal(tool.name, "get_workflow_output");
+  assert.match(tool.description, /Wait once/i);
+  assert.match(tool.description, /Esc cancels only the wait/i);
+  assert.match(tool.description, /Never poll list_active_workflows or use shell sleep/i);
+  assert.equal(Check(tool.parameters, { runId: "audit-abc123" }), true);
+  assert.equal(Check(tool.parameters, { runId: "audit-abc123", block: false, timeoutMs: 10 }), true);
+  assert.equal(Check(tool.parameters, { runId: "audit-abc123", timeoutMs: 0 }), false);
+  assert.equal(Check(tool.parameters, { runId: "audit-abc123", extra: true }), false);
+  assert.equal(tool.promptSnippet, undefined);
+  assert.equal(tool.promptGuidelines, undefined);
+  assert.equal(tool.executionMode, "sequential");
+
+  const prepare = tool.prepareArguments as (value: unknown) => unknown;
+  assert.deepEqual(prepare({ runId: "audit-abc123" }), {
+    runId: "audit-abc123",
+    block: true,
+    timeoutMs: 600_000,
+  });
+  assert.throws(() => prepare({ runId: "../foreign" }), /canonical runId/);
+  assert.throws(() => prepare({ runId: "audit-abc123", timeoutMs: 0 }), /integer from 1/);
+  assert.throws(() => prepare({ runId: "audit-abc123", extra: true }), /does not accept extra/);
+});
+
+test("get_workflow_output returns a bounded completed result immediately", async () => {
+  const manager = outputManager({
+    ...run("completed"),
+    sessionId: "session-a",
+    result: { report: "final report", evidence: ["a", "b"] },
+  });
+  const tool = createGetWorkflowOutputTool({ manager, getResultMaxChars: () => 80 });
+  const response = await (tool.execute as any)(
+    "output-call",
+    { runId: "audit-abc123", block: true, timeoutMs: 100 },
+    undefined,
+    undefined,
+    {},
+  );
+
+  assert.equal(response.details.completed, true);
+  assert.equal(response.details.status, "completed");
+  assert.equal(response.details.timedOut, undefined);
+  assert.match(response.content[0].text, /final report/);
+  assert.match(response.content[0].text, /Full persisted run: C:[\\/]workflow-runs[\\/]audit-abc123\.json/);
+  assert.equal(manager.eventNames().length, 0);
+});
+
+test("get_workflow_output waits on lifecycle events once and removes every listener", async () => {
+  const manager = outputManager({ ...run("running"), sessionId: "session-a" });
+  const pending = executeOutput(manager, { runId: "audit-abc123", block: true, timeoutMs: 500 });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  for (const eventName of ["complete", "error", "stopped", "paused", "deleted"]) {
+    assert.equal(manager.listenerCount(eventName), 1);
+  }
+  manager.emit("complete", { runId: "other-run" });
+  manager.state = { ...manager.state, status: "completed", result: "verified output" };
+  manager.emit("complete", { runId: "audit-abc123" });
+
+  const response = await pending;
+  assert.equal(response.details.completed, true);
+  assert.match(response.content[0].text, /verified output/);
+  for (const eventName of ["complete", "error", "stopped", "paused", "deleted"]) {
+    assert.equal(manager.listenerCount(eventName), 0);
+  }
+});
+
+test("get_workflow_output closes the subscribe/read race without polling", async () => {
+  const initial = { ...run("running"), sessionId: "session-a" };
+  const completed = { ...initial, status: "completed" as const, result: "race-safe output" };
+  const manager = outputManager(initial);
+  let reads = 0;
+  manager.listRuns = () => [reads++ === 0 ? initial : completed];
+
+  const response = await executeOutput(manager, { runId: initial.runId, block: true, timeoutMs: 500 });
+  assert.equal(response.details.completed, true);
+  assert.match(response.content[0].text, /race-safe output/);
+  assert.equal(reads, 3);
+  assert.equal(manager.eventNames().length, 0);
+});
+
+test("get_workflow_output timeout and Esc-like interrupt are leak-free and do not stop the run", async () => {
+  const manager = outputManager({ ...run("running"), sessionId: "session-a" });
+  const timedOut = await executeOutput(manager, { runId: "audit-abc123", block: true, timeoutMs: 5 });
+  assert.equal(timedOut.details.completed, false);
+  assert.equal(timedOut.details.timedOut, true);
+  assert.match(timedOut.content[0].text, /Do not poll/);
+  assert.equal(manager.eventNames().length, 0);
+
+  const controller = new AbortController();
+  const outputTool = createGetWorkflowOutputTool({ manager });
+  const interruptedPromise = (outputTool.execute as any)(
+    "output-call",
+    { runId: "audit-abc123", block: true, timeoutMs: 500 },
+    controller.signal,
+    undefined,
+    {},
+  );
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  controller.abort();
+  const interrupted = await interruptedPromise;
+  assert.equal(interrupted.details.interrupted, true);
+  assert.equal(interrupted.terminate, true, "Esc ends the main agent turn instead of starting another loop");
+  assert.match(interrupted.content[0].text, /continues in the background/);
+  assert.equal(manager.state.status, "running");
+  assert.equal(manager.eventNames().length, 0);
+});
+
+test("get_workflow_output fails closed for unbound or foreign-session runs", async () => {
+  const foreign = outputManager({ ...run("completed"), sessionId: "session-b", result: "secret" });
+  const foreignResponse = await executeOutput(foreign, { runId: "audit-abc123", block: false });
+  assert.match(foreignResponse.details.error ?? "", /not found in current session/);
+  assert.doesNotMatch(foreignResponse.content[0].text, /secret/);
+
+  const unbound = outputManager({ ...run("completed"), sessionId: "session-a", result: "secret" }, "");
+  const unboundResponse = await executeOutput(unbound, { runId: "audit-abc123", block: false });
+  assert.match(unboundResponse.details.error ?? "", /ownership is unavailable/);
 });
 
 test("list_active_workflows returns only bounded current-session cancellation handles", async () => {
@@ -189,6 +338,17 @@ test("session-scoped tools survive a retained pre-upgrade manager without getSes
   const listTool = createListActiveWorkflowsTool(options);
   const listed = await (listTool.execute as any)("list-call", {}, undefined, undefined, {});
   assert.deepEqual(listed.details.runs, [{ runId: "audit-current-1", name: "audit", status: "running" }]);
+
+  const outputTool = createGetWorkflowOutputTool(options);
+  const output = await (outputTool.execute as any)(
+    "output-call",
+    { runId: "audit-current-1", block: false },
+    undefined,
+    undefined,
+    {},
+  );
+  assert.equal(output.details.status, "running");
+  assert.equal(output.details.error, undefined);
 
   const stopTool = createStopWorkflowTool(options);
   const stopped = await (stopTool.execute as any)("stop-call", { runId: "audit-current-1" }, undefined, undefined, {});

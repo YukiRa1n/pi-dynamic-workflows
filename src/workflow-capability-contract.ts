@@ -321,7 +321,7 @@ const capabilities: readonly CapabilityDescriptor[] = [
       "selector priority is explicit model > agentType model > tier > phase model > metadata model > implicit medium > session default",
       "an explicit model, agentType model, tier, or phase model that resolves to an unavailable model throws MODEL_NOT_FOUND naming the source (e.g. the tier and what it resolved to) instead of falling back",
       "only the implicit default medium tier (no explicit model, tier, agentType, or phase model requested) degrades to the session default when unavailable, logging a one-time run-visible warning instead of throwing",
-      "worktree isolation is best-effort; failure logs that isolation was ignored and continues without an isolated working directory",
+      "worktree isolation is fail-closed; failure throws a nonrecoverable agent execution error before the agent can use the shared working directory",
     ],
     evidence: ["tests/workflow-runtime.test.ts", "tests/agent-registry.test.ts", "tests/structured-output.test.ts"],
   }),

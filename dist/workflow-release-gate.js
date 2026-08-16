@@ -8,7 +8,7 @@ import { WORKFLOW_AUTHORING_COVERAGE, WORKFLOW_AUTHORING_FROZEN_FILES, WORKFLOW_
 import { checkWorkflowCapabilityPublications, } from "./workflow-authoring-reference.js";
 import { WORKFLOW_CAPABILITY_DEFINITION } from "./workflow-capability-contract.js";
 import { checkWorkflowContextMeasurement, WORKFLOW_CONTEXT_MEASUREMENT_PATH } from "./workflow-context-measurement.js";
-import { createListActiveWorkflowsTool, createStopWorkflowTool, createWorkflowControlTool, } from "./workflow-control-tool.js";
+import { createGetWorkflowOutputTool, createListActiveWorkflowsTool, createStopWorkflowTool, createWorkflowControlTool, } from "./workflow-control-tool.js";
 import { createWorkflowTool } from "./workflow-tool.js";
 /** Re-exported stable diagnostic codes for release automation. */
 export { WorkflowReleaseDiagnosticCode } from "./enums.js";
@@ -293,8 +293,33 @@ function validateListActiveWorkflowsSurface() {
     }
     return diagnostics;
 }
+function validateGetWorkflowOutputSurface() {
+    const tool = createGetWorkflowOutputTool({
+        getManager: () => {
+            throw new Error("release inspection");
+        },
+    });
+    const parameters = isRecord(tool.parameters) ? tool.parameters : {};
+    const properties = isRecord(parameters.properties) ? parameters.properties : {};
+    const required = Array.isArray(parameters.required) ? parameters.required : [];
+    const diagnostics = [];
+    if (tool.name !== "get_workflow_output" ||
+        parameters.type !== "object" ||
+        parameters.additionalProperties !== false ||
+        Object.keys(properties).sort().join(",") !== "block,runId,timeoutMs" ||
+        required.length !== 1 ||
+        required[0] !== "runId") {
+        diagnostics.push(diagnostic(WorkflowReleaseDiagnosticCode.TOOL_INPUT_MISMATCH, "get_workflow_output", "get_workflow_output must expose exact runId plus optional block/timeoutMs in a strict object schema."));
+    }
+    if (!/wait once/iu.test(tool.description) ||
+        !/never poll/iu.test(tool.description) ||
+        !/shell sleep/iu.test(tool.description)) {
+        diagnostics.push(diagnostic(WorkflowReleaseDiagnosticCode.TOOL_INPUT_MISMATCH, "get_workflow_output.description", "get_workflow_output must direct models to one event wait instead of list/shell polling."));
+    }
+    return diagnostics;
+}
 function validateModelWorkflowToolIsolation() {
-    const required = ["start_workflow", "list_active_workflows", "stop_workflow"];
+    const required = ["start_workflow", "list_active_workflows", "get_workflow_output", "stop_workflow"];
     const missing = required.filter((name) => !DEFAULT_EXCLUDED_SUBAGENT_TOOLS.includes(name));
     if (missing.length === 0)
         return [];
@@ -348,6 +373,7 @@ const RELEASE_SURFACE_SOURCES = [
     "src/workflow-manager.ts",
     "src/workflow-paths.ts",
     "src/workflow-release-gate.ts",
+    "src/workflow-result-projection.ts",
     "src/workflow-saved.ts",
     "src/workflow-settings.ts",
     "src/workflow-tool.ts",
@@ -484,6 +510,7 @@ export function checkWorkflowRelease(options) {
         ...validateToolInputs(definition),
         ...validateWorkflowControlSurface(),
         ...validateListActiveWorkflowsSurface(),
+        ...validateGetWorkflowOutputSurface(),
         ...validateStopWorkflowSurface(),
         ...validateModelWorkflowToolIsolation(),
         ...validatePackage(options.root, options.publishableFiles),

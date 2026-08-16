@@ -342,7 +342,12 @@ describe("workflow extension - stable tool availability", () => {
 
         installExtension(pi);
 
-        assert.deepEqual(registeredTools, ["start_workflow", "list_active_workflows", "stop_workflow"]);
+        assert.deepEqual(registeredTools, [
+          "start_workflow",
+          "list_active_workflows",
+          "get_workflow_output",
+          "stop_workflow",
+        ]);
         assert.ok(handlers.session_start.length >= 1);
         emitSessionStart(
           handlers,
@@ -419,9 +424,11 @@ describe("workflow extension - stable tool availability", () => {
         assert.deepEqual(registeredTools, [
           "start_workflow",
           "list_active_workflows",
+          "get_workflow_output",
           "stop_workflow",
           "start_workflow",
           "list_active_workflows",
+          "get_workflow_output",
           "stop_workflow",
         ]);
         assert.equal(takeWorkflowRuntime(process.cwd()), undefined, "the fresh factory consumes the staged runtime");

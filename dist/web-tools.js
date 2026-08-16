@@ -56,6 +56,78 @@ function mappedIpv4(address) {
     const low = Number.parseInt(words[1], 16);
     return `${high >>> 8}.${high & 0xff}.${low >>> 8}.${low & 0xff}`;
 }
+function ipv6Value(address) {
+    let normalized = address.toLowerCase();
+    if (normalized.includes(".")) {
+        const separator = normalized.lastIndexOf(":");
+        const octets = normalized
+            .slice(separator + 1)
+            .split(".")
+            .map(Number);
+        if (separator < 0 ||
+            octets.length !== 4 ||
+            octets.some((part) => !Number.isInteger(part) || part < 0 || part > 255))
+            return undefined;
+        normalized = `${normalized.slice(0, separator)}:${((octets[0] << 8) | octets[1]).toString(16)}:${((octets[2] << 8) | octets[3]).toString(16)}`;
+    }
+    const halves = normalized.split("::");
+    if (halves.length > 2)
+        return undefined;
+    const left = halves[0] ? halves[0].split(":") : [];
+    const right = halves.length === 2 && halves[1] ? halves[1].split(":") : [];
+    const missing = 8 - left.length - right.length;
+    if ((halves.length === 1 && missing !== 0) || (halves.length === 2 && missing < 1))
+        return undefined;
+    const words = [...left, ...Array.from({ length: missing }, () => "0"), ...right];
+    if (words.length !== 8 || words.some((word) => !/^[0-9a-f]{1,4}$/.test(word)))
+        return undefined;
+    return words.reduce((value, word) => (value << 16n) | BigInt(Number.parseInt(word, 16)), 0n);
+}
+function ipv6Policy(cidr, blocked) {
+    const [address, rawBits] = cidr.split("/");
+    const prefix = ipv6Value(address);
+    const bits = Number(rawBits);
+    if (prefix === undefined || !Number.isInteger(bits) || bits < 0 || bits > 128) {
+        throw new Error(`Invalid internal IPv6 policy: ${cidr}`);
+    }
+    return { prefix, bits, blocked };
+}
+function matchesIpv6Policy(value, policy) {
+    const shift = 128n - BigInt(policy.bits);
+    return value >> shift === policy.prefix >> shift;
+}
+// Longest-prefix policy derived from the IANA IPv6 special-purpose registry.
+// The broad 2001::/23 reservation is deny-by-default, with only its explicitly
+// globally reachable more-specific allocations restored. Translation and
+// tunnel prefixes remain blocked because they can encode a different target.
+const IPV6_POLICIES = [
+    ipv6Policy("2001:1::1/128", false),
+    ipv6Policy("2001:1::2/128", false),
+    ipv6Policy("2001:1::3/128", false),
+    ipv6Policy("2001:4:112::/48", false),
+    ipv6Policy("2001:2::/48", true),
+    ipv6Policy("64:ff9b:1::/48", true),
+    ipv6Policy("2001::/32", true),
+    ipv6Policy("2001:3::/32", false),
+    ipv6Policy("2001:db8::/32", true),
+    ipv6Policy("2001:10::/28", true),
+    ipv6Policy("2001:20::/28", false),
+    ipv6Policy("2001:30::/28", false),
+    ipv6Policy("3fff::/20", true),
+    ipv6Policy("5f00::/16", true),
+    ipv6Policy("2002::/16", true),
+    ipv6Policy("2001::/23", true),
+    ipv6Policy("::ffff:0:0/96", true),
+    ipv6Policy("64:ff9b::/96", true),
+    ipv6Policy("::/96", true),
+    ipv6Policy("100:0:0:1::/64", true),
+    ipv6Policy("100::/64", true),
+    ipv6Policy("fc00::/7", true),
+    ipv6Policy("fe80::/10", true),
+    ipv6Policy("fec0::/10", true),
+    ipv6Policy("ff00::/8", true),
+    ipv6Policy("2000::/3", false),
+].sort((a, b) => b.bits - a.bits);
 export function blockedAddress(address) {
     const normalized = address
         .replace(/^\[|\]$/g, "")
@@ -68,18 +140,10 @@ export function blockedAddress(address) {
         return blockedIpv4(normalized);
     if (isIP(normalized) !== 6)
         return true;
-    // Unspecified, loopback, IPv4-compatible, NAT64 well-known prefix, unique
-    // local, link-local, multicast, and documentation ranges are not fetchable.
-    return (normalized === "::" ||
-        normalized === "::1" ||
-        normalized.startsWith("::ffff:") ||
-        normalized.startsWith("64:ff9b:") ||
-        normalized.startsWith("100:") ||
-        normalized.startsWith("2001:db8:") ||
-        normalized.startsWith("fc") ||
-        normalized.startsWith("fd") ||
-        /^fe[89ab]/.test(normalized) ||
-        normalized.startsWith("ff"));
+    const value = ipv6Value(normalized);
+    if (value === undefined)
+        return true;
+    return IPV6_POLICIES.find((policy) => matchesIpv6Policy(value, policy))?.blocked ?? true;
 }
 async function resolveSafeTarget(raw) {
     const parsed = new URL(raw);

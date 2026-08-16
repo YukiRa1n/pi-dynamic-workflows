@@ -312,7 +312,8 @@ async function reapReclaimMarkers(repoRoot: string): Promise<number> {
     // healthy worktree. The two independent metadata proofs are authoritative;
     // the stale marker itself is the only artifact to reclaim.
     if (marker.state !== "cleanup" && branchMarker === marker.ownerToken && sidecarProof) {
-      if (removeReclaimMarker(markerPath)) continue;
+      if (removeReclaimMarker(markerPath)) reaped++;
+      continue;
     }
 
     if (!(await isRegisteredWorktree(candidate))) {

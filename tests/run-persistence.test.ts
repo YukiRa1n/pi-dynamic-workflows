@@ -7,6 +7,7 @@ import {
   readFileSync,
   rmSync,
   type statSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -1153,6 +1154,51 @@ test(
     assert.ok(lease, "lease exists before delete");
     rp.delete("delete-lock", undefined, lease);
     assert.equal(existsSync(join(workflowProjectPaths(cwd).runsDir, "delete-lock.lock")), false, "lock cleaned up");
+  }),
+);
+
+test(
+  "delete keeps the backup and lease when the primary record cannot be removed",
+  withTempCwd(async (cwd) => {
+    const initial = createRunPersistence(cwd);
+    const state = {
+      runId: "delete-primary-failure",
+      workflowName: "w",
+      status: "paused",
+      phases: [],
+      agents: [],
+      logs: [],
+    } as PersistedRunState;
+    initial.save(state);
+
+    const runsDir = workflowProjectPaths(cwd).runsDir;
+    const primary = join(runsDir, `${state.runId}.json`);
+    const backup = `${primary}.bak`;
+    const lock = join(runsDir, `${state.runId}.lock`);
+    const persistence = createRunPersistence(cwd, {
+      unlinkSync(path) {
+        if (path === primary) {
+          const error = new Error("injected primary unlink failure") as NodeJS.ErrnoException;
+          error.code = "EACCES";
+          throw error;
+        }
+        unlinkSync(path);
+      },
+    });
+    const lease = persistence.acquireRunLease(state.runId);
+    assert.ok(lease);
+
+    assert.equal(persistence.delete(state.runId, state.revision, lease), false);
+    assert.equal(existsSync(primary), true, "primary remains for retry");
+    assert.equal(existsSync(backup), true, "backup remains recoverable");
+    assert.equal(existsSync(lock), true, "lease remains held by the live manager");
+
+    const loaded = persistence.load(state.runId);
+    assert.ok(loaded);
+    loaded.status = "running";
+    persistence.save(loaded, loaded.revision, lease);
+    assert.equal(persistence.load(state.runId)?.status, "running", "the retained lease remains usable");
+    persistence.releaseRunLease(lease);
   }),
 );
 

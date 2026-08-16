@@ -34,8 +34,8 @@ export declare class SharedStore {
     private totalBytes;
     private readonly limits;
     private readonly agentDeltas;
-    private readonly priorValues;
-    private readonly keyOwners;
+    private readonly keyVersionHeads;
+    private readonly deltaVersions;
     private readonly retiredDeltas;
     private disposed;
     constructor(options?: SharedStoreOptions);
@@ -76,14 +76,10 @@ export declare class SharedStore {
      * whatever it held immediately before the window started (or deleted, if
      * it did not exist yet) — never to some other attempt's or caller's value.
      *
-     * Per-key guard: a key is only rolled back if the store's CURRENT value is
-     * still OWNED by this attempt's delta window (tracked by `keyOwners`, not by
-     * value equality). If a concurrently-running sibling (a different `deltaKey`,
-     * e.g. another agent in the same parallel() batch) legitimately overwrote the
-     * same key AFTER this attempt wrote it but BEFORE it failed — including a
-     * write of the exact same primitive or object reference — that sibling's
-     * write is left untouched; rolling back unconditionally would silently erase
-     * a live, unrelated write that this attempt never made.
+     * Per-key guard: discarded version nodes are skipped from the current chain.
+     * A later sibling head remains visible; if that sibling also fails, resolving
+     * its predecessor skips every already-discarded node until it reaches a live
+     * sibling, a committed value, or the original baseline.
      *
      * A no-op if `deltaKey` never wrote anything (nothing to roll back).
      */
@@ -107,6 +103,8 @@ export declare class SharedStore {
     private admitValue;
     private replaceValue;
     private removeValue;
+    /** Recompute one visible key after a delta commits or is discarded. */
+    private resolveVersionHead;
 }
 /**
  * Create per-agent store tools that attribute writes to `deltaKey`, a

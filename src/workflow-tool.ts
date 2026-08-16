@@ -102,8 +102,7 @@ const modelFacingWorkflowToolSchema = Type.Object(
   {
     script: Type.Optional(
       Type.String({
-        description:
-          "JavaScript workflow; omitted metadata is filled in. Use await agent('task', { label: 'id' }); call agent() at least once.",
+        description: "JavaScript using agent(); omit when using preset.",
       }),
     ),
     preset: Type.Optional(
@@ -227,7 +226,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
     name: modelFacing ? "start_workflow" : "workflow",
     label: modelFacing ? "Start workflow" : "Workflow",
     description: modelFacing
-      ? "Start a new background workflow only when the user asks for a new multi-agent run. It cannot update an existing run; existing runs use /workflows. Use a script or built-in preset."
+      ? "Start a new background workflow only when the user requests multi-agent work. Use a script or preset; existing runs use /workflows."
       : allowResume
         ? "Run a saved/built-in or JavaScript workflow in the background; results return automatically. Use resumeFromRunId only to revise the same paused run."
         : "Start a new background workflow for an explicitly requested multi-agent task. Provide a saved name or JavaScript using agent(), parallel(), and pipeline(); results return automatically. Existing runs use /workflows.",

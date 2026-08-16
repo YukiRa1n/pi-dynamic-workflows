@@ -4,6 +4,17 @@ All notable changes to `@quintinshaw/pi-dynamic-workflows` are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- Added `get_workflow_output`, an interruptible one-shot lifecycle wait for an exact current-session run ID. It returns bounded terminal output and replaces repeated `list_active_workflows` plus shell-sleep polling. Esc cancels only the wait; the workflow continues in the background.
+
+### Fixed
+
+- Fixed concurrent SharedStore rollback so failed interleaved writers cannot restore another failed writer's value or diverge from the durable journal.
+- Fixed run deletion ordering so a primary-record unlink failure preserves its backup and live lease; worktree startup reaping now preserves a healthy checkout even when stale-marker cleanup fails.
+- Hardened IPv6 SSRF filtering with binary longest-prefix matching for special-purpose, translated, tunneled, deprecated site-local, and non-global address space.
+- Corrected the executable capability contract and generated authoring reference to describe worktree isolation as fail-closed.
+
 ## [3.5.1-yuki.3] - 2026-08-16
 
 ### Added

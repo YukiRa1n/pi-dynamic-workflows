@@ -36,7 +36,8 @@ async function withGitRace(
     | "recreate-canonical-after-branch-claim"
     | "fail-owner-config"
     | "break-sidecar"
-    | "fail-branch-delete",
+    | "fail-branch-delete"
+    | "replace-reclaim-marker-with-directory",
   environment: Record<string, string>,
   run: () => Promise<void>,
 ): Promise<void> {
@@ -46,7 +47,7 @@ async function withGitRace(
   writeFileSync(
     script,
     `import { spawnSync } from "node:child_process";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 
 const args = process.argv.slice(2);
 const realGit = process.env.PI_REAL_GIT;
@@ -61,6 +62,19 @@ if (mode === "fail-owner-config" && args.includes("config") && args.some((arg) =
 
 if (mode === "fail-branch-delete" && args.includes("branch") && args.includes("-D")) {
   process.exit(1);
+}
+
+if (
+  mode === "replace-reclaim-marker-with-directory" &&
+  args.includes("config") &&
+  args.includes("--get") &&
+  args.some((arg) => arg.includes("pi-worktree-owner"))
+) {
+  const result = invoke(args);
+  const marker = process.env.PI_WT_RECLAIM_MARKER;
+  rmSync(marker, { force: true });
+  mkdirSync(marker, { recursive: true });
+  process.exit(result.status ?? 1);
 }
 
 if (mode === "break-sidecar" && args.includes("worktree") && args.includes("add")) {
@@ -150,6 +164,18 @@ function expectedWorktreePath(repo: string, name: string): string {
   const digest = createHash("sha256").update(name).digest("hex").slice(0, 10);
   const id = `${readable.slice(0, 21)}-${digest}`.slice(0, 32);
   return join(repo, ".pi", "worktrees", id);
+}
+
+function expectedReclaimMarkerPath(repo: string, branch: string, ownerToken: string): string {
+  const name = `${branch}:${ownerToken}`;
+  const readable =
+    name
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "") || "agent";
+  const digest = createHash("sha256").update(name).digest("hex").slice(0, 10);
+  const id = `${readable.slice(0, 21)}-${digest}`.slice(0, 32);
+  return join(repo, ".pi", "worktrees", ".claims", `${id}.reclaim.json`);
 }
 
 // ── Existing tests (unchanged) ──
@@ -247,6 +273,49 @@ test("removeWorktree leaves an owner-fenced reclaim marker when branch deletion 
       "",
     );
     assert.equal(existsSync(markerPath), false, "the marker is removed only after the branch is gone");
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+});
+
+test("startup reaping never removes a healthy worktree when stale marker unlink fails", async () => {
+  const repo = mkdtempSync(join(tmpdir(), "pi-wt-marker-unlink-"));
+  const git = (...args: string[]) => execFileSync(REAL_GIT, ["-C", repo, ...args], { stdio: "pipe" });
+  try {
+    git("init", "-q");
+    git("config", "user.email", "t@t.t");
+    git("config", "user.name", "t");
+    writeFileSync(join(repo, "file.txt"), "base\n");
+    git("add", ".");
+    git("commit", "-q", "-m", "init");
+
+    const worktree = await createWorktreeLive(repo, "healthy-marker-unlink");
+    assert.equal(worktree.isolated, true);
+    assert.ok(worktree.branch && worktree.ownerToken);
+    const markerPath = expectedReclaimMarkerPath(repo, worktree.branch, worktree.ownerToken);
+    mkdirSync(join(repo, ".pi", "worktrees", ".claims"), { recursive: true });
+    writeFileSync(
+      markerPath,
+      JSON.stringify({
+        ownerToken: worktree.ownerToken,
+        pid: 2_147_483_647,
+        createdAt: new Date().toISOString(),
+        repoRoot: repo,
+        branch: worktree.branch,
+        path: worktree.cwd,
+        state: "creating",
+      }),
+      "utf8",
+    );
+    const staleAt = new Date(Date.now() - 10 * 60_000);
+    utimesSync(markerPath, staleAt, staleAt);
+
+    await withGitRace("replace-reclaim-marker-with-directory", { PI_WT_RECLAIM_MARKER: markerPath }, async () => {
+      assert.equal(await reapOrphanedWorktrees(repo), 0, "failed marker cleanup is retained for a later retry");
+    });
+
+    assert.equal(existsSync(worktree.cwd), true, "healthy checkout is preserved");
+    assert.notEqual(git("branch", "--list", worktree.branch).toString("utf8").trim(), "", "branch is preserved");
   } finally {
     rmSync(repo, { recursive: true, force: true });
   }

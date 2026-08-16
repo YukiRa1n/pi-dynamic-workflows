@@ -1,16 +1,18 @@
+import { join } from "node:path";
 import { defineTool } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { aggregateAgentUsage, tokenFigures } from "./display.js";
 import { assertSafeRunId } from "./run-persistence.js";
+import { DEFAULT_WORKFLOW_RESULT_CHARS, summarizeWorkflowResult } from "./workflow-result-projection.js";
 // A tool's top-level parameter schema must be a JSON Schema object (`type:
 // "object"`). A discriminated Type.Union of two objects serializes to a
 // top-level `anyOf` with no `type`, which strict providers (e.g. DeepSeek)
 // reject with "schema must be type object, got type: null". So the schema is a
 // single strict object. Detailed inspection is intentionally absent: status
-// polling caused self-sustaining provider loops instead of waiting for
-// workflow-result. The separate model-facing list exposes cancellation handles
-// only; it does not expose progress or historical inspection.
+// polling caused self-sustaining provider loops. The model-facing list exposes
+// cancellation handles only; get_workflow_output provides one event-driven
+// wait, while progress and historical inspection remain outside this surface.
 const workflowControlSchema = Type.Object({
     action: Type.Union([Type.Literal("pause"), Type.Literal("resume"), Type.Literal("stop")], {
         description: "Lifecycle action.",
@@ -20,11 +22,22 @@ const workflowControlSchema = Type.Object({
 const stopWorkflowSchema = Type.Object({
     runId: Type.String({
         minLength: 1,
-        description: "Exact run ID returned by start_workflow.",
     }),
 }, { additionalProperties: false });
 const listActiveWorkflowsSchema = Type.Object({}, { additionalProperties: false });
+const getWorkflowOutputSchema = Type.Object({
+    runId: Type.String({
+        minLength: 1,
+    }),
+    block: Type.Optional(Type.Boolean()),
+    timeoutMs: Type.Optional(Type.Integer({
+        minimum: 1,
+        maximum: 600_000,
+    })),
+}, { additionalProperties: false });
 const MAX_MODEL_VISIBLE_ACTIVE_RUNS = 64;
+const MAX_WORKFLOW_OUTPUT_WAIT_MS = 600_000;
+const WORKFLOW_OUTPUT_END_EVENTS = ["complete", "error", "stopped", "paused", "deleted"];
 /** Exact cancellation handles for active runs owned by the bound Pi session. */
 export function createListActiveWorkflowsTool(options) {
     const getManager = () => {
@@ -36,7 +49,7 @@ export function createListActiveWorkflowsTool(options) {
     return defineTool({
         name: "list_active_workflows",
         label: "List active workflows",
-        description: "List active workflows owned by this Pi session, returning exact run IDs for cancellation.",
+        description: "List current-session workflow IDs for cancellation only. Never poll; use get_workflow_output to wait.",
         parameters: listActiveWorkflowsSchema,
         prepareArguments: normalizeListActiveWorkflowsInput,
         async execute() {
@@ -74,6 +87,92 @@ export function createListActiveWorkflowsTool(options) {
         },
     });
 }
+/** One-shot, session-owned output retrieval with an interruptible event wait. */
+export function createGetWorkflowOutputTool(options) {
+    const getManager = () => {
+        const manager = options.getManager?.() ?? options.manager;
+        if (!manager)
+            throw new Error("get_workflow_output: no WorkflowManager configured");
+        return manager;
+    };
+    return defineTool({
+        name: "get_workflow_output",
+        label: "Get workflow output",
+        description: "Wait once for a current-session workflow output (default 10 min; Esc cancels only the wait). Never poll list_active_workflows or use shell sleep; results also arrive automatically.",
+        parameters: getWorkflowOutputSchema,
+        prepareArguments: normalizeGetWorkflowOutputInput,
+        executionMode: "sequential",
+        async execute(_toolCallId, params, signal) {
+            const block = params.block ?? true;
+            const timeoutMs = params.timeoutMs ?? MAX_WORKFLOW_OUTPUT_WAIT_MS;
+            let manager;
+            try {
+                manager = getManager();
+            }
+            catch (error) {
+                return workflowOutputError(params.runId, block, errorText(error));
+            }
+            try {
+                const sessionId = currentSessionId(manager, options);
+                if (!sessionId) {
+                    return workflowOutputError(params.runId, block, "current session ownership is unavailable");
+                }
+                const initial = ownedRun(manager, params.runId, sessionId);
+                if (!initial)
+                    return workflowOutputError(params.runId, block, "run not found in current session");
+                let outcome = "ready";
+                if (block && initial.status === "running") {
+                    outcome = await waitForWorkflowOutput(manager, params.runId, sessionId, timeoutMs, signal);
+                }
+                if (outcome === "interrupted") {
+                    return {
+                        ...workflowOutputState(manager, initial, block, options, {
+                            interrupted: true,
+                            message: "Workflow output wait was interrupted. The workflow continues in the background.",
+                        }),
+                        // Pi's tool loop otherwise performs one more model iteration with
+                        // the already-aborted signal before it can observe stopReason=aborted.
+                        // End this main-session turn directly; the detached workflow owns a
+                        // different AbortController and remains running.
+                        terminate: true,
+                    };
+                }
+                const current = ownedRun(manager, params.runId, sessionId);
+                if (!current) {
+                    return workflowOutputError(params.runId, block, "run was deleted while waiting");
+                }
+                if (current.status !== "running")
+                    return workflowOutputState(manager, current, block, options);
+                if (outcome === "timeout") {
+                    return workflowOutputState(manager, current, block, options, {
+                        timedOut: true,
+                        message: "Workflow is still running after the wait timeout. Do not poll; its terminal output will be delivered automatically.",
+                    });
+                }
+                return workflowOutputState(manager, current, block, options, {
+                    message: "Workflow is still running. Call with block=true once if the current task must wait for its result.",
+                });
+            }
+            catch (error) {
+                return workflowOutputError(params.runId, block, errorText(error));
+            }
+        },
+        renderCall(args, theme) {
+            const runId = typeof args?.runId === "string" ? shortRunId(args.runId) : "";
+            const suffix = runId ? theme.fg("dim", ` · ${runId}`) : "";
+            return new Text(`${theme.fg("toolTitle", theme.bold("get workflow output"))}${suffix}`, 0, 0);
+        },
+        renderResult(toolResult, _options, theme) {
+            const details = toolResult.details;
+            const label = details.error
+                ? `Unavailable: ${details.error}`
+                : details.completed
+                    ? `Completed ${details.runId}`
+                    : `${details.status ?? "unknown"} ${details.runId}`;
+            return new Text(theme.fg(details.error ? "warning" : details.completed ? "success" : "muted", label), 0, 0);
+        },
+    });
+}
 /**
  * Provider-facing cancellation handle. It deliberately exposes no discovery,
  * status, pause, resume, or steering surface: the caller must use the exact ID
@@ -90,7 +189,7 @@ export function createStopWorkflowTool(options) {
     return defineTool({
         name: "stop_workflow",
         label: "Stop workflow",
-        description: "Stop one workflow started in this Pi session when cancellation is requested or the preceding start was mistaken. Exact runId required.",
+        description: "Stop one workflow in this Pi session. Exact runId required.",
         parameters: stopWorkflowSchema,
         prepareArguments: normalizeStopWorkflowInput,
         async execute(_toolCallId, params) {
@@ -251,6 +350,162 @@ function normalizeListActiveWorkflowsInput(value) {
     if (extraKey)
         throw new Error(`list_active_workflows does not accept ${extraKey}`);
     return value;
+}
+function normalizeGetWorkflowOutputInput(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+        throw new Error("get_workflow_output requires an object argument");
+    }
+    const input = value;
+    const allowedKeys = new Set(["runId", "block", "timeoutMs"]);
+    const extraKey = Object.keys(input).find((key) => !allowedKeys.has(key));
+    if (extraKey)
+        throw new Error(`get_workflow_output does not accept ${extraKey}`);
+    if (typeof input.runId !== "string" || !input.runId.trim()) {
+        throw new Error("get_workflow_output requires runId");
+    }
+    try {
+        assertSafeRunId(input.runId);
+    }
+    catch {
+        throw new Error("get_workflow_output requires a canonical runId");
+    }
+    if (input.block !== undefined && typeof input.block !== "boolean") {
+        throw new Error("get_workflow_output block must be boolean");
+    }
+    if (input.timeoutMs !== undefined) {
+        if (typeof input.timeoutMs !== "number" ||
+            !Number.isSafeInteger(input.timeoutMs) ||
+            input.timeoutMs < 1 ||
+            input.timeoutMs > MAX_WORKFLOW_OUTPUT_WAIT_MS) {
+            throw new Error(`get_workflow_output timeoutMs must be an integer from 1 to ${MAX_WORKFLOW_OUTPUT_WAIT_MS}`);
+        }
+    }
+    return {
+        runId: input.runId,
+        block: input.block ?? true,
+        timeoutMs: typeof input.timeoutMs === "number" ? input.timeoutMs : MAX_WORKFLOW_OUTPUT_WAIT_MS,
+    };
+}
+function waitForWorkflowOutput(manager, runId, sessionId, timeoutMs, signal) {
+    return new Promise((resolve, reject) => {
+        if (typeof manager.on !== "function" || typeof manager.off !== "function") {
+            reject(new Error("workflow manager does not support output waiting"));
+            return;
+        }
+        let settled = false;
+        let timer;
+        const cleanup = () => {
+            if (timer)
+                clearTimeout(timer);
+            for (const eventName of WORKFLOW_OUTPUT_END_EVENTS)
+                manager.off(eventName, onTerminalEvent);
+            signal?.removeEventListener("abort", onAbort);
+        };
+        const finish = (outcome) => {
+            if (settled)
+                return;
+            settled = true;
+            cleanup();
+            resolve(outcome);
+        };
+        const onTerminalEvent = (event) => {
+            if (isRecord(event) && event.runId === runId)
+                finish("ready");
+        };
+        const onAbort = () => finish("interrupted");
+        for (const eventName of WORKFLOW_OUTPUT_END_EVENTS)
+            manager.on(eventName, onTerminalEvent);
+        signal?.addEventListener("abort", onAbort, { once: true });
+        if (signal?.aborted)
+            finish("interrupted");
+        if (!settled) {
+            // Subscribe before re-reading. Completion between the caller's initial
+            // read and listener installation is therefore observed by either the
+            // event or this second persisted-state read.
+            const current = ownedRun(manager, runId, sessionId);
+            if (current?.status !== "running")
+                finish("ready");
+        }
+        if (!settled) {
+            timer = setTimeout(() => finish("timeout"), timeoutMs);
+        }
+    });
+}
+function ownedRun(manager, runId, sessionId) {
+    const run = manager.listRuns().find((candidate) => isPersistedRunState(candidate) && candidate.runId === runId);
+    return run?.sessionId === sessionId ? run : undefined;
+}
+function workflowOutputState(manager, run, blocked, options, state = {}) {
+    const resultPath = persistedResultPath(manager, run.runId);
+    const completed = run.status === "completed";
+    const details = {
+        runId: run.runId,
+        status: run.status,
+        completed,
+        blocked,
+        ...(state.timedOut ? { timedOut: true } : {}),
+        ...(state.interrupted ? { interrupted: true } : {}),
+        ...(resultPath ? { resultPath } : {}),
+    };
+    let text;
+    if (state.message) {
+        text = `${state.message} (run ${run.runId}, status ${run.status}).`;
+    }
+    else if (completed) {
+        const output = summarizeWorkflowResult(run.result, workflowResultMaxChars(options));
+        text = [`Workflow completed (run ${run.runId}).`, "", output].join("\n");
+    }
+    else if (run.status === "failed") {
+        const error = liveRunError(manager, run.runId) ?? "unknown error";
+        details.error = error;
+        text = `Workflow failed (run ${run.runId}): ${error}.`;
+    }
+    else if (run.status === "paused") {
+        text = `Workflow is paused (run ${run.runId}). Resume it through /workflows if the same task should continue.`;
+    }
+    else if (run.status === "aborted") {
+        text = `Workflow was aborted (run ${run.runId}).`;
+    }
+    else {
+        text = `Workflow output is not ready (run ${run.runId}, status ${run.status}).`;
+    }
+    if (resultPath)
+        text = `${text}\n\nFull persisted run: ${resultPath}`;
+    return { content: [{ type: "text", text }], details };
+}
+function workflowOutputError(runId, blocked, error) {
+    return {
+        content: [{ type: "text", text: `Workflow output unavailable (run ${runId}): ${error}.` }],
+        details: { runId, completed: false, blocked, error },
+    };
+}
+function workflowResultMaxChars(options) {
+    try {
+        const configured = options.getResultMaxChars?.();
+        if (typeof configured === "number" && Number.isFinite(configured)) {
+            return Math.max(1, Math.min(1_000_000, Math.floor(configured)));
+        }
+    }
+    catch {
+        // Presentation settings must not make durable output unreadable.
+    }
+    return DEFAULT_WORKFLOW_RESULT_CHARS;
+}
+function persistedResultPath(manager, runId) {
+    try {
+        return join(manager.getPersistence().getRunsDir(), `${runId}.json`);
+    }
+    catch {
+        return undefined;
+    }
+}
+function liveRunError(manager, runId) {
+    try {
+        return manager.getRun(runId)?.error?.message;
+    }
+    catch {
+        return undefined;
+    }
 }
 function listActiveWorkflowResult(runs, truncated, error) {
     const content = error

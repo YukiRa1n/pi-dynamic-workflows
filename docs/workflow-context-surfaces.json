@@ -1,5 +1,5 @@
 {
-  "formatVersion": 8,
+  "formatVersion": 9,
   "encoding": "utf8",
   "sources": [
     "src/workflow-tool.ts",
@@ -15,26 +15,31 @@
     },
     "providerVisibleWorkflowToolDefinition": {
       "serialization": "UTF-8 bytes of the stable JSON.stringify({ name, description, parameters }) workflow definition",
-      "bytes": 737
+      "bytes": 617
     },
     "providerVisibleAlwaysOnToolDefinitions": {
       "serialization": "sum of stable provider-visible workflow tool definitions on ordinary turns",
-      "bytes": 1319,
+      "bytes": 1529,
       "tools": [
         {
           "name": "start_workflow",
           "serialization": "UTF-8 bytes of JSON.stringify({ name, description, parameters })",
-          "bytes": 737
+          "bytes": 617
         },
         {
           "name": "list_active_workflows",
           "serialization": "UTF-8 bytes of JSON.stringify({ name, description, parameters })",
-          "bytes": 214
+          "bytes": 226
+        },
+        {
+          "name": "get_workflow_output",
+          "serialization": "UTF-8 bytes of JSON.stringify({ name, description, parameters })",
+          "bytes": 450
         },
         {
           "name": "stop_workflow",
           "serialization": "UTF-8 bytes of JSON.stringify({ name, description, parameters })",
-          "bytes": 368
+          "bytes": 236
         }
       ]
     },
@@ -48,11 +53,11 @@
     },
     "stableWorkflowOwnedContext": {
       "serialization": "sum of the stable Pi prompt and provider workflow definitions",
-      "bytes": 1319
+      "bytes": 1529
     },
     "explicitWorkflowRequestOwnedContext": {
       "serialization": "stable workflow-owned context plus the explicit-request suffix",
-      "bytes": 1342
+      "bytes": 1552
     },
     "registeredSkillsDiscovery": {
       "serialization": "sum of UTF-8 bytes of normalized Pi skill XML (name + description + location) across every root in package.json's pi.skills",
@@ -72,12 +77,12 @@
     },
     "ordinaryWorkflowOwnedAlwaysOn": {
       "serialization": "sum of the stable workflow definition and every registered skill discovery entry",
-      "bytes": 1772
+      "bytes": 1982
     },
     "workflowAuthoringSkillCorpus": {
       "serialization": "sum of UTF-8 bytes for every file under skills/workflow-authoring",
       "files": 28,
-      "bytes": 76706
+      "bytes": 76722
     },
     "representativeAuthoringProfiles": {
       "serialization": "sum of UTF-8 bytes for each profile's declared package-relative files",

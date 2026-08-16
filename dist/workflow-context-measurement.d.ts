@@ -33,7 +33,7 @@ export interface ToolDefinitionSurface extends ByteSurface {
 }
 /** Versioned byte measurements for always-on, discovery, corpus, and representative authoring surfaces. */
 export interface WorkflowContextMeasurement {
-    formatVersion: 8;
+    formatVersion: 9;
     encoding: "utf8";
     sources: [
         "src/workflow-tool.ts",

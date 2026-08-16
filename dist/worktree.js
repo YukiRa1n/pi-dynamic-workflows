@@ -259,7 +259,8 @@ async function reapReclaimMarkers(repoRoot) {
         // the stale marker itself is the only artifact to reclaim.
         if (marker.state !== "cleanup" && branchMarker === marker.ownerToken && sidecarProof) {
             if (removeReclaimMarker(markerPath))
-                continue;
+                reaped++;
+            continue;
         }
         if (!(await isRegisteredWorktree(candidate))) {
             // A crash during `worktree add` can leave the branch without a registered

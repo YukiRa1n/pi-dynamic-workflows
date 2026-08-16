@@ -197,6 +197,43 @@ test("SharedStore.discardDelta must not clobber a concurrent sibling's legitimat
   );
 });
 
+test("SharedStore discarding concurrent failed writers skips failed predecessors", () => {
+  const store = new SharedStore();
+  store.put("k", "pre");
+  store.trackPut("k", "failed-A", "run-1:A");
+  store.trackPut("k", "failed-B", "run-1:B");
+
+  store.discardDelta("run-1:A");
+  assert.equal(store.get("k"), "failed-B", "the later live writer remains visible while it is still active");
+  store.discardDelta("run-1:B");
+  assert.equal(store.get("k"), "pre", "rollback must skip A after A and B both fail");
+});
+
+test("SharedStore version chains preserve committed predecessors across concurrent rollback", () => {
+  const store = new SharedStore();
+  store.put("k", "pre");
+  store.trackPut("k", "committed-A", "run-1:A");
+  store.trackPut("k", "failed-B", "run-1:B");
+
+  assert.deepEqual(store.commitDelta("run-1:A"), { k: "committed-A" });
+  assert.equal(store.get("k"), "failed-B");
+  store.discardDelta("run-1:B");
+  assert.equal(store.get("k"), "committed-A", "B must roll back to A after A commits beneath it");
+});
+
+test("SharedStore version chains handle interleaved repeat writes by one failing delta", () => {
+  const store = new SharedStore();
+  store.put("k", "pre");
+  store.trackPut("k", "failed-A1", "run-1:A");
+  store.trackPut("k", "live-B", "run-1:B");
+  store.trackPut("k", "failed-A2", "run-1:A");
+
+  store.discardDelta("run-1:A");
+  assert.equal(store.get("k"), "live-B", "both of A's interleaved nodes must be skipped");
+  store.discardDelta("run-1:B");
+  assert.equal(store.get("k"), "pre", "discarding B must also skip A's older failed node");
+});
+
 test("SharedStore.discardDelta still rolls back a key untouched by any concurrent sibling", () => {
   const store = new SharedStore();
   store.put("k", "pre");

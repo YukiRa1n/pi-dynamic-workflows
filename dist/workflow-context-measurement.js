@@ -1,6 +1,6 @@
 import { readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, relative } from "node:path";
-import { createListActiveWorkflowsTool, createStopWorkflowTool } from "./workflow-control-tool.js";
+import { createGetWorkflowOutputTool, createListActiveWorkflowsTool, createStopWorkflowTool, } from "./workflow-control-tool.js";
 import { buildArmedWorkflowPrompt, buildForcedWorkflowPrompt } from "./workflow-editor.js";
 import { createWorkflowTool } from "./workflow-tool.js";
 /** Package-relative generated context-measurement artifact. */
@@ -148,7 +148,12 @@ export function measureWorkflowContextSurfaces(root = ROOT) {
             throw new Error("context measurement only");
         },
     });
-    const alwaysOnTools = [tool, listTool, stopTool];
+    const outputTool = createGetWorkflowOutputTool({
+        getManager: () => {
+            throw new Error("context measurement only");
+        },
+    });
+    const alwaysOnTools = [tool, listTool, outputTool, stopTool];
     const permanentWorkflowPrompt = [
         ...(tool.promptSnippet ? [`- workflow: ${tool.promptSnippet}`] : []),
         ...(tool.promptGuidelines ?? []).map((guideline) => `- ${guideline}`),
@@ -187,7 +192,7 @@ export function measureWorkflowContextSurfaces(root = ROOT) {
     const armedRewriteBytes = bytes(buildArmedWorkflowPrompt(""));
     const forcedRewriteBytes = bytes(buildForcedWorkflowPrompt(""));
     return {
-        formatVersion: 8,
+        formatVersion: 9,
         encoding: "utf8",
         sources: [
             "src/workflow-tool.ts",

@@ -160,6 +160,8 @@ export {
 export { registerWorkflowCommands } from "./workflow-commands.js";
 export type {
   ActiveWorkflowHandle,
+  GetWorkflowOutputInput,
+  GetWorkflowOutputResultDetails,
   ListActiveWorkflowsInput,
   ListActiveWorkflowsResultDetails,
   StopWorkflowInput,
@@ -169,6 +171,7 @@ export type {
   WorkflowControlToolOptions,
 } from "./workflow-control-tool.js";
 export {
+  createGetWorkflowOutputTool,
   createListActiveWorkflowsTool,
   createStopWorkflowTool,
   createWorkflowControlTool,
@@ -210,6 +213,10 @@ export {
   WorkflowResourceCoordinator,
   type WorkflowResourceCoordinatorOptions,
 } from "./workflow-resource-coordinator.js";
+export {
+  DEFAULT_WORKFLOW_RESULT_CHARS,
+  summarizeWorkflowResult,
+} from "./workflow-result-projection.js";
 export type {
   CapturedWorkflowRoutingCall,
   WorkflowRoutingChoiceEvaluation,

@@ -29,7 +29,7 @@ Every exact fact below is projected from the installed extension's capability co
 - Constraint: selector priority is explicit model > agentType model > tier > phase model > metadata model > implicit medium > session default
 - Constraint: an explicit model, agentType model, tier, or phase model that resolves to an unavailable model throws MODEL_NOT_FOUND naming the source (e.g. the tier and what it resolved to) instead of falling back
 - Constraint: only the implicit default medium tier (no explicit model, tier, agentType, or phase model requested) degrades to the session default when unavailable, logging a one-time run-visible warning instead of throwing
-- Constraint: worktree isolation is best-effort; failure logs that isolation was ignored and continues without an isolated working directory
+- Constraint: worktree isolation is fail-closed; failure throws a nonrecoverable agent execution error before the agent can use the shared working directory
 
 <a id="parallel"></a>
 ## parallel

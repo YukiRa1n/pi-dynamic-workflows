@@ -643,21 +643,43 @@ export function createRunPersistence(cwd, fsOverride, options) {
         invalidateListCache();
     };
     deleteRunFiles = (runId, lease) => {
-        let deleted = false;
-        for (const path of candidateRunPaths(runId)) {
+        const paths = candidateRunPaths(runId);
+        let hadRecord = paths.some((path) => _existsSync(path) || _existsSync(`${path}.bak`));
+        // The primary records are the publication boundary. Keep every backup and
+        // lease intact until all primaries are gone so a transient Windows unlink
+        // failure cannot strand a live manager without either recovery data or its
+        // ownership token.
+        for (const path of paths) {
+            try {
+                _unlinkSync(path);
+                hadRecord = true;
+                removeFileStateCache(path);
+            }
+            catch (err) {
+                if (err.code !== "ENOENT")
+                    return false;
+            }
+        }
+        if (!hadRecord)
+            return false;
+        // A backup is itself a recoverable record. If it cannot be removed, report
+        // failure and retain the lease so the current owner can retry safely.
+        for (const path of paths) {
+            try {
+                _unlinkSync(`${path}.bak`);
+                removeFileStateCache(`${path}.bak`);
+            }
+            catch (err) {
+                if (err.code !== "ENOENT")
+                    return false;
+            }
+        }
+        for (const path of paths) {
             const dir = path === primaryRunPath(runId) ? runsDir : legacyRunsDir;
-            // Best-effort cleanup of the sidecar files alongside the primary.
-            for (const sidecar of [`${path}.bak`, `${path}.tmp`, join(dir, `${runId}.log`)]) {
+            // Non-record sidecars are best-effort after the durable record is gone.
+            for (const sidecar of [`${path}.tmp`, join(dir, `${runId}.log`)]) {
                 unlinkIfExistsSafe(fs, sidecar);
                 removeFileStateCache(sidecar);
-            }
-            const lock = lockPath(dir, runId);
-            // Never unlink a lock that no longer carries the lease used for this
-            // deletion; another process may have acquired it between verification
-            // and publication cleanup.
-            if (!lease || readLockAt(lock, runId, path)?.token === lease.token) {
-                unlinkIfExistsSafe(fs, lock);
-                removeFileStateCache(lock);
             }
             // Atomic writers use unique `<run>.json.<token>.tmp` names. Remove only
             // this run's abandoned temporaries; never sweep unrelated records.
@@ -673,11 +695,19 @@ export function createRunPersistence(cwd, fsOverride, options) {
             catch {
                 // Retention/deletion remains best-effort if the directory disappears.
             }
-            if (unlinkIfExistsSafe(fs, path))
-                deleted = true;
-            removeFileStateCache(path);
         }
-        return deleted;
+        // Release publication locks last. Never unlink a lock that no longer
+        // carries the lease used for this deletion; another process may have
+        // acquired it between verification and cleanup.
+        for (const path of paths) {
+            const dir = path === primaryRunPath(runId) ? runsDir : legacyRunsDir;
+            const lock = lockPath(dir, runId);
+            if (!lease || readLockAt(lock, runId, path)?.token === lease.token) {
+                unlinkIfExistsSafe(fs, lock);
+                removeFileStateCache(lock);
+            }
+        }
+        return true;
     };
     const durableBytes = (runId) => {
         let bytes = 0;

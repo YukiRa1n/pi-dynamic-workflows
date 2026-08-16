@@ -8,7 +8,8 @@
 import { join } from "node:path";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { aggregateAgentUsage, fmtCost, fmtTokenSegment, shorten, statusIcon, tokenFigures, } from "./display.js";
-import { serializeBounded, truncateUtf8 } from "./safe-serialize.js";
+import { truncateUtf8 } from "./safe-serialize.js";
+import { DEFAULT_WORKFLOW_RESULT_CHARS, summarizeWorkflowResult } from "./workflow-result-projection.js";
 import { shortModel } from "./workflow-ui.js";
 // `tokenUsage` is included so the detailed panel's live token/s counter refreshes
 // as tokens accrue (not only on agent start/end). It is harmless in compact mode —
@@ -29,7 +30,6 @@ const RUN_EVENTS = [
 const RUN_END_EVENTS = ["complete", "error", "stopped", "paused", "deleted"];
 const MAX_TOKEN_SAMPLES_PER_RUN = 128;
 const MAX_TOKEN_SAMPLE_RUNS = 1024;
-const DEFAULT_DELIVERY_RESULT_CHARS = 12_000;
 /** Standalone retry projections are only a cache. Durable terminal deliveries
  * remain authoritative in WorkflowManager's outbox and are reconstructed on
  * every resume, so this queue can be hard-bounded without losing results. */
@@ -39,83 +39,6 @@ const MAX_PENDING_DELIVERY_PROJECTIONS = 32;
  * stay in the outbox for a later generation instead of expanding a process-
  * lifetime dedup set without limit. */
 const MAX_STANDALONE_SUBMISSIONS_PER_GENERATION = 512;
-/**
- * Build a bounded provider-visible projection of the workflow's semantic return
- * value. The complete value remains in the persisted run and interactive pager.
- * We intentionally use the workflow return — never "the last agent" — because
- * execution order is not a product contract. Strings are the common final-report
- * shape; structured returns are serialized deterministically and truncated with
- * an explicit retrieval pointer supplied by deliverText().
- */
-function summarizeResult(result, maxChars = DEFAULT_DELIVERY_RESULT_CHARS) {
-    const limit = Math.max(1, Math.floor(maxChars));
-    let serialized;
-    if (typeof result === "string") {
-        serialized = result;
-    }
-    else if (result && typeof result === "object" && !Array.isArray(result)) {
-        const record = result;
-        // Inspect data descriptors only: a provider projection must not invoke a
-        // getter/proxy conversion merely to find the preferred report field.
-        let preferredKey;
-        let artifact;
-        try {
-            for (const key of ["report", "synthesis", "summary", "answer"]) {
-                const descriptor = Object.getOwnPropertyDescriptor(record, key);
-                if (!descriptor || descriptor.get || descriptor.set || typeof descriptor.value !== "string")
-                    continue;
-                if (descriptor.value.trim()) {
-                    preferredKey = key;
-                    artifact = descriptor.value;
-                    break;
-                }
-            }
-        }
-        catch {
-            // The complete value remains durable; an inaccessible projection simply
-            // falls back to the bounded descriptor traversal.
-        }
-        if (preferredKey && artifact !== undefined) {
-            const metadata = Object.create(null);
-            try {
-                for (const key of Reflect.ownKeys(record)) {
-                    if (typeof key !== "string" || key === preferredKey)
-                        continue;
-                    const descriptor = Object.getOwnPropertyDescriptor(record, key);
-                    if (!descriptor)
-                        metadata[key] = "[Unserializable node]";
-                    else if (descriptor.get || descriptor.set)
-                        metadata[key] = "[Accessor]";
-                    else
-                        metadata[key] = descriptor.value;
-                }
-            }
-            catch {
-                // Keep the artifact even when a proxy refuses metadata inspection.
-            }
-            serialized = `${artifact}\n\n[Workflow metadata]\n${serializeBounded(metadata, { maxBytes: limit + 512 })}`;
-        }
-        else {
-            serialized = serializeBounded(result, { maxBytes: limit + 512 });
-        }
-    }
-    else {
-        serialized = serializeBounded(result, { maxBytes: limit + 512 });
-    }
-    if (Buffer.byteLength(serialized, "utf8") <= limit)
-        return serialized;
-    // Keep both beginning and end: prefix-only truncation can hide conclusions,
-    // caveats, or security findings placed at the tail. Exact content remains in
-    // the durable run record. The internal serializer cap above ensures this
-    // branch never traverses a giant value before projection.
-    const marker = `\n\n[... middle omitted; final workflow result projected to ${limit} characters ...]\n\n`;
-    if (limit <= marker.length)
-        return truncateUtf8(marker, limit, "");
-    const available = limit - Buffer.byteLength(marker, "utf8");
-    const head = Math.ceil(available * 0.7);
-    const tail = available - head;
-    return `${truncateUtf8(serialized, head, "")}${marker}${truncateUtf8(serialized.slice(-tail), tail, "")}`;
-}
 function safeAgentSnapshots(value) {
     if (!Array.isArray(value))
         return [];
@@ -134,8 +57,8 @@ function fitLine(line, width) {
 export function deliverText(run, opts = {}) {
     const maxChars = typeof opts.maxChars === "number" && Number.isFinite(opts.maxChars)
         ? Math.max(0, Math.floor(opts.maxChars))
-        : DEFAULT_DELIVERY_RESULT_CHARS;
-    const summary = summarizeResult(run.result?.result, maxChars);
+        : DEFAULT_WORKFLOW_RESULT_CHARS;
+    const summary = summarizeWorkflowResult(run.result?.result, maxChars);
     const tu = run.result?.tokenUsage;
     const cost = tu?.cost ? ` · ${fmtCost(tu.cost)}` : "";
     const segment = fmtTokenSegment(tokenFigures(tu), fmtTokensShort);

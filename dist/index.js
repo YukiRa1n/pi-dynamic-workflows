@@ -25,11 +25,12 @@ export { createWebFetchTool, createWebSearchTool, createWebTools } from "./web-t
 export { parseWorkflowScript, runWorkflow } from "./workflow.js";
 export { CapabilityClassification, CapabilityOrigin, CapabilitySupport, DiagnosticSeverity, DiscoveryPlacement, defineWorkflowCapabilityContract, WORKFLOW_CAPABILITY_CONTRACT, WORKFLOW_CAPABILITY_DEFINITION, WorkflowCapabilityContractError, } from "./workflow-capability-contract.js";
 export { registerWorkflowCommands } from "./workflow-commands.js";
-export { createListActiveWorkflowsTool, createStopWorkflowTool, createWorkflowControlTool, } from "./workflow-control-tool.js";
+export { createGetWorkflowOutputTool, createListActiveWorkflowsTool, createStopWorkflowTool, createWorkflowControlTool, } from "./workflow-control-tool.js";
 export { buildArmedWorkflowPrompt, buildForcedWorkflowPrompt, endsWithTrigger, hasTrigger, hasWorkflowRequestTrigger, installWorkflowKeywordArming, registerWorkflowProgressCommands, registerWorkflowTriggerCommand, } from "./workflow-editor.js";
 export { EXPLICIT_DELIVERY_RATE_WINDOW_MS, MAX_EXPLICIT_DELIVERIES_PER_RUN, MAX_EXPLICIT_DELIVERIES_PER_WINDOW, MAX_EXPLICIT_DELIVERY_BYTES_PER_RUN, WorkflowManager, } from "./workflow-manager.js";
 export { WORKFLOW_HOME_RELATIVE_DIR, WORKFLOW_PROJECTS_SUBDIR, workflowHomeDir, workflowProjectKey, workflowProjectPaths, workflowUserSavedDir, } from "./workflow-paths.js";
 export { defaultWorkflowResourceCoordinator, WorkflowResourceCoordinator, } from "./workflow-resource-coordinator.js";
+export { DEFAULT_WORKFLOW_RESULT_CHARS, summarizeWorkflowResult, } from "./workflow-result-projection.js";
 export { evaluateWorkflowRoutingChoice, WORKFLOW_ROUTING_CHOICE_SCENARIOS } from "./workflow-routing-choice.js";
 export { assertSafeSavedWorkflowName, createWorkflowStorage, isSafeSavedWorkflowName } from "./workflow-saved.js";
 export { getWorkflowProjectSettingsPath, getWorkflowSettingsPath, loadWorkflowSettings, saveWorkflowSettings, saveWorkflowSettingsForCwd, } from "./workflow-settings.js";

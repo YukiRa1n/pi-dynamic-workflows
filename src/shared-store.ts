@@ -39,6 +39,22 @@ export interface SharedStoreOptions {
   maxTotalBytes?: number;
 }
 
+type StoreBaselineVersion = {
+  kind: "baseline";
+  existed: boolean;
+  value: unknown;
+  bytes: number;
+};
+
+type StoreWriteVersion = {
+  kind: "write";
+  deltaKey: string;
+  state: "active" | "committed" | "discarded";
+  value: unknown;
+  bytes: number;
+  previous: StoreWriteVersion | StoreBaselineVersion;
+};
+
 export class SharedStore {
   private readonly map = new Map<string, unknown>();
   private readonly valueBytes = new Map<string, number>();
@@ -50,20 +66,14 @@ export class SharedStore {
   // Deltas use a null-prototype object so prototype-sensitive keys like
   // `__proto__` are stored as own data properties (JSON round-trips them).
   private readonly agentDeltas = new Map<string, Record<string, unknown>>();
-  // Pre-write shadow values for the CURRENT delta-key's in-progress writes,
-  // so a failed retry attempt's mutations can be rolled back (see
-  // `discardDelta`) instead of leaking into the live store or a later
-  // successful attempt's recorded delta. Populated lazily by `trackPut` (only
-  // the first write to a given key within the current delta window is
-  // shadowed — later writes to the same key within the same attempt are
-  // already covered by that first shadow) and cleared whenever the delta is
-  // finalized, either way, via `commitDelta`/`discardDelta`.
-  private readonly priorValues = new Map<string, Map<string, { existed: boolean; value: unknown }>>();
-  // Per-key last-writer record: which deltaKey owns the CURRENT value. Used by
-  // `discardDelta` to decide rollback ownership by identity (not value
-  // equality), so a failing attempt can never erase a sibling's same-valued
-  // write (FQ-004). Cleared on commit/discard/dispose for keys this delta owns.
-  private readonly keyOwners = new Map<string, { deltaKey: string }>();
+  // Per-key write-version chains preserve predecessor identity across
+  // concurrent failures. A single current-owner marker cannot represent
+  // `pre → A → B`: discarding A then B would otherwise restore A's failed
+  // value. Nodes are marked committed/discarded and resolved lazily from the
+  // head, so rollback skips every failed predecessor without clobbering a
+  // later live sibling write. Consecutive writes by the same delta coalesce.
+  private readonly keyVersionHeads = new Map<string, StoreWriteVersion>();
+  private readonly deltaVersions = new Map<string, StoreWriteVersion[]>();
   // Delta windows are one-shot. Retiring a window prevents a late tool callback
   // from an exhausted/committed retry attempt from reopening it and contaminating
   // the next attempt (or a disposed run).
@@ -94,8 +104,9 @@ export class SharedStore {
     this.assertLive();
     const admitted = this.admitValue(key, value);
     this.replaceValue(key, admitted.value, admitted.bytes);
-    // Untracked (script-level) writes do not participate in delta ownership.
-    this.keyOwners.delete(key);
+    // An untracked script/replay write is a new stable baseline. Existing
+    // transaction nodes become unreachable and can no longer roll it back.
+    this.keyVersionHeads.delete(key);
   }
 
   /**
@@ -107,22 +118,36 @@ export class SharedStore {
   trackPut(key: string, value: unknown, deltaKey: string): void {
     this.assertDeltaLive(deltaKey, "store write belongs to a completed agent attempt");
     const admitted = this.admitValue(key, value);
-    let priors = this.priorValues.get(deltaKey);
-    if (!priors) {
-      priors = new Map();
-      this.priorValues.set(deltaKey, priors);
-    }
-    // Only shadow the value from BEFORE this delta window started writing to
-    // this key — a second write to the same key within the same attempt must
-    // not overwrite the shadow with its own (already-in-window) value.
-    if (!priors.has(key)) {
-      priors.set(
-        key,
-        this.map.has(key) ? { existed: true, value: this.map.get(key) } : { existed: false, value: undefined },
-      );
+    const head = this.keyVersionHeads.get(key);
+    let nextHead: StoreWriteVersion;
+    if (head?.deltaKey === deltaKey && head.state === "active") {
+      // No sibling write intervened, so the predecessor is unchanged and this
+      // attempt's repeated write can update its existing node in place.
+      head.value = admitted.value;
+      head.bytes = admitted.bytes;
+      nextHead = head;
+    } else {
+      nextHead = {
+        kind: "write",
+        deltaKey,
+        state: "active",
+        value: admitted.value,
+        bytes: admitted.bytes,
+        previous:
+          head ??
+          ({
+            kind: "baseline",
+            existed: this.map.has(key),
+            value: this.map.get(key),
+            bytes: this.valueBytes.get(key) ?? 0,
+          } satisfies StoreBaselineVersion),
+      };
+      this.keyVersionHeads.set(key, nextHead);
+      const versions = this.deltaVersions.get(deltaKey) ?? [];
+      versions.push(nextHead);
+      this.deltaVersions.set(deltaKey, versions);
     }
     this.replaceValue(key, admitted.value, admitted.bytes);
-    this.keyOwners.set(key, { deltaKey });
     let delta = this.agentDeltas.get(deltaKey);
     if (!delta) {
       delta = Object.create(null) as Record<string, unknown>;
@@ -159,13 +184,11 @@ export class SharedStore {
     if (this.retiredDeltas.has(deltaKey)) throw new Error("agent attempt delta is already completed");
     const delta = this.agentDeltas.get(deltaKey) ?? Object.create(null);
     this.retiredDeltas.add(deltaKey);
-    // Drop ownership records for keys this delta owns (they are now durable).
-    for (const key of Object.keys(delta)) {
-      const owner = this.keyOwners.get(key);
-      if (owner?.deltaKey === deltaKey) this.keyOwners.delete(key);
-    }
+    const versions = this.deltaVersions.get(deltaKey) ?? [];
+    for (const version of versions) version.state = "committed";
+    for (const key of new Set(Object.keys(delta))) this.resolveVersionHead(key);
     this.agentDeltas.delete(deltaKey);
-    this.priorValues.delete(deltaKey);
+    this.deltaVersions.delete(deltaKey);
     // Return a normal plain object for API/test compatibility while retaining
     // null-prototype storage internally against prototype-sensitive writes.
     return structuredClone(Object.fromEntries(Object.entries(delta)));
@@ -185,14 +208,10 @@ export class SharedStore {
    * whatever it held immediately before the window started (or deleted, if
    * it did not exist yet) — never to some other attempt's or caller's value.
    *
-   * Per-key guard: a key is only rolled back if the store's CURRENT value is
-   * still OWNED by this attempt's delta window (tracked by `keyOwners`, not by
-   * value equality). If a concurrently-running sibling (a different `deltaKey`,
-   * e.g. another agent in the same parallel() batch) legitimately overwrote the
-   * same key AFTER this attempt wrote it but BEFORE it failed — including a
-   * write of the exact same primitive or object reference — that sibling's
-   * write is left untouched; rolling back unconditionally would silently erase
-   * a live, unrelated write that this attempt never made.
+   * Per-key guard: discarded version nodes are skipped from the current chain.
+   * A later sibling head remains visible; if that sibling also fails, resolving
+   * its predecessor skips every already-discarded node until it reaches a live
+   * sibling, a committed value, or the original baseline.
    *
    * A no-op if `deltaKey` never wrote anything (nothing to roll back).
    */
@@ -200,21 +219,11 @@ export class SharedStore {
     if (this.disposed || this.retiredDeltas.has(deltaKey)) return;
     this.retiredDeltas.add(deltaKey);
     const delta = this.agentDeltas.get(deltaKey);
-    if (!delta) return;
-    const priors = this.priorValues.get(deltaKey);
-    for (const key of Object.keys(delta)) {
-      // Ownership check by identity: only roll back if THIS delta still owns
-      // the current value (FQ-004 — same-valued sibling writes must survive).
-      if (this.keyOwners.get(key)?.deltaKey !== deltaKey) continue;
-      const prior = priors?.get(key);
-      if (prior?.existed) {
-        const admitted = this.admitValue(key, prior.value);
-        this.replaceValue(key, admitted.value, admitted.bytes);
-      } else this.removeValue(key);
-      this.keyOwners.delete(key);
-    }
+    const versions = this.deltaVersions.get(deltaKey) ?? [];
+    for (const version of versions) version.state = "discarded";
+    for (const key of new Set(Object.keys(delta ?? {}))) this.resolveVersionHead(key);
     this.agentDeltas.delete(deltaKey);
-    this.priorValues.delete(deltaKey);
+    this.deltaVersions.delete(deltaKey);
   }
 
   /**
@@ -230,6 +239,7 @@ export class SharedStore {
     for (const [k, v] of Object.entries(delta)) {
       const admitted = this.admitValue(k, v);
       this.replaceValue(k, admitted.value, admitted.bytes);
+      this.keyVersionHeads.delete(k);
     }
   }
 
@@ -243,13 +253,13 @@ export class SharedStore {
     // keys before clearing their bookkeeping so late tool callbacks cannot
     // reopen an old window and mutate the newly restored snapshot.
     for (const deltaKey of this.agentDeltas.keys()) this.retiredDeltas.add(deltaKey);
-    for (const deltaKey of this.priorValues.keys()) this.retiredDeltas.add(deltaKey);
+    for (const deltaKey of this.deltaVersions.keys()) this.retiredDeltas.add(deltaKey);
     this.map.clear();
     this.valueBytes.clear();
     this.totalBytes = 0;
     this.agentDeltas.clear();
-    this.priorValues.clear();
-    this.keyOwners.clear();
+    this.deltaVersions.clear();
+    this.keyVersionHeads.clear();
     for (const [k, v] of Object.entries(snap)) {
       const admitted = this.admitValue(k, v);
       this.replaceValue(k, admitted.value, admitted.bytes);
@@ -263,8 +273,8 @@ export class SharedStore {
     this.valueBytes.clear();
     this.totalBytes = 0;
     this.agentDeltas.clear();
-    this.priorValues.clear();
-    this.keyOwners.clear();
+    this.deltaVersions.clear();
+    this.keyVersionHeads.clear();
     this.retiredDeltas.clear();
   }
 
@@ -313,6 +323,30 @@ export class SharedStore {
     this.totalBytes -= this.valueBytes.get(key) ?? 0;
     this.valueBytes.delete(key);
     this.map.delete(key);
+  }
+
+  /** Recompute one visible key after a delta commits or is discarded. */
+  private resolveVersionHead(key: string): void {
+    const originalHead = this.keyVersionHeads.get(key);
+    if (!originalHead) return;
+    let resolved: StoreWriteVersion | StoreBaselineVersion = originalHead;
+    while (resolved.kind === "write" && resolved.state === "discarded") resolved = resolved.previous;
+
+    if (resolved.kind === "write" && resolved.state === "active") {
+      if (resolved !== originalHead) {
+        this.replaceValue(key, resolved.value, resolved.bytes);
+        this.keyVersionHeads.set(key, resolved);
+      }
+      return;
+    }
+
+    // A committed visible version is the new durable baseline; predecessors
+    // can never become visible again. Baselines use their captured byte count
+    // so rollback itself cannot fail admission and leak the failed head.
+    if (resolved.kind === "write") this.replaceValue(key, resolved.value, resolved.bytes);
+    else if (resolved.existed) this.replaceValue(key, resolved.value, resolved.bytes);
+    else this.removeValue(key);
+    this.keyVersionHeads.delete(key);
   }
 }
 

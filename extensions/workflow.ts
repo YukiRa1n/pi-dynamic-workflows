@@ -14,6 +14,7 @@ import {
 } from "../src/extension-reload.js";
 import {
   createEffortState,
+  createGetWorkflowOutputTool,
   createListActiveWorkflowsTool,
   createStopWorkflowTool,
   createWebTools,
@@ -1317,9 +1318,15 @@ export default function extension(pi: ExtensionAPI) {
     modelFacing: true,
   });
   const listActiveWorkflowsTool = createListActiveWorkflowsTool({ getManager, getSessionId });
+  const getWorkflowOutputTool = createGetWorkflowOutputTool({
+    getManager,
+    getSessionId,
+    getResultMaxChars: () => loadWorkflowSettings({ cwd: getCwd() }).deliveredResultMaxChars,
+  });
   const stopWorkflowTool = createStopWorkflowTool({ getManager, getSessionId });
   pi.registerTool(workflowTool);
   pi.registerTool(listActiveWorkflowsTool);
+  pi.registerTool(getWorkflowOutputTool);
   pi.registerTool(stopWorkflowTool);
   registerWorkflowMessageRenderers(pi);
   // Keep workflow history as custom entries for the UI, but expose it to the

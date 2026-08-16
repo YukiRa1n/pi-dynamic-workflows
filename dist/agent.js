@@ -321,7 +321,7 @@ export function usageFromStats(stats) {
 }
 /**
  * Orchestration tools always denied to workflow subagents. The stock extension
- * exposes only start, active-list, and exact-ID stop workflow tools, but embedders may also register the library,
+ * exposes only start, active-list, output-wait, and exact-ID stop workflow tools, but embedders may also register the library,
  * lifecycle, or steering tools. Nested background runs would escape the parent's
  * limits and accounting,
  * so all known orchestration names remain fail-closed here. Callers may deny
@@ -330,6 +330,7 @@ export function usageFromStats(stats) {
 export const DEFAULT_EXCLUDED_SUBAGENT_TOOLS = [
     "start_workflow",
     "list_active_workflows",
+    "get_workflow_output",
     "stop_workflow",
     "workflow",
     "workflow_control",

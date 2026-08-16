@@ -331,7 +331,7 @@ test("generated helper facts expose exact callback, option, result, and failure 
   assert.match(agent?.constraints.join(" ") ?? "", /schema noncompliance.*nonrecoverable/i);
   assert.match(agent?.constraints.join(" ") ?? "", /explicit model.*unavailable.*throws MODEL_NOT_FOUND/i);
   assert.match(agent?.constraints.join(" ") ?? "", /implicit default medium tier.*session default when unavailable/i);
-  assert.match(agent?.constraints.join(" ") ?? "", /worktree isolation.*best-effort/i);
+  assert.match(agent?.constraints.join(" ") ?? "", /worktree isolation.*fail-closed/i);
   assert.equal(background, undefined, "public workflow input must not expose a background toggle");
   assert.doesNotMatch(renderSupportedCapabilityTable(), /background\?: boolean/);
   assert.match(metadata?.signature ?? "", /phases\?: Array<\{ title: string; detail\?: string; model\?: string \}>/);

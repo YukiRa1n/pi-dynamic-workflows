@@ -723,6 +723,7 @@ test("DEFAULT_EXCLUDED_SUBAGENT_TOOLS denies the recursive orchestration tools (
   assert.deepEqual(DEFAULT_EXCLUDED_SUBAGENT_TOOLS, [
     "start_workflow",
     "list_active_workflows",
+    "get_workflow_output",
     "stop_workflow",
     "workflow",
     "workflow_control",
@@ -737,6 +738,7 @@ test("subagentExcludedTools always includes the defaults, plus caller/session na
   assert.deepEqual(subagentExcludedTools(), [
     "start_workflow",
     "list_active_workflows",
+    "get_workflow_output",
     "stop_workflow",
     "workflow",
     "workflow_control",
@@ -745,6 +747,7 @@ test("subagentExcludedTools always includes the defaults, plus caller/session na
   assert.deepEqual(subagentExcludedTools(["pi-subagents"]), [
     "start_workflow",
     "list_active_workflows",
+    "get_workflow_output",
     "stop_workflow",
     "workflow",
     "workflow_control",
@@ -755,6 +758,7 @@ test("subagentExcludedTools always includes the defaults, plus caller/session na
   assert.ok(
     merged.includes("start_workflow") &&
       merged.includes("list_active_workflows") &&
+      merged.includes("get_workflow_output") &&
       merged.includes("stop_workflow") &&
       merged.includes("workflow") &&
       merged.includes("workflow_control"),

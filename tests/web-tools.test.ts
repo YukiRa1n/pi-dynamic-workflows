@@ -1,12 +1,47 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  blockedAddress,
   createWebFetchTool,
   createWebSearchTool,
   createWebTools,
   htmlToText,
   parseBingResults,
 } from "../src/web-tools.js";
+
+test("blockedAddress rejects private, reserved, translated, and non-global IP addresses", () => {
+  const blocked = [
+    "127.0.0.1",
+    "192.168.1.1",
+    "::",
+    "::1",
+    "::192.168.1.1",
+    "::7f00:1",
+    "::8.8.8.8",
+    "::ffff:127.0.0.1",
+    "::ffff:7f00:1",
+    "64:ff9b::808:808",
+    "64:ff9b:1::1",
+    "100::1",
+    "100:0:0:1::1",
+    "2001::1",
+    "2001:2::1",
+    "2001:db8::1",
+    "2002:c0a8:101::1",
+    "3fff::1",
+    "5f00::1",
+    "fc00::1",
+    "fe80::1",
+    "fec0::1",
+    "ff02::1",
+  ];
+  for (const address of blocked) assert.equal(blockedAddress(address), true, `${address} must be blocked`);
+});
+
+test("blockedAddress permits public IPv4 and globally reachable IPv6 addresses", () => {
+  const allowed = ["8.8.8.8", "::ffff:8.8.8.8", "2606:4700:4700::1111", "2620:4f:8000::1", "2001:3::1"];
+  for (const address of allowed) assert.equal(blockedAddress(address), false, `${address} must be allowed`);
+});
 
 // ─── createWebSearchTool ─────────────────────────────────────────────────────
 
