@@ -14,6 +14,8 @@ import {
 } from "../src/extension-reload.js";
 import {
   createEffortState,
+  createListActiveWorkflowsTool,
+  createStopWorkflowTool,
   createWebTools,
   createWorkflowStorage,
   createWorkflowTool,
@@ -1303,16 +1305,20 @@ export default function extension(pi: ExtensionAPI) {
     get storage() {
       return storage;
     },
-    // The public Pi surface starts fresh work only. Existing-run lifecycle and
-    // steering are explicit /workflows commands, so a new request cannot be
-    // silently attached to an old workflow by a model tool call.
+    // The start tool creates fresh work only, so a new request cannot be
+    // silently attached to an old workflow. The separate model-facing list and
+    // stop tools expose cancellation handles, not steering or task routing.
     allowResume: false,
     // Keep policy knobs (limits/replay) in the library API, not in the
-    // provider-visible Pi schema. Existing-run lifecycle is explicit below.
+    // provider-visible start schema.
     exposeAdvancedParameters: false,
     modelFacing: true,
   });
+  const listActiveWorkflowsTool = createListActiveWorkflowsTool({ getManager });
+  const stopWorkflowTool = createStopWorkflowTool({ getManager });
   pi.registerTool(workflowTool);
+  pi.registerTool(listActiveWorkflowsTool);
+  pi.registerTool(stopWorkflowTool);
   registerWorkflowMessageRenderers(pi);
   // Keep workflow history as custom entries for the UI, but expose it to the
   // provider as tool_result semantics through the context transform.

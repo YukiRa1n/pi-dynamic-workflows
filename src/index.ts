@@ -159,11 +159,20 @@ export {
 } from "./workflow-capability-contract.js";
 export { registerWorkflowCommands } from "./workflow-commands.js";
 export type {
+  ActiveWorkflowHandle,
+  ListActiveWorkflowsInput,
+  ListActiveWorkflowsResultDetails,
+  StopWorkflowInput,
+  StopWorkflowResultDetails,
   WorkflowControlInput,
   WorkflowControlRunDetails,
   WorkflowControlToolOptions,
 } from "./workflow-control-tool.js";
-export { createWorkflowControlTool } from "./workflow-control-tool.js";
+export {
+  createListActiveWorkflowsTool,
+  createStopWorkflowTool,
+  createWorkflowControlTool,
+} from "./workflow-control-tool.js";
 export {
   type ArmReason,
   buildArmedWorkflowPrompt,

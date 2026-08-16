@@ -2,12 +2,13 @@ import { createHash } from "node:crypto";
 import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, normalize, relative } from "node:path";
 import packageJson from "../package.json" with { type: "json" };
+import { DEFAULT_EXCLUDED_SUBAGENT_TOOLS } from "./agent.js";
 import { CapabilityClassification, CapabilitySupport, DiscoveryPlacement, WorkflowAuthoringProtection, WorkflowReleaseDiagnosticCode, } from "./enums.js";
 import { WORKFLOW_AUTHORING_COVERAGE, WORKFLOW_AUTHORING_FROZEN_FILES, WORKFLOW_AUTHORING_PATTERN_IDS, WORKFLOW_AUTHORING_RECIPE_IDS, WORKFLOW_COMPREHENSION_SCENARIO_IDS, } from "./workflow-authoring-coverage.js";
 import { checkWorkflowCapabilityPublications, } from "./workflow-authoring-reference.js";
 import { WORKFLOW_CAPABILITY_DEFINITION } from "./workflow-capability-contract.js";
 import { checkWorkflowContextMeasurement, WORKFLOW_CONTEXT_MEASUREMENT_PATH } from "./workflow-context-measurement.js";
-import { createWorkflowControlTool } from "./workflow-control-tool.js";
+import { createListActiveWorkflowsTool, createStopWorkflowTool, createWorkflowControlTool, } from "./workflow-control-tool.js";
 import { createWorkflowTool } from "./workflow-tool.js";
 /** Re-exported stable diagnostic codes for release automation. */
 export { WorkflowReleaseDiagnosticCode } from "./enums.js";
@@ -251,6 +252,56 @@ function validateWorkflowControlSurface() {
     }
     return diagnostics;
 }
+function validateStopWorkflowSurface() {
+    const tool = createStopWorkflowTool({
+        getManager: () => {
+            throw new Error("release inspection");
+        },
+    });
+    const parameters = isRecord(tool.parameters) ? tool.parameters : {};
+    const properties = isRecord(parameters.properties) ? parameters.properties : {};
+    const diagnostics = [];
+    if (tool.name !== "stop_workflow" ||
+        parameters.type !== "object" ||
+        parameters.additionalProperties !== false ||
+        Object.keys(properties).length !== 1 ||
+        !isRecord(properties.runId)) {
+        diagnostics.push(diagnostic(WorkflowReleaseDiagnosticCode.TOOL_INPUT_MISMATCH, "stop_workflow", "stop_workflow must expose only one exact runId in a strict top-level object schema."));
+    }
+    if (/\b(?:list|status|pause|resume|steer|latest)\b/iu.test(tool.description)) {
+        diagnostics.push(diagnostic(WorkflowReleaseDiagnosticCode.TOOL_INPUT_MISMATCH, "stop_workflow.description", "stop_workflow description must not advertise discovery, inferred targeting, or broader lifecycle actions."));
+    }
+    return diagnostics;
+}
+function validateListActiveWorkflowsSurface() {
+    const tool = createListActiveWorkflowsTool({
+        getManager: () => {
+            throw new Error("release inspection");
+        },
+    });
+    const parameters = isRecord(tool.parameters) ? tool.parameters : {};
+    const properties = isRecord(parameters.properties) ? parameters.properties : {};
+    const diagnostics = [];
+    if (tool.name !== "list_active_workflows" ||
+        parameters.type !== "object" ||
+        parameters.additionalProperties !== false ||
+        Object.keys(properties).length !== 0) {
+        diagnostics.push(diagnostic(WorkflowReleaseDiagnosticCode.TOOL_INPUT_MISMATCH, "list_active_workflows", "list_active_workflows must expose a strict empty object schema."));
+    }
+    if (/\b(?:history|progress|details?|pause|resume|steer)\b/iu.test(tool.description)) {
+        diagnostics.push(diagnostic(WorkflowReleaseDiagnosticCode.TOOL_INPUT_MISMATCH, "list_active_workflows.description", "list_active_workflows description must stay limited to current-session cancellation handles."));
+    }
+    return diagnostics;
+}
+function validateModelWorkflowToolIsolation() {
+    const required = ["start_workflow", "list_active_workflows", "stop_workflow"];
+    const missing = required.filter((name) => !DEFAULT_EXCLUDED_SUBAGENT_TOOLS.includes(name));
+    if (missing.length === 0)
+        return [];
+    return [
+        diagnostic(WorkflowReleaseDiagnosticCode.TOOL_INPUT_MISMATCH, "DEFAULT_EXCLUDED_SUBAGENT_TOOLS", `Workflow subagents must not receive model-facing orchestration tools: ${missing.join(", ")}.`),
+    ];
+}
 // Every TypeScript source has a package-root dist twin. Keeping the complete
 // list here makes a changed source file a release-gate input instead of relying
 // on a small hand-maintained high-risk subset that can silently drift.
@@ -432,6 +483,9 @@ export function checkWorkflowRelease(options) {
         ...validateFrozenGuidanceFiles(options.root, options.guidanceOverrides),
         ...validateToolInputs(definition),
         ...validateWorkflowControlSurface(),
+        ...validateListActiveWorkflowsSurface(),
+        ...validateStopWorkflowSurface(),
+        ...validateModelWorkflowToolIsolation(),
         ...validatePackage(options.root, options.publishableFiles),
         ...validateChangedSurfaces(options.root, options.publishableFiles, options.changedFiles),
         ...validateGuidanceBaseline(options.root, options.guidanceBaseline),

@@ -399,6 +399,8 @@ export declare class WorkflowManager extends EventEmitter {
     /** Bind the manager to the current pi session, so new runs are tagged with it and
      * the navigator/task-panel show only this session's runs (set on session_start). */
     setSessionId(id: string | undefined): void;
+    /** Current Pi session binding used for ownership-scoped lifecycle actions. */
+    getSessionId(): string | undefined;
     /** Queue a host-session message for one explicitly identified running workflow. */
     enqueueUserMessage(message: string, runId: string, kind: WorkflowSteeringKind): string | undefined;
     /** Atomically take messages queued for a run before its next agent() call. */

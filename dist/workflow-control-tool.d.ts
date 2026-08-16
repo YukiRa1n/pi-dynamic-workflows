@@ -6,7 +6,13 @@ declare const workflowControlSchema: Type.TObject<{
     action: Type.TUnion<[Type.TLiteral<"pause">, Type.TLiteral<"resume">, Type.TLiteral<"stop">]>;
     runId: Type.TString;
 }>;
+declare const stopWorkflowSchema: Type.TObject<{
+    runId: Type.TString;
+}>;
+declare const listActiveWorkflowsSchema: Type.TObject<{}>;
 export type WorkflowControlInput = Static<typeof workflowControlSchema>;
+export type StopWorkflowInput = Static<typeof stopWorkflowSchema>;
+export type ListActiveWorkflowsInput = Static<typeof listActiveWorkflowsSchema>;
 export interface WorkflowControlToolOptions {
     manager?: WorkflowManager;
     /** Live manager accessor; prefer over a closed-over manager when the extension may replace it. */
@@ -34,5 +40,30 @@ export interface WorkflowControlRunDetails {
     inFlightLabels: string[];
     tokenTotal: number;
 }
+export interface StopWorkflowResultDetails {
+    runId: string;
+    stopped: boolean;
+    status?: RunStatus;
+    error?: string;
+}
+export interface ActiveWorkflowHandle {
+    runId: string;
+    name: string;
+    status: "running" | "paused";
+}
+export interface ListActiveWorkflowsResultDetails {
+    runs: ActiveWorkflowHandle[];
+    truncated: boolean;
+    error?: string;
+}
+/** Exact cancellation handles for active runs owned by the bound Pi session. */
+export declare function createListActiveWorkflowsTool(options: WorkflowControlToolOptions): ToolDefinition<typeof listActiveWorkflowsSchema, ListActiveWorkflowsResultDetails>;
+/**
+ * Provider-facing cancellation handle. It deliberately exposes no discovery,
+ * status, pause, resume, or steering surface: the caller must use the exact ID
+ * returned by start_workflow, and the manager must be bound to the owning Pi
+ * session before any mutation is allowed.
+ */
+export declare function createStopWorkflowTool(options: WorkflowControlToolOptions): ToolDefinition<typeof stopWorkflowSchema, StopWorkflowResultDetails>;
 export declare function createWorkflowControlTool(options: WorkflowControlToolOptions): ToolDefinition<typeof workflowControlSchema, Record<string, unknown>>;
 export {};

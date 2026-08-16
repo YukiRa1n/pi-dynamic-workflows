@@ -9,8 +9,10 @@ import type { ManagedRun, WorkflowManager } from "./workflow-manager.js";
 // "object"`). A discriminated Type.Union of two objects serializes to a
 // top-level `anyOf` with no `type`, which strict providers (e.g. DeepSeek)
 // reject with "schema must be type object, got type: null". So the schema is a
-// single strict object. Inspection is intentionally absent: status/list caused
-// self-sustaining provider polling loops instead of waiting for workflow-result.
+// single strict object. Detailed inspection is intentionally absent: status
+// polling caused self-sustaining provider loops instead of waiting for
+// workflow-result. The separate model-facing list exposes cancellation handles
+// only; it does not expose progress or historical inspection.
 const workflowControlSchema = Type.Object(
   {
     action: Type.Union([Type.Literal("pause"), Type.Literal("resume"), Type.Literal("stop")], {
@@ -21,7 +23,23 @@ const workflowControlSchema = Type.Object(
   { additionalProperties: false },
 );
 
+const stopWorkflowSchema = Type.Object(
+  {
+    runId: Type.String({
+      minLength: 1,
+      description: "Exact run ID returned by start_workflow.",
+    }),
+  },
+  { additionalProperties: false },
+);
+
+const listActiveWorkflowsSchema = Type.Object({}, { additionalProperties: false });
+
+const MAX_MODEL_VISIBLE_ACTIVE_RUNS = 64;
+
 export type WorkflowControlInput = Static<typeof workflowControlSchema>;
+export type StopWorkflowInput = Static<typeof stopWorkflowSchema>;
+export type ListActiveWorkflowsInput = Static<typeof listActiveWorkflowsSchema>;
 
 export interface WorkflowControlToolOptions {
   manager?: WorkflowManager;
@@ -56,6 +74,143 @@ type ControlResult = {
   content: Array<{ type: "text"; text: string }>;
   details: Record<string, unknown>;
 };
+
+export interface StopWorkflowResultDetails {
+  runId: string;
+  stopped: boolean;
+  status?: RunStatus;
+  error?: string;
+}
+
+export interface ActiveWorkflowHandle {
+  runId: string;
+  name: string;
+  status: "running" | "paused";
+}
+
+export interface ListActiveWorkflowsResultDetails {
+  runs: ActiveWorkflowHandle[];
+  truncated: boolean;
+  error?: string;
+}
+
+/** Exact cancellation handles for active runs owned by the bound Pi session. */
+export function createListActiveWorkflowsTool(
+  options: WorkflowControlToolOptions,
+): ToolDefinition<typeof listActiveWorkflowsSchema, ListActiveWorkflowsResultDetails> {
+  const getManager = (): WorkflowManager => {
+    const manager = options.getManager?.() ?? options.manager;
+    if (!manager) throw new Error("list_active_workflows: no WorkflowManager configured");
+    return manager;
+  };
+
+  return defineTool({
+    name: "list_active_workflows",
+    label: "List active workflows",
+    description: "List active workflows owned by this Pi session, returning exact run IDs for cancellation.",
+    parameters: listActiveWorkflowsSchema,
+    prepareArguments: normalizeListActiveWorkflowsInput,
+    async execute() {
+      try {
+        const manager = getManager();
+        const sessionId = manager.getSessionId();
+        if (!sessionId) return listActiveWorkflowResult([], false, "current session ownership is unavailable");
+        const active = manager
+          .listRuns()
+          .filter(
+            (run): run is PersistedRunState & { status: "running" | "paused" } =>
+              isPersistedRunState(run) &&
+              run.sessionId === sessionId &&
+              (run.status === "running" || run.status === "paused"),
+          )
+          .sort((a, b) => Date.parse(b.startedAt) - Date.parse(a.startedAt));
+        const runs = active.slice(0, MAX_MODEL_VISIBLE_ACTIVE_RUNS).map(({ runId, workflowName, status }) => ({
+          runId,
+          name: compactWorkflowName(workflowName),
+          status,
+        }));
+        return listActiveWorkflowResult(runs, active.length > runs.length);
+      } catch (error) {
+        return listActiveWorkflowResult([], false, errorText(error));
+      }
+    },
+    renderCall(_args, theme) {
+      return new Text(theme.fg("toolTitle", theme.bold("list active workflows")), 0, 0);
+    },
+    renderResult(toolResult, _options, theme) {
+      const details = toolResult.details;
+      const text = details.error
+        ? `Unavailable: ${details.error}`
+        : `${details.runs.length} active workflow${details.runs.length === 1 ? "" : "s"}`;
+      return new Text(theme.fg(details.error ? "warning" : "success", text), 0, 0);
+    },
+  });
+}
+
+/**
+ * Provider-facing cancellation handle. It deliberately exposes no discovery,
+ * status, pause, resume, or steering surface: the caller must use the exact ID
+ * returned by start_workflow, and the manager must be bound to the owning Pi
+ * session before any mutation is allowed.
+ */
+export function createStopWorkflowTool(
+  options: WorkflowControlToolOptions,
+): ToolDefinition<typeof stopWorkflowSchema, StopWorkflowResultDetails> {
+  const getManager = (): WorkflowManager => {
+    const manager = options.getManager?.() ?? options.manager;
+    if (!manager) throw new Error("stop_workflow: no WorkflowManager configured");
+    return manager;
+  };
+
+  return defineTool({
+    name: "stop_workflow",
+    label: "Stop workflow",
+    description:
+      "Stop one workflow started in this Pi session when cancellation is requested or the preceding start was mistaken. Exact runId required.",
+    parameters: stopWorkflowSchema,
+    prepareArguments: normalizeStopWorkflowInput,
+    async execute(_toolCallId, params) {
+      let manager: WorkflowManager;
+      try {
+        manager = getManager();
+      } catch (error) {
+        return stopWorkflowResult(params.runId, false, undefined, errorText(error));
+      }
+
+      try {
+        const sessionId = manager.getSessionId();
+        if (!sessionId) {
+          return stopWorkflowResult(params.runId, false, undefined, "current session ownership is unavailable");
+        }
+        const run = manager
+          .listRuns()
+          .find((candidate) => isPersistedRunState(candidate) && candidate.runId === params.runId);
+        if (!run || run.sessionId !== sessionId) {
+          return stopWorkflowResult(params.runId, false, undefined, "run not found in current session");
+        }
+        if (run.status !== "running" && run.status !== "paused") {
+          return stopWorkflowResult(params.runId, false, run.status, `cannot stop run with status ${run.status}`);
+        }
+        if (!manager.stop(run.runId)) {
+          return stopWorkflowResult(params.runId, false, run.status, "stop was not accepted");
+        }
+        return stopWorkflowResult(run.runId, true, "aborted");
+      } catch (error) {
+        return stopWorkflowResult(params.runId, false, undefined, errorText(error));
+      }
+    },
+    renderCall(args, theme) {
+      const runId = typeof args?.runId === "string" ? shortRunId(args.runId) : "";
+      const suffix = runId ? theme.fg("dim", ` · ${runId}`) : "";
+      return new Text(`${theme.fg("toolTitle", theme.bold("stop workflow"))}${suffix}`, 0, 0);
+    },
+    renderResult(toolResult, _options, theme) {
+      const details = toolResult.details;
+      const label = details.stopped ? `Stopped ${details.runId}` : `Not stopped: ${details.error ?? details.runId}`;
+      return new Text(theme.fg(details.stopped ? "success" : "warning", label), 0, 0);
+    },
+  });
+}
 
 export function createWorkflowControlTool(
   options: WorkflowControlToolOptions,
@@ -142,6 +297,77 @@ function normalizeInput(value: unknown): WorkflowControlInput {
     throw new Error(`workflow_control action "${input.action}" requires a canonical runId`);
   }
   return input as WorkflowControlInput;
+}
+
+function normalizeStopWorkflowInput(value: unknown): StopWorkflowInput {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("stop_workflow requires an object argument");
+  }
+  const input = value as Record<string, unknown>;
+  const extraKey = Object.keys(input).find((key) => key !== "runId");
+  if (extraKey) throw new Error(`stop_workflow does not accept ${extraKey}`);
+  if (typeof input.runId !== "string" || !input.runId.trim()) {
+    throw new Error("stop_workflow requires runId");
+  }
+  try {
+    assertSafeRunId(input.runId);
+  } catch {
+    throw new Error("stop_workflow requires a canonical runId");
+  }
+  return input as StopWorkflowInput;
+}
+
+function normalizeListActiveWorkflowsInput(value: unknown): ListActiveWorkflowsInput {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("list_active_workflows requires an object argument");
+  }
+  const extraKey = Object.keys(value).find(() => true);
+  if (extraKey) throw new Error(`list_active_workflows does not accept ${extraKey}`);
+  return value as ListActiveWorkflowsInput;
+}
+
+function listActiveWorkflowResult(
+  runs: ActiveWorkflowHandle[],
+  truncated: boolean,
+  error?: string,
+): ControlResult & { details: ListActiveWorkflowsResultDetails } {
+  const content = error
+    ? `Active workflows unavailable: ${error}.`
+    : runs.length === 0
+      ? "No active workflows in this Pi session."
+      : [
+          "Active workflows in this Pi session:",
+          ...runs.map((run) => `- ${run.runId} | ${run.name} | ${run.status}`),
+          ...(truncated ? ["- More active workflows are available through /workflows list."] : []),
+        ].join("\n");
+  return {
+    content: [{ type: "text", text: content }],
+    details: { runs, truncated, ...(error ? { error } : {}) },
+  };
+}
+
+function compactWorkflowName(name: string): string {
+  const compact = name.replace(/\s+/gu, " ").trim();
+  return compact.length <= 96 ? compact : `${compact.slice(0, 95)}…`;
+}
+
+function stopWorkflowResult(
+  runId: string,
+  stopped: boolean,
+  status?: RunStatus,
+  error?: string,
+): ControlResult & { details: StopWorkflowResultDetails } {
+  const text = stopped
+    ? `Workflow stopped (run ${runId}).`
+    : `Workflow not stopped (run ${runId}): ${error ?? "unknown error"}.`;
+  return {
+    content: [{ type: "text", text }],
+    details: { runId, stopped, ...(status ? { status } : {}), ...(error ? { error } : {}) },
+  };
+}
+
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function result(text: string, details: Record<string, unknown>): ControlResult {

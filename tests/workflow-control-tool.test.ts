@@ -3,7 +3,11 @@ import test from "node:test";
 import { Check } from "typebox/value";
 import type { WorkflowSnapshot } from "../src/display.js";
 import type { PersistedRunState, RunStatus } from "../src/run-persistence.js";
-import { createWorkflowControlTool } from "../src/workflow-control-tool.js";
+import {
+  createListActiveWorkflowsTool,
+  createStopWorkflowTool,
+  createWorkflowControlTool,
+} from "../src/workflow-control-tool.js";
 import type { WorkflowManager } from "../src/workflow-manager.js";
 
 function run(status: RunStatus = "running", runId = "audit-abc123"): PersistedRunState {
@@ -72,6 +76,33 @@ function text(result: Awaited<ReturnType<typeof execute>>): string {
   return result.content[0].text;
 }
 
+function stopManager(options: { sessionId?: string; runSessionId?: string; status?: RunStatus; runId?: string }) {
+  const runId = options.runId ?? "audit-current-1";
+  const item = { ...run(options.status ?? "running", runId), sessionId: options.runSessionId };
+  const calls: string[] = [];
+  const manager = {
+    getSessionId: () => options.sessionId,
+    listRuns: () => [item],
+    stop(id: string) {
+      calls.push(id);
+      if (item.status !== "running" && item.status !== "paused") return false;
+      item.status = "aborted";
+      return true;
+    },
+  } as unknown as WorkflowManager;
+  return { manager, calls, item };
+}
+
+async function executeStop(manager: WorkflowManager, params: Record<string, unknown>) {
+  const tool = createStopWorkflowTool({ manager });
+  return (tool.execute as any)("stop-call", params, undefined, undefined, {});
+}
+
+async function executeList(manager: WorkflowManager, params: Record<string, unknown> = {}) {
+  const tool = createListActiveWorkflowsTool({ manager });
+  return (tool.execute as any)("list-call", params, undefined, undefined, {});
+}
+
 const renderTheme = {
   fg: (_color: string, value: string) => value,
   bold: (value: string) => value,
@@ -83,6 +114,127 @@ function renderedText(component: { render(width: number): string[] }): string {
     .map((line) => line.trimEnd())
     .join("\n");
 }
+
+test("list_active_workflows exposes a strict empty schema and no lifecycle controls", () => {
+  const fixture = stopManager({ sessionId: "session-a", runSessionId: "session-a" });
+  const tool = createListActiveWorkflowsTool({ manager: fixture.manager });
+
+  assert.equal(tool.name, "list_active_workflows");
+  assert.match(tool.description, /active workflows owned by this Pi session/i);
+  assert.equal(Check(tool.parameters, {}), true);
+  assert.equal(Check(tool.parameters, { status: true }), false);
+  assert.equal(tool.promptSnippet, undefined);
+  assert.equal(tool.promptGuidelines, undefined);
+  const prepare = tool.prepareArguments as (value: unknown) => unknown;
+  assert.deepEqual(prepare({}), {});
+  assert.throws(() => prepare({ status: true }), /does not accept status/);
+});
+
+test("list_active_workflows returns only bounded current-session cancellation handles", async () => {
+  const runs: PersistedRunState[] = Array.from({ length: 66 }, (_, index) => ({
+    ...run(index % 2 === 0 ? "running" : "paused", `active-${String(index).padStart(3, "0")}`),
+    workflowName: `workflow ${index}`,
+    sessionId: "session-a",
+    startedAt: new Date(Date.UTC(2026, 0, 1, 0, 0, index)).toISOString(),
+  }));
+  runs.push({
+    ...run("running", "foreign-001"),
+    workflowName: "foreign",
+    sessionId: "session-b",
+    startedAt: new Date(Date.UTC(2026, 0, 2)).toISOString(),
+  });
+  runs.push({
+    ...run("completed", "completed-001"),
+    workflowName: "completed",
+    sessionId: "session-a",
+    startedAt: new Date(Date.UTC(2026, 0, 2)).toISOString(),
+  });
+  const manager = {
+    getSessionId: () => "session-a",
+    listRuns: () => runs,
+  } as unknown as WorkflowManager;
+
+  const response = await executeList(manager);
+  assert.equal(response.details.runs.length, 64);
+  assert.equal(response.details.truncated, true);
+  assert.equal(response.details.runs[0]?.runId, "active-065");
+  assert.deepEqual(Object.keys(response.details.runs[0] ?? {}).sort(), ["name", "runId", "status"]);
+  assert.equal(response.details.runs[0]?.name, "workflow 65");
+  assert.equal(
+    response.details.runs.some(({ runId }: { runId: string }) => runId === "foreign-001"),
+    false,
+  );
+  assert.equal(
+    response.details.runs.some(({ runId }: { runId: string }) => runId === "completed-001"),
+    false,
+  );
+  assert.match(response.content[0].text, /More active workflows are available through \/workflows list/);
+});
+
+test("list_active_workflows fails closed when current-session ownership is unavailable", async () => {
+  const fixture = stopManager({ runSessionId: "session-a" });
+  const response = await executeList(fixture.manager);
+
+  assert.deepEqual(response.details.runs, []);
+  assert.equal(response.details.truncated, false);
+  assert.match(response.details.error ?? "", /ownership is unavailable/);
+});
+
+test("stop_workflow exposes only an exact runId cancellation handle", () => {
+  const fixture = stopManager({ sessionId: "session-a", runSessionId: "session-a" });
+  const tool = createStopWorkflowTool({ manager: fixture.manager });
+
+  assert.equal(tool.name, "stop_workflow");
+  assert.match(tool.description, /this Pi session/i);
+  assert.match(tool.description, /Exact runId required/i);
+  assert.equal(tool.promptSnippet, undefined);
+  assert.equal(tool.promptGuidelines, undefined);
+  assert.equal(Check(tool.parameters, { runId: "audit-current-1" }), true);
+  assert.equal(Check(tool.parameters, {}), false);
+  assert.equal(Check(tool.parameters, { runId: "audit-current-1", action: "stop" }), false);
+
+  const prepare = tool.prepareArguments as (value: unknown) => unknown;
+  assert.throws(() => prepare({}), /requires runId/);
+  assert.throws(() => prepare({ runId: "../foreign" }), /canonical runId/);
+  assert.throws(() => prepare({ runId: "audit-current-1", action: "stop" }), /does not accept action/);
+});
+
+test("stop_workflow stops an exact running or paused run owned by the current session", async () => {
+  for (const status of ["running", "paused"] as const) {
+    const fixture = stopManager({ sessionId: "session-a", runSessionId: "session-a", status });
+    const response = await executeStop(fixture.manager, { runId: "audit-current-1" });
+
+    assert.equal(response.details.stopped, true);
+    assert.equal(response.details.status, "aborted");
+    assert.equal((response as { terminate?: boolean }).terminate, undefined);
+    assert.deepEqual(fixture.calls, ["audit-current-1"]);
+    assert.match(response.content[0].text, /Workflow stopped/);
+  }
+});
+
+test("stop_workflow fails closed without a session binding or for a foreign-session run", async () => {
+  const unbound = stopManager({ runSessionId: "session-a" });
+  const unboundResponse = await executeStop(unbound.manager, { runId: "audit-current-1" });
+  assert.equal(unboundResponse.details.stopped, false);
+  assert.match(unboundResponse.details.error ?? "", /ownership is unavailable/);
+  assert.deepEqual(unbound.calls, []);
+
+  const foreign = stopManager({ sessionId: "session-a", runSessionId: "session-b" });
+  const foreignResponse = await executeStop(foreign.manager, { runId: "audit-current-1" });
+  assert.equal(foreignResponse.details.stopped, false);
+  assert.match(foreignResponse.details.error ?? "", /not found in current session/);
+  assert.deepEqual(foreign.calls, []);
+});
+
+test("stop_workflow does not retry or mutate an already terminal run", async () => {
+  const fixture = stopManager({ sessionId: "session-a", runSessionId: "session-a", status: "completed" });
+  const response = await executeStop(fixture.manager, { runId: "audit-current-1" });
+
+  assert.equal(response.details.stopped, false);
+  assert.equal(response.details.status, "completed");
+  assert.match(response.details.error ?? "", /cannot stop run with status completed/);
+  assert.deepEqual(fixture.calls, []);
+});
 
 test("workflow_control exposes concise lifecycle actions in a strict schema", () => {
   const { manager } = fakeManager([]);

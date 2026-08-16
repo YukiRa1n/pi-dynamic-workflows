@@ -287,7 +287,7 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
 export type AgentRunResult<TSchemaDef extends TSchema | undefined> = TSchemaDef extends TSchema ? Static<TSchemaDef> : string;
 /**
  * Orchestration tools always denied to workflow subagents. The stock extension
- * exposes only `start_workflow`, but embedders may also register the library,
+ * exposes only start, active-list, and exact-ID stop workflow tools, but embedders may also register the library,
  * lifecycle, or steering tools. Nested background runs would escape the parent's
  * limits and accounting,
  * so all known orchestration names remain fail-closed here. Callers may deny

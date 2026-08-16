@@ -722,6 +722,8 @@ test("DEFAULT_EXCLUDED_SUBAGENT_TOOLS denies the recursive orchestration tools (
   // is a regression fence so it can't be silently narrowed.
   assert.deepEqual(DEFAULT_EXCLUDED_SUBAGENT_TOOLS, [
     "start_workflow",
+    "list_active_workflows",
+    "stop_workflow",
     "workflow",
     "workflow_control",
     "workflow_steer",
@@ -732,9 +734,18 @@ test("subagentExcludedTools always includes the defaults, plus caller/session na
   // This is what run() passes to createAgentSession as excludeTools. Fencing the
   // merge here catches a spread-order regression that drops the defaults — which
   // a deepEqual on the constant alone would miss.
-  assert.deepEqual(subagentExcludedTools(), ["start_workflow", "workflow", "workflow_control", "workflow_steer"]);
+  assert.deepEqual(subagentExcludedTools(), [
+    "start_workflow",
+    "list_active_workflows",
+    "stop_workflow",
+    "workflow",
+    "workflow_control",
+    "workflow_steer",
+  ]);
   assert.deepEqual(subagentExcludedTools(["pi-subagents"]), [
     "start_workflow",
+    "list_active_workflows",
+    "stop_workflow",
     "workflow",
     "workflow_control",
     "workflow_steer",
@@ -742,7 +753,11 @@ test("subagentExcludedTools always includes the defaults, plus caller/session na
   ]);
   const merged = subagentExcludedTools(["extra"], ["session-denied"]);
   assert.ok(
-    merged.includes("start_workflow") && merged.includes("workflow") && merged.includes("workflow_control"),
+    merged.includes("start_workflow") &&
+      merged.includes("list_active_workflows") &&
+      merged.includes("stop_workflow") &&
+      merged.includes("workflow") &&
+      merged.includes("workflow_control"),
     "defaults are never dropped",
   );
   assert.ok(merged.includes("workflow_steer"), "main-session steering is never exposed to subagents");

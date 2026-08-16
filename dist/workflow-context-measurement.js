@@ -1,5 +1,6 @@
 import { readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, relative } from "node:path";
+import { createListActiveWorkflowsTool, createStopWorkflowTool } from "./workflow-control-tool.js";
 import { buildArmedWorkflowPrompt, buildForcedWorkflowPrompt } from "./workflow-editor.js";
 import { createWorkflowTool } from "./workflow-tool.js";
 /** Package-relative generated context-measurement artifact. */
@@ -137,7 +138,17 @@ function median(values) {
 /** Measures permanent, discovery, corpus, and canonical on-demand workflow context surfaces. */
 export function measureWorkflowContextSurfaces(root = ROOT) {
     const tool = createWorkflowTool({ allowResume: false, exposeAdvancedParameters: false, modelFacing: true });
-    const alwaysOnTools = [tool];
+    const stopTool = createStopWorkflowTool({
+        getManager: () => {
+            throw new Error("context measurement only");
+        },
+    });
+    const listTool = createListActiveWorkflowsTool({
+        getManager: () => {
+            throw new Error("context measurement only");
+        },
+    });
+    const alwaysOnTools = [tool, listTool, stopTool];
     const permanentWorkflowPrompt = [
         ...(tool.promptSnippet ? [`- workflow: ${tool.promptSnippet}`] : []),
         ...(tool.promptGuidelines ?? []).map((guideline) => `- ${guideline}`),
@@ -176,9 +187,15 @@ export function measureWorkflowContextSurfaces(root = ROOT) {
     const armedRewriteBytes = bytes(buildArmedWorkflowPrompt(""));
     const forcedRewriteBytes = bytes(buildForcedWorkflowPrompt(""));
     return {
-        formatVersion: 7,
+        formatVersion: 8,
         encoding: "utf8",
-        sources: ["src/workflow-tool.ts", "src/workflow-editor.ts", "skills/workflow-authoring", "package.json#pi.skills"],
+        sources: [
+            "src/workflow-tool.ts",
+            "src/workflow-control-tool.ts",
+            "src/workflow-editor.ts",
+            "skills/workflow-authoring",
+            "package.json#pi.skills",
+        ],
         surfaces: {
             permanentWorkflowPrompt: {
                 serialization: "UTF-8 bytes of LF-joined stable Pi prompt lines contributed by workflow",
@@ -202,12 +219,12 @@ export function measureWorkflowContextSurfaces(root = ROOT) {
                 bytes: forcedRewriteBytes,
             },
             stableWorkflowOwnedContext: {
-                serialization: "sum of the stable Pi prompt and provider workflow definition",
-                bytes: promptBytes + toolBytes,
+                serialization: "sum of the stable Pi prompt and provider workflow definitions",
+                bytes: promptBytes + alwaysOnToolBytes,
             },
             explicitWorkflowRequestOwnedContext: {
                 serialization: "stable workflow-owned context plus the explicit-request suffix",
-                bytes: promptBytes + toolBytes + armedRewriteBytes,
+                bytes: promptBytes + alwaysOnToolBytes + armedRewriteBytes,
             },
             registeredSkillsDiscovery: {
                 serialization: "sum of UTF-8 bytes of normalized Pi skill XML (name + description + location) across every root in package.json's pi.skills",

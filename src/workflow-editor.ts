@@ -283,7 +283,7 @@ export function installWorkflowKeywordArming(
   // mutates session-global provider state and has no per-input lease, so doing
   // that from the input hook can race streaming turns and invalidate the stable
   // prompt-cache prefix. This hook only adds a short suffix to an explicit
-  // workflow request; the single start-only workflow tool stays stable.
+  // workflow request; the compact start/list/stop tool set stays stable.
   pi.on("input", (event: { source?: string; text?: string }) => {
     if (event.source !== "interactive" || !event.text) return { action: "continue" } as const;
     const normalizedText = event.text.trim();

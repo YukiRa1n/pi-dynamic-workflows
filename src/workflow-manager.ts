@@ -564,6 +564,11 @@ export class WorkflowManager extends EventEmitter {
     this.sessionId = id;
   }
 
+  /** Current Pi session binding used for ownership-scoped lifecycle actions. */
+  getSessionId(): string | undefined {
+    return this.sessionId;
+  }
+
   /** Queue a host-session message for one explicitly identified running workflow. */
   enqueueUserMessage(message: string, runId: string, kind: WorkflowSteeringKind): string | undefined {
     assertSafeRunId(runId);

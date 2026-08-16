@@ -33,13 +33,19 @@ export interface ToolDefinitionSurface extends ByteSurface {
 }
 /** Versioned byte measurements for always-on, discovery, corpus, and representative authoring surfaces. */
 export interface WorkflowContextMeasurement {
-    formatVersion: 7;
+    formatVersion: 8;
     encoding: "utf8";
-    sources: ["src/workflow-tool.ts", "src/workflow-editor.ts", "skills/workflow-authoring", "package.json#pi.skills"];
+    sources: [
+        "src/workflow-tool.ts",
+        "src/workflow-control-tool.ts",
+        "src/workflow-editor.ts",
+        "skills/workflow-authoring",
+        "package.json#pi.skills"
+    ];
     surfaces: {
         /** Stable Pi system-prompt contribution from the workflow tool. */
         permanentWorkflowPrompt: ByteSurface;
-        /** Stable provider definition for the single start-only workflow tool. */
+        /** Stable provider definition for the start-only workflow tool. */
         providerVisibleWorkflowToolDefinition: ByteSurface;
         /** Workflow definitions present on every ordinary turn. */
         providerVisibleAlwaysOnToolDefinitions: ByteSurface & {

@@ -28,10 +28,11 @@ test("workflow context measurement reports Pi-rendered prompt and provider tool 
   const artifact = measureWorkflowContextSurfaces(ROOT);
   assert.deepEqual(JSON.parse(renderWorkflowContextMeasurement()), artifact);
 
-  assert.equal(artifact.formatVersion, 7);
+  assert.equal(artifact.formatVersion, 8);
   assert.equal(artifact.encoding, "utf8");
   assert.deepEqual(artifact.sources, [
     "src/workflow-tool.ts",
+    "src/workflow-control-tool.ts",
     "src/workflow-editor.ts",
     "skills/workflow-authoring",
     "package.json#pi.skills",
@@ -40,7 +41,7 @@ test("workflow context measurement reports Pi-rendered prompt and provider tool 
   assert.match(artifact.surfaces.providerVisibleWorkflowToolDefinition.serialization, /stable/i);
   assert.deepEqual(
     artifact.surfaces.providerVisibleAlwaysOnToolDefinitions.tools.map((tool) => tool.name),
-    ["start_workflow"],
+    ["start_workflow", "list_active_workflows", "stop_workflow"],
   );
   assert.ok(artifact.surfaces.providerVisibleAlwaysOnToolDefinitions.bytes > 0);
   assert.equal(
@@ -67,14 +68,14 @@ test("workflow context measurement reports Pi-rendered prompt and provider tool 
   assert.equal(
     artifact.surfaces.explicitWorkflowRequestOwnedContext.bytes,
     artifact.surfaces.permanentWorkflowPrompt.bytes +
-      artifact.surfaces.providerVisibleWorkflowToolDefinition.bytes +
+      artifact.surfaces.providerVisibleAlwaysOnToolDefinitions.bytes +
       artifact.surfaces.armedWorkflowPromptRewrite.bytes,
   );
   assert.ok(artifact.surfaces.armedWorkflowPromptRewrite.bytes < 240);
   assert.ok(artifact.surfaces.forcedWorkflowPromptRewrite.bytes < 96);
   assert.equal(
     artifact.surfaces.stableWorkflowOwnedContext.bytes,
-    artifact.surfaces.permanentWorkflowPrompt.bytes + artifact.surfaces.providerVisibleWorkflowToolDefinition.bytes,
+    artifact.surfaces.permanentWorkflowPrompt.bytes + artifact.surfaces.providerVisibleAlwaysOnToolDefinitions.bytes,
   );
   assert.equal(
     artifact.surfaces.ordinaryWorkflowOwnedAlwaysOn.bytes,
@@ -82,7 +83,7 @@ test("workflow context measurement reports Pi-rendered prompt and provider tool 
   );
   assert.ok(
     artifact.surfaces.ordinaryWorkflowOwnedAlwaysOn.bytes <= 2_000,
-    "ordinary turns keep the stable start-only workflow surface and skill discovery below 2 KiB",
+    "ordinary turns keep the stable workflow tools and skill discovery below 2 KiB",
   );
   assert.ok(
     artifact.surfaces.explicitWorkflowRequestOwnedContext.bytes <= 1_800,
@@ -146,6 +147,8 @@ test("context freshness command prints stable and on-demand byte counts", () => 
   assert.match(output, /Explicit workflow request context: \d+ bytes/);
   assert.match(output, /Ordinary stable workflow tool definitions: \d+ bytes/);
   assert.match(output, /- start_workflow: \d+ bytes/);
+  assert.match(output, /- list_active_workflows: \d+ bytes/);
+  assert.match(output, /- stop_workflow: \d+ bytes/);
   assert.doesNotMatch(output, /- workflow_control: \d+ bytes/);
   assert.doesNotMatch(output, /- workflow_steer: \d+ bytes/);
   assert.match(output, /Registered skills discovery \(all \d+\): \d+ bytes/);

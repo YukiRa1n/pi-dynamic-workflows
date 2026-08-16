@@ -343,6 +343,8 @@ test(
     const details = result.details as { runId?: string; background?: boolean };
     assert.ok(details.runId);
     assert.equal(details.background, true);
+    const providerText = result.content.find((item) => item.type === "text")?.text ?? "";
+    assert.ok(providerText.includes(details.runId), "the main model must receive the exact cancellation handle");
   }),
 );
 

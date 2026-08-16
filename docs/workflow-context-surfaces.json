@@ -1,8 +1,9 @@
 {
-  "formatVersion": 7,
+  "formatVersion": 8,
   "encoding": "utf8",
   "sources": [
     "src/workflow-tool.ts",
+    "src/workflow-control-tool.ts",
     "src/workflow-editor.ts",
     "skills/workflow-authoring",
     "package.json#pi.skills"
@@ -18,12 +19,22 @@
     },
     "providerVisibleAlwaysOnToolDefinitions": {
       "serialization": "sum of stable provider-visible workflow tool definitions on ordinary turns",
-      "bytes": 737,
+      "bytes": 1319,
       "tools": [
         {
           "name": "start_workflow",
           "serialization": "UTF-8 bytes of JSON.stringify({ name, description, parameters })",
           "bytes": 737
+        },
+        {
+          "name": "list_active_workflows",
+          "serialization": "UTF-8 bytes of JSON.stringify({ name, description, parameters })",
+          "bytes": 214
+        },
+        {
+          "name": "stop_workflow",
+          "serialization": "UTF-8 bytes of JSON.stringify({ name, description, parameters })",
+          "bytes": 368
         }
       ]
     },
@@ -36,12 +47,12 @@
       "bytes": 61
     },
     "stableWorkflowOwnedContext": {
-      "serialization": "sum of the stable Pi prompt and provider workflow definition",
-      "bytes": 737
+      "serialization": "sum of the stable Pi prompt and provider workflow definitions",
+      "bytes": 1319
     },
     "explicitWorkflowRequestOwnedContext": {
       "serialization": "stable workflow-owned context plus the explicit-request suffix",
-      "bytes": 760
+      "bytes": 1342
     },
     "registeredSkillsDiscovery": {
       "serialization": "sum of UTF-8 bytes of normalized Pi skill XML (name + description + location) across every root in package.json's pi.skills",
@@ -61,7 +72,7 @@
     },
     "ordinaryWorkflowOwnedAlwaysOn": {
       "serialization": "sum of the stable workflow definition and every registered skill discovery entry",
-      "bytes": 1190
+      "bytes": 1772
     },
     "workflowAuthoringSkillCorpus": {
       "serialization": "sum of UTF-8 bytes for every file under skills/workflow-authoring",

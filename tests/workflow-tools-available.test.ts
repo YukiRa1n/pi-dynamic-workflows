@@ -1,7 +1,7 @@
 /**
  * Tests for tools availability when workflows mode is triggered.
  *
- * The workflow extension exposes one stable start-only workflow tool. Input
+ * The workflow extension exposes stable start, active-list, and exact-ID cancellation tools. Input
  * arming only adds a compact marker to an explicit request; it never mutates
  * Pi's active tool set.
  */
@@ -308,7 +308,7 @@ describe("installWorkflowKeywordArming - tool availability", () => {
 });
 
 describe("workflow extension - stable tool availability", () => {
-  it("keeps one start-only workflow tool visible and hands runtime across reload", async () => {
+  it("keeps stable start, active-list, and exact-ID stop tools visible across reload", async () => {
     const fakeHome = mkdtempSync(join(tmpdir(), "pi-dw-control-extension-"));
     try {
       await withFakeHomeAsync(fakeHome, async () => {
@@ -338,7 +338,7 @@ describe("workflow extension - stable tool availability", () => {
 
         installExtension(pi);
 
-        assert.deepEqual(registeredTools, ["start_workflow"]);
+        assert.deepEqual(registeredTools, ["start_workflow", "list_active_workflows", "stop_workflow"]);
         assert.ok(handlers.session_start.length >= 1);
         emitSessionStart(
           handlers,
@@ -405,10 +405,14 @@ describe("workflow extension - stable tool availability", () => {
           sendMessage: () => {},
         } as unknown as ExtensionAPI;
         installExtension(secondPi);
-        assert.equal(
-          registeredTools.slice(0, 2).every((name) => name === "start_workflow"),
-          true,
-        );
+        assert.deepEqual(registeredTools, [
+          "start_workflow",
+          "list_active_workflows",
+          "stop_workflow",
+          "start_workflow",
+          "list_active_workflows",
+          "stop_workflow",
+        ]);
         assert.equal(takeWorkflowRuntime(process.cwd()), undefined, "the fresh factory consumes the staged runtime");
 
         emitSessionStart(

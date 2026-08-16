@@ -4,14 +4,14 @@ This document preserves the decision-by-decision record behind the workflow tool
 
 ## Current placement in 3.5.1-yuki.2
 
-The record originated in [Whamp/pi-dynamic-workflows#23](https://github.com/Whamp/pi-dynamic-workflows/pull/23). The 3.0.0 target later merged [QuintinShaw/pi-dynamic-workflows#93](https://github.com/QuintinShaw/pi-dynamic-workflows/pull/93), which changed workflow triggering from forced execution to explicit intent. The current extension is compatible with stock Pi: it registers one stable, start-only `workflow` tool, does not mutate the active tool set between turns, and keeps lifecycle control on explicit `/workflows` commands. Existing runs are never a model-facing routing target; a new requirement stays in the main session or starts a fresh run.
+The record originated in [Whamp/pi-dynamic-workflows#23](https://github.com/Whamp/pi-dynamic-workflows/pull/23). The 3.0.0 target later merged [QuintinShaw/pi-dynamic-workflows#93](https://github.com/QuintinShaw/pi-dynamic-workflows/pull/93), which changed workflow triggering from forced execution to explicit intent. The current extension is compatible with stock Pi: it registers stable start, current-session active-list, and exact-ID stop tools, does not mutate the active tool set between turns, and keeps detailed inspection plus broader lifecycle control on explicit `/workflows` commands. Existing runs are never a model-facing routing target; a new requirement stays in the main session or starts a fresh run.
 
 | Decision area | Current authority |
 | --- | --- |
 | Capability summary | `description` in [`src/workflow-tool.ts`](../src/workflow-tool.ts) |
 | First-attempt script syntax and composition | The on-demand [`workflow-authoring` skill](../skills/workflow-authoring/SKILL.md), pointed to by `script.description`, plus parser/runtime checks |
 | Background and outer resource controls | Their parameter descriptions plus runtime behavior |
-| Workflow selection | The stable start-only tool description/schema plus explicit user intent; existing-run lifecycle stays on `/workflows` |
+| Workflow selection | Stable start plus bounded current-session list and exact-ID stop schemas; explicit user intent still gates new runs |
 | Detailed authoring policy | The on-demand [`workflow-authoring` skill](../skills/workflow-authoring/SKILL.md), not ordinary-turn prompt context |
 | Exact capability facts | The executable contract and generated [workflow-authoring reference](workflow-authoring.md) |
 | Dynamic model routes and agent types | Active user and project configuration, not static prompt catalogues |
@@ -23,14 +23,14 @@ The original reviewed record follows. Its quoted before-and-after text documents
 
 Pi renders `promptSnippet` as a tool's one-line entry in the system prompt's `Available tools` section and appends `promptGuidelines` as flat bullets. The `workflow` tool keeps a concise capability description and a stable provider-visible schema across turns. The default extension registers no model-facing control, steer, or status schemas; `/workflows status|watch|pause|resume|stop|steer` remains the explicit user/UI path.
 
-The generated [context measurement](workflow-context-surfaces.json) should measure the stable workflow definition and its cache-prefix contribution. It must not describe per-turn tool mutation as the current contract.
+The generated [context measurement](workflow-context-surfaces.json) should measure all stable workflow definitions and their cache-prefix contribution. It must not describe per-turn tool mutation as the current contract.
 
 ## Current lifecycle, cache, and replay invariants
 
-The provider surface is a stable start capability, not a lifecycle control menu:
+The provider surface is a stable start and bounded cancellation interface, not a general lifecycle menu:
 
-- The extension keeps one start-only `workflow` definition registered so the provider-visible prefix remains cache-stable.
-- The model-facing tool starts a new workflow only. Existing runs are inspected or changed through explicit `/workflows status|watch|pause|resume|stop|steer` commands.
+- The extension keeps compact start, current-session active-list, and exact-ID stop definitions registered so the provider-visible prefix remains cache-stable.
+- Model-facing lifecycle is limited to recovering a current-session cancellation handle and stopping that exact run. Detailed inspection and other mutations use `/workflows status|watch|pause|resume|stop|steer`.
 - A new requirement is not an existing-run continuation. It stays in the main session or starts a fresh workflow, even when another run mentions similar words.
 - `resumeFromRunId` is an embedded compatibility option only for `createWorkflowTool({ allowResume: true })`; it is absent from the default extension schema.
 
@@ -38,7 +38,7 @@ The Anthropic cache-warm gate is a bounded optimization, not a replay condition.
 
 Replay identity is run-scoped. The run-level provider context (`cwd`, instructions, tools, excluded tools, and session) is serialized and hashed once, then included in every call identity. Nested workflow context, run instructions, model-resolution inputs, schemas, agent definitions, and timeout/retry inheritance remain part of the call key. Opaque or unstable context fails closed instead of replaying a result under a guessed identity. This separates journal replay from provider cache warming: disabling `PI_CACHE_RETENTION` does not disable durable workflow replay.
 
-The current measurement target is the stable start-only workflow definition, approximately 1.1–1.3 KiB depending on the serialized schema. The important invariant is that this prefix does not change merely because the user message mentions a workflow or an existing run; regenerated measurements are the authority after source changes.
+The current measurement target is the stable start, active-list, and exact-ID stop definitions. The important invariant is that this prefix does not change merely because the user message mentions a workflow or an existing run; regenerated measurements are the authority after source changes.
 
 ## Current external design references
 
@@ -46,7 +46,7 @@ The current surface was re-reviewed against the official [OpenAI latest-model pr
 
 Those sources support four placement decisions used here:
 
-1. Keep the parent surface stable and task-relevant. One concise start-only workflow schema avoids per-turn tool mutation and preserves the prompt-cache prefix.
+1. Keep the parent surface stable and task-relevant. Concise start, active-list, and exact-ID stop schemas avoid per-turn tool mutation and preserve the prompt-cache prefix.
 2. Give the model one scoped action. `workflow` starts new work; lifecycle commands handle existing runs, while child-to-parent delivery carries only classified urgent messages.
 3. Put argument semantics next to the argument and keep detailed authoring contracts in the on-demand skill. This preserves precise tool descriptions without repeating a manual in every ordinary provider request.
 4. Treat subagents as isolated, bounded workers. Routine progress and finals remain in workflow state; only classified blockers, critical findings, or decisions may cross into another live context.

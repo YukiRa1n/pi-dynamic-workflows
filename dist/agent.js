@@ -321,13 +321,20 @@ export function usageFromStats(stats) {
 }
 /**
  * Orchestration tools always denied to workflow subagents. The stock extension
- * exposes only `start_workflow`, but embedders may also register the library,
+ * exposes only start, active-list, and exact-ID stop workflow tools, but embedders may also register the library,
  * lifecycle, or steering tools. Nested background runs would escape the parent's
  * limits and accounting,
  * so all known orchestration names remain fail-closed here. Callers may deny
  * additional names via WorkflowAgentOptions.excludeTools.
  */
-export const DEFAULT_EXCLUDED_SUBAGENT_TOOLS = ["start_workflow", "workflow", "workflow_control", "workflow_steer"];
+export const DEFAULT_EXCLUDED_SUBAGENT_TOOLS = [
+    "start_workflow",
+    "list_active_workflows",
+    "stop_workflow",
+    "workflow",
+    "workflow_control",
+    "workflow_steer",
+];
 /**
  * The full subagent tool denylist: the always-on defaults plus any names the
  * caller added (via WorkflowAgentOptions.excludeTools) or set on the injected

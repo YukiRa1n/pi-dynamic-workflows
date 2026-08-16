@@ -51,7 +51,7 @@ Finite resource defaults also bound fan-out (10,000 items per `parallel()`/`pipe
 
 ## Provider-surface lifecycle
 
-The extension uses stock Pi APIs and keeps one compact, start-only `start_workflow` tool registered with a stable provider-visible definition. It starts a new background run from a script or curated built-in preset. Saved/run names, resource limits, replay, and lifecycle actions remain library or `/workflows` command APIs. The extension does not register model-facing control, steer, or status tools, and does not rewrite the active tool set between turns.
+The extension uses stock Pi APIs and keeps compact start, active-list, and exact-ID stop tools registered with stable provider-visible definitions. Start creates a background run; list returns only current-session running/paused handles; stop requires one exact ID. Saved names, resource limits, replay, detailed inspection, pause, resume, and steering remain library or `/workflows` command APIs; the extension never rewrites the active tool set between turns.
 
 Manage existing runs explicitly with `/workflows status|watch|pause|resume|stop|steer <id>`. A new requirement stays in the main session or starts a fresh workflow; it is never sent to an unrelated existing run. `/effort` changes guidance only for an explicitly requested workflow and never converts an ordinary message into workflow work.
 

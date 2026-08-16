@@ -8,7 +8,9 @@
 
 After installation, Pi gains:
 
-- `start_workflow` — one stable, start-only tool for a generated script or curated built-in preset.
+- `start_workflow` — a stable, start-only tool for a generated script or curated built-in preset.
+- `list_active_workflows` — a stable, current-session list of exact cancellation handles.
+- `stop_workflow` — a stable, exact-ID cancellation handle limited to runs owned by the current Pi session.
 - `/workflows` — interactive workflow navigator.
 - `/workflows status|watch|pause|resume|stop|steer` — explicit lifecycle and existing-run commands.
 - `/workflows-models` — configure `small`, `medium`, and `big` model tiers.
@@ -16,7 +18,7 @@ After installation, Pi gains:
 - Workflow-scoped Agent Teams with peer messages, inboxes, and a shared task board.
 - One bounded background workflow result is delivered to the main session using Pi's safe-point steering queue; an active provider request is not cancelled. Routine per-subagent finals stay in the run journal/pager instead of consuming parent context.
 
-The extension uses the stock Pi extension API and keeps one start-only `start_workflow` definition registered. Its provider-visible prefix therefore stays stable for prompt caching; there is no per-turn tool lease or dynamic `setActiveTools` rewrite. Existing runs are managed explicitly with `/workflows`; a new requirement stays in the main session or starts a fresh run and is never routed into an unrelated run.
+The extension uses the stock Pi extension API and keeps compact start, active-list, and exact-ID stop definitions registered. Its provider-visible prefix therefore stays stable for prompt caching; there is no per-turn tool lease or dynamic `setActiveTools` rewrite. The list returns only current-session running/paused handles, and stop requires one exact ID. Other existing-run actions stay under `/workflows`; a new requirement is never routed into an unrelated run.
 
 ## Requirements
 
@@ -96,7 +98,7 @@ Inside Pi, open:
 /workflows
 ```
 
-The compact start-only `start_workflow` tool is stable across ordinary turns and explicit workflow requests. It accepts a custom `script` or one of five curated `preset` names; it does not accept saved/run IDs, limits, replay, or lifecycle controls. Lifecycle and existing-run actions are command/UI paths under `/workflows`, so the model does not receive separate control, steer, or status tool schemas.
+The compact `start_workflow`, `list_active_workflows`, and `stop_workflow` tools are stable across turns. Start accepts a custom `script` or curated `preset`; list returns only current-session running/paused handles; stop accepts one exact ID. Saved names, limits, replay, detailed inspection, pause, resume, and steering remain command/UI paths under `/workflows`.
 
 ### 2. Configure model tiers
 
