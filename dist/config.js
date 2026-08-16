@@ -17,6 +17,17 @@ export const MAX_DURABLE_RUN_BYTES = 16 * 1024 * 1024;
 export const DEFAULT_MAX_PAUSED_RUNS_IN_MEMORY = 20;
 /** Maximum members/tasks/messages retained by one workflow team by default. */
 export const DEFAULT_MAX_TEAM_MEMBERS = 100;
+/** Run-wide Agent Team state ceilings. */
+export const MAX_TEAMS_PER_RUN = 32;
+export const MAX_TEAM_MEMBERS_PER_RUN = 1000;
+export const MAX_TEAM_TASKS_PER_RUN = 4000;
+export const MAX_TEAM_MESSAGES_PER_RUN = 8192;
+/** Manager-wide pending user-message high-water marks. */
+export const MAX_PENDING_MESSAGES = 1024;
+export const MAX_PENDING_MESSAGE_BYTES = 4 * 1024 * 1024;
+/** Non-evicting paused durable high-water marks; explicit prune is required. */
+export const DEFAULT_MAX_PAUSED_RUNS_ON_DISK = 10_000;
+export const DEFAULT_MAX_PAUSED_BYTES_ON_DISK = 1024 * 1024 * 1024;
 export const DEFAULT_MAX_TEAM_TASKS = 2_000;
 export const DEFAULT_MAX_TEAM_MESSAGES = 4_096;
 /** SharedStore resource ceilings. Values are rejected before they enter the store. */

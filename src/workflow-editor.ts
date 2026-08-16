@@ -8,7 +8,7 @@
 
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { DEFAULT_KEYWORD_TRIGGER_WORD, normalizeKeywordTriggerWord } from "./config.js";
-import { type EffortState, effortDirective, isSubstantive } from "./effort-command.js";
+import { type EffortState, effortDirective } from "./effort-command.js";
 import {
   loadWorkflowSettings,
   saveWorkflowSettings,
@@ -38,6 +38,25 @@ export function hasTrigger(text: string, triggerWord = DEFAULT_KEYWORD_TRIGGER_W
   return triggerRegex(triggerWord).test(text);
 }
 
+/**
+ * Provider-facing arming is stricter than lexical highlighting. A configured
+ * custom word remains an explicit opt-in, while the default word ignores common
+ * discussion/debugging phrases and recognizes compact CJK requests such as
+ * "用workflow审查" that Unicode token boundaries otherwise reject.
+ */
+export function hasWorkflowRequestTrigger(text: string, triggerWord = DEFAULT_KEYWORD_TRIGGER_WORD): boolean {
+  const word = normalizeKeywordTriggerWord(triggerWord) ?? DEFAULT_KEYWORD_TRIGGER_WORD;
+  if (word.toLowerCase() !== DEFAULT_KEYWORD_TRIGGER_WORD) return hasTrigger(text, word);
+
+  const explicitRequest =
+    /\b(?:run|start|launch|execute|invoke|use)\b.{0,48}\bworkflows?\b/iu.test(text) ||
+    /^\s*workflows?\s*[:：]\s*\S/iu.test(text) ||
+    /\bworkflows?\b\s+(?:audit|review|research|analy[sz]e|inspect|check|run)\b/iu.test(text) ||
+    /(?:用|使用|运行|启动|调用|跑)(?:一下|一个|这个|该)?\s*workflows?/iu.test(text) ||
+    /(?:帮我|请).{0,24}\bworkflows?\b.{0,24}(?:审|查|分析|研究|执行|并行|跑)/iu.test(text);
+  return explicitRequest;
+}
+
 export function endsWithTrigger(textBeforeCursor: string, triggerWord = DEFAULT_KEYWORD_TRIGGER_WORD): boolean {
   return triggerRegex(triggerWord, "iu", true).test(textBeforeCursor);
 }
@@ -52,114 +71,58 @@ export interface WorkflowModeState {
 
 export interface InstallWorkflowKeywordArmingOptions {
   settingsStore?: WorkflowSettingsStore;
+  /** @deprecated Tool visibility is stable; retained for source compatibility. */
+  controlToolName?: string;
+  /** @deprecated Tool visibility is stable; retained for source compatibility. */
+  steerToolName?: string;
+  /** @deprecated Tool visibility is stable; retained for source compatibility. */
+  workflowToolFamily?: readonly string[];
 }
 
-/**
- * Why a turn was armed. This is stated truthfully in the banner so the model
- * isn't told "the trigger word you typed" on a path where no word was typed:
- *  - "keyword": the user typed the configured workflow trigger word.
- *  - "effort": standing `/effort` armed this turn (no workflow word was typed).
- */
+/** Legacy recognizer retained for embedders; the Pi extension does not lease tools from it. */
+export function hasExplicitWorkflowControlRequest(text: string): boolean {
+  return (
+    /\b(?:pause|resume|stop|cancel)\b.{0,64}\b(?:workflow|run)\b/iu.test(text) ||
+    /\b(?:workflow|run)\b.{0,64}\b(?:pause|resume|stop|cancel)\b/iu.test(text) ||
+    /(?:暂停|恢复|停止|取消).{0,48}(?:workflow|工作流|run)/iu.test(text) ||
+    /(?:workflow|工作流|run).{0,48}(?:暂停|恢复|停止|取消)/iu.test(text)
+  );
+}
+
+/** Legacy recognizer retained for embedders; explicit Pi steering uses /workflows steer. */
+export function hasExplicitWorkflowSteerRequest(text: string): boolean {
+  const generatedRunId = /\b(?:[A-Za-z0-9][A-Za-z0-9._-]*-)?[a-z0-9]{7,}-[a-z0-9]{6}\b/iu.test(text);
+  if (!generatedRunId) return false;
+  return (
+    /\b(?:steer|continue|correct|update|amend|answer|reply)\b.{0,64}\b(?:workflow|run)\b/iu.test(text) ||
+    /\b(?:workflow|run)\b.{0,64}\b(?:steer|continue|correct|update|amend|answer|reply)\b/iu.test(text) ||
+    /(?:继续|修正|更正|补充|回复|回答|转告).{0,48}(?:workflow|工作流|run)/iu.test(text) ||
+    /(?:workflow|工作流|run).{0,48}(?:继续|修正|更正|补充|回复|回答|转告)/iu.test(text)
+  );
+}
+
+/** Backward-compatible arming reason type; the compact suffix no longer narrates it. */
 export type ArmReason = "keyword" | "effort";
 
-/**
- * Appended to the effort-path directive: standing `/effort` arms on every
- * substantive message, so the model must be told it can decline the workflow on
- * a conversational or trivial turn (mirrors "solo only on conversational turns").
- */
-export const EFFORT_CONVERSATIONAL_ESCAPE =
-  "This turn was armed by standing effort mode, not by an explicit workflow request: if it is conversational or trivial, skip the workflow and just respond directly.";
-
-/** The one-line, truthful "why armed" clause for each heuristic arming path. */
-function armReasonClause(reason: ArmReason): string {
-  return reason === "keyword"
-    ? "you typed the workflow trigger word, which counts as an explicit opt-in to multi-agent orchestration"
-    : "standing effort mode armed this turn (you did not explicitly ask for a workflow)";
-}
-
-/**
- * The #89 reassurance shared by every arming banner: a background run ENDING the
- * turn is expected, not a stall — the result auto-delivers back — so the model
- * shouldn't feel it must stay and block, nor avoid the tool to stay interactive.
- * The public workflow tool is background-only; results return through delivery.
- */
-const BACKGROUND_DELIVERY_REASSURANCE =
-  "If you do call `workflow`, it runs in the background: this turn will end and the result is delivered back into the conversation automatically when it finishes — that's expected, not a stall, so you do not need to stay and block.";
-
-/**
- * The directive appended to a submitted message when workflows mode is ARMED by a
- * HEURISTIC path — the keyword trigger or standing `/effort`. (The explicit
- * `/workflows run` command uses {@link buildForcedWorkflowPrompt} instead.)
- *
- * This authorizes — it does not force. Arming is a confirmed opt-in signal that
- * lifts the always-on "do not call the tool" gate for THIS message; the model
- * still decides whether the message is actually a request to do work (→ call the
- * `workflow` tool) or just talk about workflows (→ answer directly). The old
- * "You MUST / the ONLY acceptable action / Do NOT answer directly" forcing text
- * caused two bugs: it over-triggered on messages that merely mention workflows
- * (#88), and — by commanding the model to emit nothing but one `workflow` call
- * and not talk — it produced a bare background run that ends the turn and leaves
- * the user at an idle prompt (#89).
- *
- * The banner therefore (1) LEADS with the decision boundary (question/trivial →
- * answer directly; a real decomposable request → call `workflow`) rather than
- * leading with "call the tool"; (2) states the truthful opt-in `reason` for THIS
- * path (no "the word you typed" on the effort path, where none was); and (3)
- * carries the #89 background/deliver-back reassurance so an ending turn reads as
- * expected. The how-to mechanics are NOT here — they live in the tool's static
- * `description` (see createWorkflowTool), visible whenever the model looks at the
- * tool, so they aren't re-injected per armed turn (#65).
- *
- * `extraDirective` (e.g. an effort-tier nudge + EFFORT_CONVERSATIONAL_ESCAPE) is
- * appended when present.
- */
+/** Add a minimal user-message suffix after an explicit workflow request. */
 export function buildArmedWorkflowPrompt(
   text: string,
   opts: { reason?: ArmReason; extraDirective?: string } = {},
 ): string {
-  const reason = opts.reason ?? "keyword";
-  const lines = [
-    text,
-    "",
-    "---",
-    "[workflows mode armed. Decide first: if this message is a question, a trivial task, or",
-    "just talk (about workflows, this repo, or the tool itself), answer it directly and stay",
-    "conversational — arming authorizes the tool, it does not force it. If it is a real,",
-    "decomposable request to do work, handle it by calling the `workflow` tool: write a script",
-    "that fans the task out across subagents via agent()/parallel()/pipeline().",
-    `Why this turn is armed: ${armReasonClause(reason)}.`,
-    BACKGROUND_DELIVERY_REASSURANCE + "]",
-  ];
+  const lines = [text, "", "[Workflow requested.]"];
   if (opts.extraDirective) lines.push("", opts.extraDirective);
   return lines.join("\n");
 }
 
-/**
- * The directive for the explicit `/workflows run <prompt>` command. Unlike the
- * heuristic {@link buildArmedWorkflowPrompt}, `/workflows run` is a maximal-intent
- * command — the user typed a command whose whole purpose is to execute a workflow
- * now — so it does NOT get the "if it's a question, just answer" escape. It still
- * avoids the old MUST/ONLY forcing language (which caused #88/#89) and still
- * carries the #89 background/deliver-back reassurance so an ending turn reads as
- * expected. `extraDirective` (e.g. a standing effort-tier nudge) is appended.
- */
+/** Add the explicit `/workflows run` routing suffix. */
 export function buildForcedWorkflowPrompt(text: string, extraDirective?: string): string {
-  const lines = [
-    text,
-    "",
-    "---",
-    "[/workflows run — you ran an explicit command to execute a workflow for this request.",
-    "Call the `workflow` tool now: write a script that fans this task out across subagents",
-    "via agent()/parallel()/pipeline(). (This is a direct command, not a heuristic guess, so",
-    "do not answer in prose instead of running the workflow.)",
-    BACKGROUND_DELIVERY_REASSURANCE + "]",
-  ];
+  const lines = [text, "", "[Workflow command: call `start_workflow` for this request.]"];
   if (extraDirective) lines.push("", extraDirective);
   return lines.join("\n");
 }
 
 /** The exact name of the workflow tool that workflows mode forces. */
-export const WORKFLOW_TOOL_NAME = "workflow";
+export const WORKFLOW_TOOL_NAME = "start_workflow";
 
 export function registerWorkflowTriggerCommand(
   pi: ExtensionAPI,
@@ -316,68 +279,24 @@ export function installWorkflowKeywordArming(
   registerWorkflowTriggerCommand(pi, state, settingsStore);
   registerWorkflowProgressCommands(pi, settingsStore);
 
-  // Active tools saved while a turn is restricted to `workflow`; restored on turn_end.
-  let savedTools: string[] | undefined;
-
-  // When armed at submit time, rewrite the user's message to force a workflow AND
-  // ensure the `workflow` tool is in the active tool set, so the model can call it.
-  // We keep all existing tools (bash, read, edit, write, web_search, etc.) because
-  // the model often needs them BEFORE writing the workflow script (e.g. exploring
-  // the codebase, reading files, searching for context). This only ADDS the
-  // workflow tool to the active set; no tools are removed (the original set is
-  // saved in `savedTools` and restored elsewhere).
-  //
-  // NOTE: we check event.text directly (hasTrigger) rather than state.active from
-  // the editor, because the editor's state is reset synchronously by submitValue()
-  // BEFORE the input event fires (the actual prompt processing is async).
+  // Tool visibility is deliberately not changed here. Pi's setActiveTools()
+  // mutates session-global provider state and has no per-input lease, so doing
+  // that from the input hook can race streaming turns and invalidate the stable
+  // prompt-cache prefix. This hook only adds a short suffix to an explicit
+  // workflow request; the single start-only workflow tool stays stable.
   pi.on("input", (event: { source?: string; text?: string }) => {
     if (event.source !== "interactive" || !event.text) return { action: "continue" } as const;
-    // Arm either when the user typed the "workflow(s)" trigger, or when standing
-    // effort mode is on and the message is a substantive request.
     const normalizedText = event.text.trim();
     const suppressed = state.suppressedKeywordText === normalizedText;
     if (suppressed) state.suppressedKeywordText = undefined;
-    const triggered = state.keywordTriggerEnabled && !suppressed && hasTrigger(event.text, state.keywordTriggerWord);
-    const byEffort = !triggered && !!effort && effort.level !== "off" && isSubstantive(event.text);
-    if (!triggered && !byEffort) return { action: "continue" } as const;
-    try {
-      if (savedTools === undefined) {
-        savedTools = pi.getActiveTools?.() ?? [];
-        const current = [...savedTools];
-        if (!current.includes(WORKFLOW_TOOL_NAME)) {
-          current.push(WORKFLOW_TOOL_NAME);
-        }
-        pi.setActiveTools?.(current);
-      }
-    } catch {
-      // Tool restriction is best-effort; the armed directive still authorizes the workflow.
-    }
-    // Effort path: the trigger word was NOT typed — this arms on ANY substantive
-    // message while standing effort is on. So the directive must (a) state the
-    // truthful "effort" reason (not "the word you typed"), and (b) let the model
-    // skip the workflow entirely on conversational/trivial turns, not just on
-    // questions about workflows.
-    const extra =
-      byEffort && effort
-        ? [effortDirective(effort.level), EFFORT_CONVERSATIONAL_ESCAPE].filter(Boolean).join(" ")
-        : undefined;
-    const reason: ArmReason = byEffort ? "effort" : "keyword";
+    const triggered =
+      state.keywordTriggerEnabled && !suppressed && hasWorkflowRequestTrigger(event.text, state.keywordTriggerWord);
+    if (!triggered) return { action: "continue" } as const;
+    const extra = effort && effort.level !== "off" ? effortDirective(effort.level) : undefined;
     return {
       action: "transform",
-      text: buildArmedWorkflowPrompt(event.text, { reason, extraDirective: extra }),
+      text: buildArmedWorkflowPrompt(event.text, { reason: "keyword", extraDirective: extra }),
     } as const;
-  });
-
-  // Restore the user's full tool set once the forced turn completes.
-  pi.on("turn_end", () => {
-    if (savedTools === undefined) return;
-    const restore = savedTools;
-    savedTools = undefined;
-    try {
-      pi.setActiveTools?.(restore);
-    } catch {
-      // ignore — nothing we can do if the host rejects the restore
-    }
   });
 
   return state;

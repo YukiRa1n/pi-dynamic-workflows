@@ -68,6 +68,84 @@ phase('Work')
 const a = await agent('do it', { label: 'a' })
 return { a }`;
 
+test("queued steering never guesses the newest running workflow", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-wf-explicit-steer-"));
+  const deferred = deferredAgent();
+  try {
+    const manager = new WorkflowManager({ cwd, agent: deferred.runner });
+    const runA = manager.startInBackground(oneAgentScript);
+    const runB = manager.startInBackground(oneAgentScript);
+    const unsafeLegacyCall = manager.enqueueUserMessage as unknown as (
+      message: string,
+      runId?: string,
+    ) => string | undefined;
+
+    assert.throws(() => unsafeLegacyCall("new unrelated request"), /Invalid run ID/i);
+    assert.equal(
+      unsafeLegacyCall("unclassified text", runA.runId),
+      undefined,
+      "the manager must reject an update that bypasses the classified steering API",
+    );
+    assert.equal(manager.enqueueUserMessage("same-task correction", runA.runId, "same_task_correction"), runA.runId);
+    assert.deepEqual(manager.takePendingMessages(runA.runId), [
+      { message: "same-task correction", kind: "same_task_correction" },
+    ]);
+    assert.deepEqual(manager.takePendingMessages(runB.runId), [], "another live run stays untouched");
+
+    deferred.resolve("done");
+    await Promise.allSettled([runA.promise, runB.promise]);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("deleteRun releases a fallback lease when persistence.delete throws", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-wf-delete-lease-"));
+  try {
+    const manager = new WorkflowManager({ cwd, agent: fakeAgent() });
+    const { runId } = manager.startInBackground(oneAgentScript);
+    await manager.getRun(runId)?.execution;
+    const cold = new WorkflowManager({ cwd, agent: fakeAgent() });
+    const persistence = cold.getPersistence();
+    const originalDelete = persistence.delete;
+    persistence.delete = (() => {
+      throw new Error("injected delete failure");
+    }) as typeof persistence.delete;
+    assert.throws(() => cold.deleteRun(runId), /injected delete failure/);
+    persistence.delete = originalDelete;
+    const lease = persistence.acquireRunLease(runId);
+    assert.ok(lease);
+    persistence.releaseRunLease(lease);
+    assert.ok(persistence.load(runId));
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("manager execution reservations release exact generations and admit the next run", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-wf-exec-budget-"));
+  try {
+    const shared = new (await import("../src/workflow-resource-coordinator.js")).WorkflowResourceCoordinator({
+      maxActiveExecutions: 1,
+    });
+    const manager = new WorkflowManager({ cwd, agent: fakeAgent(), resourceCoordinator: shared });
+    await manager.runSync(oneAgentScript);
+    assert.equal(manager.getResourceDiagnostics().activeExecutions, 0);
+    const other = new WorkflowManager({
+      cwd: join(cwd, "other"),
+      agent: fakeAgent(),
+      resourceCoordinator: shared,
+      resourceNamespace: "other-manager",
+    });
+    await other.runSync(oneAgentScript);
+    assert.equal(shared.snapshot().activeExecutions, 0);
+    await manager.runSync(oneAgentScript);
+    assert.equal(shared.snapshot().activeExecutions, 0);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 /** Two sequential agents: 'a' finishes, then 'b' starts. */
 const twoAgentScript = `export const meta = { name: 'two_agent_demo', description: 'two sequential agents' }
 phase('Work')
@@ -514,10 +592,10 @@ test(
         if (prompt === "a") {
           aAttempts++;
           if (aAttempts === 1) {
-            options?.onUsage?.({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 40, cost: 0 });
+            options?.onUsage?.({ input: 10, output: 30, cacheRead: 5, cacheWrite: 2, total: 40, cost: 0.4 });
             return ""; // empty output -> recoverable AGENT_EMPTY_OUTPUT -> retried
           }
-          options?.onUsage?.({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 25, cost: 0 });
+          options?.onUsage?.({ input: 7, output: 18, cacheRead: 3, cacheWrite: 1, total: 25, cost: 0.25 });
           return "a-result";
         }
         return new Promise(() => {}); // 'b' hangs until paused
@@ -548,6 +626,11 @@ return { a, b }`;
       65,
       "the persisted total must include the failed-then-retried attempt's 40 tokens, not just the final attempt's 25",
     );
+    assert.equal(paused?.tokenUsage?.input, 17, "failed retry input tokens are persisted");
+    assert.equal(paused?.tokenUsage?.output, 48, "failed retry output tokens are persisted");
+    assert.equal(paused?.tokenUsage?.cacheRead, 8, "failed retry cache-read tokens are persisted");
+    assert.equal(paused?.tokenUsage?.cacheWrite, 3, "failed retry cache-write tokens are persisted");
+    assert.equal(paused?.tokenUsage?.cost, 0.65, "failed retry cost is persisted");
   }),
 );
 
@@ -2423,6 +2506,51 @@ test(
   }),
 );
 
+test(
+  "deleteRun removes every paused retention generation for the runId",
+  withTempCwd(async (cwd) => {
+    let call = 0;
+    const resolvers: Array<(value: unknown) => void> = [];
+    const agent = {
+      async run() {
+        call++;
+        return new Promise((resolve) => resolvers.push(resolve));
+      },
+    };
+    const manager = new WorkflowManager({ cwd, agent, maxPausedRunsInMemory: 4 });
+    manager.on("error", () => {});
+
+    const first = manager.startInBackground(oneAgentScript);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(manager.pause(first.runId), true);
+    resolvers.shift()?.("first-late");
+    await first.promise.catch(() => {});
+
+    assert.equal(await manager.resume(first.runId), true);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(call, 2);
+    assert.equal(manager.pause(first.runId), true);
+    const secondExecution = manager.getRun(first.runId)?.execution;
+    resolvers.shift()?.("second-late");
+    await secondExecution?.catch(() => {});
+
+    const getPausedQueue = () => (manager as unknown as { pausedRunQueue: Array<{ runId: string }> }).pausedRunQueue;
+    assert.equal(
+      getPausedQueue().filter((entry) => entry.runId === first.runId).length,
+      2,
+      "both settled generations should be retained before deletion",
+    );
+
+    assert.equal(manager.deleteRun(first.runId), true);
+    assert.equal(
+      getPausedQueue().some((entry) => entry.runId === first.runId),
+      false,
+      "deletion must clear stale paused generations, not only the current object",
+    );
+    assert.equal(manager.getRun(first.runId), undefined);
+  }),
+);
+
 // ─── startInBackground tests ───────────────────────────────────────────────────
 
 test(
@@ -3369,6 +3497,128 @@ test(
 );
 
 test(
+  "manual pauses honor maxPausedRunsInMemory only after settle and remain persisted/resumable",
+  withTempCwd(async (cwd) => {
+    const sessions: Array<{ sendUserMessage(content: string): Promise<void> }> = [];
+    let liveCalls = 0;
+    const agent = {
+      async run(
+        prompt: string,
+        options?: {
+          signal?: AbortSignal;
+          onSessionReady?: (session: { sendUserMessage(content: string): Promise<void> }) => void;
+          onSessionEnd?: (session: { sendUserMessage(content: string): Promise<void> }) => void;
+        },
+      ) {
+        liveCalls++;
+        if (liveCalls > 4) return `resumed:${prompt}`;
+        const session = { async sendUserMessage(_content: string) {} };
+        sessions.push(session);
+        options?.onSessionReady?.(session);
+        try {
+          await new Promise<void>((_resolve, reject) => {
+            const onAbort = () => setTimeout(() => reject(new Error("aborted")), 25);
+            if (options?.signal?.aborted) onAbort();
+            else options?.signal?.addEventListener("abort", onAbort, { once: true });
+          });
+        } finally {
+          options?.onSessionEnd?.(session);
+        }
+        return "never";
+      },
+    };
+    const manager = new WorkflowManager({ cwd, agent, maxPausedRunsInMemory: 2 });
+    manager.on("error", () => {});
+    const runIds: string[] = [];
+    const promises: Promise<unknown>[] = [];
+    const starts: Array<{ runId: string; promise: Promise<unknown> }> = [];
+
+    for (let i = 0; i < 4; i++) {
+      const script = `export const meta = { name: 'paused_${i}', description: 'manual pause retention' }
+return await agent('hold-${i}', { label: 'hold-${i}' })`;
+      const started = manager.startInBackground(script);
+      runIds.push(started.runId);
+      promises.push(started.promise);
+      starts.push(started);
+      await new Promise((r) => setTimeout(r, 10));
+    }
+
+    for (const started of starts) assert.equal(manager.pause(started.runId), true);
+    assert.equal(
+      runIds.filter((runId) => manager.getRun(runId)?.status === "paused").length,
+      4,
+      "unsettled paused generations must not be evicted while abort cleanup is still running",
+    );
+
+    await Promise.allSettled(promises);
+
+    assert.equal(manager.getRun(runIds[0]), undefined, "the oldest settled paused snapshot is evicted");
+    assert.equal(manager.getRun(runIds[1]), undefined, "the second-oldest settled paused snapshot is evicted");
+    assert.equal(manager.getRun(runIds[2])?.status, "paused");
+    assert.equal(manager.getRun(runIds[3])?.status, "paused");
+    assert.equal(
+      (manager as unknown as { activeAgentSenders: Map<string, unknown> }).activeAgentSenders.size,
+      0,
+      "settled pause removes targeted sender closures even when runtime admission suppressed session-end observers",
+    );
+
+    const listed = manager.listRuns();
+    for (const runId of runIds) {
+      assert.equal(listed.find((run) => run.runId === runId)?.status, "paused", "evicted paused runs remain durable");
+    }
+
+    const resumed = await manager.resume(runIds[0]);
+    assert.equal(resumed, true, "an evicted manual pause remains resumable from persistence");
+    await new Promise((r) => setTimeout(r, 60));
+    assert.equal(manager.listRuns().find((run) => run.runId === runIds[0])?.status, "completed");
+    assert.equal(sessions.length, 4, "the resumed generation used the live success branch, not a retained old session");
+  }),
+);
+
+test(
+  "a stale paused-retention entry cannot evict a resumed generation with the same runId",
+  withTempCwd(async (cwd) => {
+    let call = 0;
+    const holds: Array<() => void> = [];
+    const agent = {
+      async run(_prompt: string) {
+        call++;
+        if (call === 1 || call === 3) {
+          await new Promise<void>((resolve) => holds.push(resolve));
+          return "late";
+        }
+        return "done";
+      },
+    };
+    const manager = new WorkflowManager({ cwd, agent, maxPausedRunsInMemory: 1 });
+    manager.on("error", () => {});
+
+    const first = manager.startInBackground(oneAgentScript);
+    await new Promise((r) => setTimeout(r, 10));
+    assert.equal(manager.pause(first.runId), true);
+    holds.shift()?.();
+    await first.promise.catch(() => {});
+    assert.equal(manager.getRun(first.runId)?.status, "paused");
+
+    assert.equal(await manager.resume(first.runId), true);
+    await new Promise((r) => setTimeout(r, 40));
+    assert.equal(manager.listRuns().find((run) => run.runId === first.runId)?.status, "completed");
+
+    const second = manager.startInBackground(oneAgentScript);
+    await new Promise((r) => setTimeout(r, 10));
+    assert.equal(manager.pause(second.runId), true);
+    holds.shift()?.();
+    await second.promise.catch(() => {});
+
+    assert.equal(
+      manager.getRun(first.runId)?.status,
+      "completed",
+      "overflowing the paused queue shifts a stale first-generation entry but must not delete its resumed result",
+    );
+  }),
+);
+
+test(
   "recordTerminalRun's status re-validation guard: a resumed (live, running) run survives an overflow triggered by its OWN stale queue entry",
   withTempCwd(async (cwd) => {
     // Repro for the guard's necessity (single manager, real queue pressure —
@@ -3549,17 +3799,22 @@ test(
     assert.equal(manager.getRun(pausedId)?.status, "paused");
 
     // Let pause()'s abort-triggered executeRun() tail fully settle BEFORE
-    // stopping — the realistic case the fix targets. By now the run's only
-    // executeRun() promise has already resolved once (as "paused", which is
-    // deliberately NOT enqueued for eviction — see IN_MEMORY_TERMINAL_STATUSES),
-    // so nothing will ever call recordTerminalRun() for it again except
-    // stop() itself.
+    // stopping — the realistic case the fix targets. The paused snapshot is
+    // now in the separate bounded paused-retention queue, but it is not a
+    // terminal entry until stop() records it below.
     da.resolve("done");
     await promise.catch(() => {});
     assert.equal(manager.getRun(pausedId)?.status, "paused", "still paused; the already-settled tail didn't change it");
 
     assert.equal(manager.stop(pausedId), true);
     assert.equal(manager.getRun(pausedId)?.status, "aborted");
+    assert.equal(
+      (manager as unknown as { pausedRunQueue: Array<{ runId: string }> }).pausedRunQueue.some(
+        (entry) => entry.runId === pausedId,
+      ),
+      false,
+      "terminalizing a paused run must clear its stale paused retention entry",
+    );
 
     // One more terminal run overflows the cap (1): the stopped run must be
     // the one evicted — proving stop() itself recorded it terminal-eligible
@@ -3572,6 +3827,118 @@ test(
       undefined,
       "stop() must have recorded the already-settled paused run as terminal-eligible, so it's evicted here",
     );
+  }),
+);
+
+test(
+  "pause persistence failure keeps the aborted generation paused instead of resurrecting ghost running state",
+  withTempCwd(async (cwd) => {
+    const deferred = deferredAgent();
+    const manager = new WorkflowManager({ cwd, agent: deferred.runner });
+    manager.on("error", () => {});
+    const started = manager.startInBackground(oneAgentScript);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(
+      manager.enqueueUserMessage("discard after blocked pause", started.runId, "same_task_correction"),
+      started.runId,
+    );
+
+    const persistence = manager.getPersistence();
+    const originalSave = persistence.save.bind(persistence);
+    let blocked = true;
+    persistence.save = ((...args: Parameters<typeof persistence.save>) => {
+      if (blocked) throw new Error("injected pause persistence failure");
+      return originalSave(...args);
+    }) as typeof persistence.save;
+
+    assert.equal(manager.pause(started.runId), false);
+    assert.equal(manager.getRun(started.runId)?.status, "paused");
+    assert.equal(manager.getRun(started.runId)?.controller.signal.aborted, true);
+    assert.equal(manager.getRun(started.runId)?.persistenceBlocked, true);
+    assert.equal(manager.getResourceDiagnostics().persistenceBlockedRuns, 1);
+
+    // Keep the final executeRun checkpoint blocked too. The generation must
+    // settle as paused and release its lease without being turned back into a
+    // fake running entry.
+    deferred.resolve();
+    await started.promise.catch(() => {});
+    assert.equal(manager.getRun(started.runId)?.status, "paused");
+    assert.equal(manager.getResourceDiagnostics().pendingMessageRuns, 0);
+    assert.equal(manager.getResourceDiagnostics().activeExecutions, 0);
+    const releasedLease = persistence.acquireRunLease(started.runId);
+    assert.ok(releasedLease, "settled persistence-blocked pause must not strand its lease");
+    if (releasedLease) persistence.releaseRunLease(releasedLease);
+
+    // Once durable publication is available again, the stale running record is
+    // still a valid recovery boundary and can be resumed by this manager.
+    blocked = false;
+    assert.equal(await manager.resume(started.runId), true);
+    await manager.getRun(started.runId)?.execution;
+    assert.equal(manager.listRuns().find((run) => run.runId === started.runId)?.status, "completed");
+  }),
+);
+
+test(
+  "stop persistence failure keeps a terminal aborted generation and bounds its retention",
+  withTempCwd(async (cwd) => {
+    const deferred = deferredAgent();
+    const manager = new WorkflowManager({ cwd, agent: deferred.runner, maxTerminalRunsInMemory: 1 });
+    manager.on("error", () => {});
+    const started = manager.startInBackground(oneAgentScript);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(
+      manager.enqueueUserMessage("discard after blocked stop", started.runId, "same_task_correction"),
+      started.runId,
+    );
+
+    const persistence = manager.getPersistence();
+    persistence.save = ((..._args: Parameters<typeof persistence.save>) => {
+      throw new Error("injected stop persistence failure");
+    }) as typeof persistence.save;
+
+    assert.equal(manager.stop(started.runId), false);
+    assert.equal(manager.getRun(started.runId)?.status, "aborted");
+    assert.equal(manager.getRun(started.runId)?.controller.signal.aborted, true);
+    assert.equal(manager.getRun(started.runId)?.stopRequested, true);
+    assert.equal(manager.getRun(started.runId)?.persistenceBlocked, true);
+
+    deferred.resolve();
+    await started.promise.catch(() => {});
+    assert.equal(manager.getRun(started.runId)?.status, "aborted");
+    assert.equal(manager.getResourceDiagnostics().persistenceBlockedRuns, 1);
+    assert.equal(manager.getResourceDiagnostics().pendingMessageRuns, 0);
+    assert.equal(manager.getResourceDiagnostics().activeExecutions, 0);
+    const releasedLease = persistence.acquireRunLease(started.runId);
+    assert.ok(releasedLease, "settled persistence-blocked stop must not strand its lease");
+    if (releasedLease) persistence.releaseRunLease(releasedLease);
+    assert.equal(await manager.resume(started.runId), false, "a stop remains terminal even when its save failed");
+  }),
+);
+
+test(
+  "persistence-blocked terminal runs use the same bounded in-memory retention as durable terminals",
+  withTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: fakeAgent(), maxTerminalRunsInMemory: 2 });
+    const persistence = manager.getPersistence();
+    const originalSave = persistence.save.bind(persistence);
+    persistence.save = ((...args: Parameters<typeof persistence.save>) => {
+      const [state] = args;
+      if (state.status === "completed" || state.status === "failed" || state.status === "aborted") {
+        throw new Error("injected terminal persistence failure");
+      }
+      return originalSave(...args);
+    }) as typeof persistence.save;
+
+    for (let i = 0; i < 6; i++) {
+      await assert.rejects(
+        manager.runSync(oneAgentScript),
+        (error: unknown) => error instanceof WorkflowError && error.code === WorkflowErrorCode.PERSISTENCE_ERROR,
+      );
+    }
+
+    const diagnostics = manager.getResourceDiagnostics();
+    assert.equal(diagnostics.inMemoryRuns, 2, "blocked terminal snapshots must be evicted at the configured cap");
+    assert.equal(diagnostics.persistenceBlockedRuns, 2, "only retained blocked terminals count in the live diagnostic");
   }),
 );
 

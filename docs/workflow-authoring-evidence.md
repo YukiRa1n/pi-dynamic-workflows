@@ -4,16 +4,21 @@ This report records review evidence for the compact workflow tool contract and t
 
 ## Context surfaces
 
-Measurements use UTF-8 bytes. The historical baseline is `818fdd8` (release 3.0.0), captured when concision work began. The candidate is the final tree on `feat/self-documenting-workflow-capabilities`.
+Measurements use UTF-8 bytes. `docs/workflow-context-surfaces.json` is generated from the current source and is the release-checked authority for these values.
 
-| Surface | Baseline (`818fdd8`) | Candidate | Change |
-| --- | ---: | ---: | ---: |
-| Permanent workflow prompt | 766 | 742 | -24 |
-| Provider-visible workflow tool definition | 9,558 | 3,918 | -5,640 |
-| Workflow-authoring skill discovery | 0 | 338 | +338 |
-| Ordinary workflow-owned always-on total | 10,324 | 4,998 | -5,326 (-51.6%) |
+| Surface | Current bytes | Activation |
+| --- | ---: | --- |
+| Stable workflow prompt | 0 | Every turn |
+| Stable workflow tool definition | 1,140 | Every turn |
+| Explicit-request rewrite | 23 | Explicit workflow request |
+| Forced command rewrite | 55 | `/workflows run` |
+| Stable workflow-owned context | 1,140 | Stable prompt plus tool definition |
+| Explicit workflow request context | 1,163 | Stable context plus explicit-request rewrite |
+| Ordinary workflow-family definitions | 1,140 | One start-only `workflow` tool |
+| Registered skill discovery | 453 | Ordinary Pi skill discovery |
+| Ordinary workflow-owned total | 1,593 | Stable tool plus skill discovery |
 
-The candidate also records 67,089 bytes across 27 on-demand skill files. Six representative authoring profiles have a median of 11,662 bytes. `docs/workflow-context-surfaces.json` is the generated, release-checked source for candidate measurements.
+The authoring skill records 76,700 bytes across 28 on-demand files. Six representative authoring profiles have a median of 14,354.5 bytes. Deterministic tests cap the stable prompt contribution at 160 B and the provider-visible workflow definition at 1,600 B. Skill discovery and representative on-demand profiles are measured separately so changes remain visible without mixing them into the tool-schema budget.
 
 ## Post-tuning comprehension validation
 
@@ -53,10 +58,12 @@ An earlier corrected-harness sample scored pre-trim at 75/81 and optimized at 71
 
 A separate protected check ran the six core scenarios three times on GPT-5.4 Mini and GPT-5.6 Luna and passed 36/36. Their three-scenario coverage gate passed 18/18. The final candidate did not repeat the earlier nine-model, 162-case core panel.
 
-## Reproduction and retention
+## Reproduction, cache warming, and replay
 
 The optional harness is available through `npm run comprehension -- --suite coverage --model <provider/model:thinking> --output <path>`. It records the selected and resolved model, thinking level, skill-loading evidence, generated workflow, runtime evidence, assertions, and token usage.
 
-The delivery-choice harness has a deterministic scorer and optional provider CLI for background versus inline delivery and token-budget intent. It expects ordinary requests to omit `tokenBudget` and preserves an explicit user cap exactly. A final-candidate run with `openai-codex/gpt-5.6-sol:high` passed 3/3 scenarios: the model omitted `tokenBudget` for both ordinary requests and preserved the explicit `200000` cap.
+The delivery-choice harness has a deterministic scorer and optional provider CLI for background delivery and token-budget intent. It expects ordinary requests to omit `tokenBudget` and preserves an explicit user cap exactly. A final-candidate run with `openai-codex/gpt-5.6-sol:high` passed 3/3 scenarios: the model omitted `tokenBudget` for both ordinary requests and preserved the explicit `200000` cap.
+
+The cache-warm contract is provider-specific: compatible Anthropic fan-out followers wait only until the owner's first assistant response starts; `PI_CACHE_RETENTION=none` disables the warm gate, while `short` and `long` select bounded windows. Journal replay uses a run-level provider-context identity so nested and retried calls do not collide on a local call index. These are separate controls: disabling cache warming does not disable durable replay.
 
 Raw provider evidence remains local and uncommitted because it is large and variable. The committed release gate verifies the harness, parser/runtime replay seam, package discovery, coverage manifest, generated references, context measurements, and all model-free examples without making provider calls.

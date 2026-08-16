@@ -46,7 +46,7 @@ export interface WorkflowSettings {
   deliveredResultMaxChars?: number;
   /**
    * Extra tool names to deny in workflow subagent sessions, on top of the
-   * always-on `workflow`/`workflow_control` defaults (#107). Use it to block
+   * built-in workflow-family defaults (#107). Use it to block
    * other recursive-orchestration tools you have installed (e.g. a pi-subagents
    * tool) so a subagent can't fan out through them.
    */

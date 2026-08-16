@@ -1,8 +1,9 @@
 /**
  * Workflow logger with file persistence.
  */
-import { appendFileSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, lstatSync, mkdirSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { MAX_WORKFLOW_LOG_BYTES, MAX_WORKFLOW_LOG_ENTRIES } from "./config.js";
 import { assertSafeRunId } from "./run-persistence.js";
 import { workflowProjectPaths } from "./workflow-paths.js";
 export function createWorkflowLogger(options = {}) {
@@ -16,6 +17,10 @@ export function createWorkflowLogger(options = {}) {
     // Number of this logger's entries already published. persist() is allowed to
     // be called repeatedly; only the suffix is appended each time.
     let persistedLogCount = 0;
+    let logBytes = 0;
+    const maxEntries = Math.max(1, Math.min(options.maxEntries ?? MAX_WORKFLOW_LOG_ENTRIES, MAX_WORKFLOW_LOG_ENTRIES));
+    const maxBytes = Math.max(1, Math.min(options.maxBytes ?? MAX_WORKFLOW_LOG_BYTES, MAX_WORKFLOW_LOG_BYTES));
+    let limitMarkerWritten = false;
     const assertSafeLogFile = () => {
         if (!logFile)
             return;
@@ -28,12 +33,44 @@ export function createWorkflowLogger(options = {}) {
                 throw err;
         }
     };
+    const appendBounded = (entry) => {
+        if (!logFile)
+            return false;
+        assertSafeLogFile();
+        const suffix = `${entry}\n`;
+        let existingBytes = 0;
+        try {
+            existingBytes = statSync(logFile).size;
+        }
+        catch {
+            existingBytes = 0;
+        }
+        const prefix = existingBytes > 0 ? "\n" : "";
+        const bytes = Buffer.byteLength(prefix + suffix, "utf8");
+        if (existingBytes + bytes > maxBytes)
+            return false;
+        appendFileSync(logFile, prefix + suffix, { encoding: "utf-8", mode: 0o600 });
+        return true;
+    };
     const write = (level, message) => {
         const timestamp = new Date().toISOString();
-        const entry = `[${timestamp}] [${level}] ${message}`;
+        let entry = `[${timestamp}] [${level}] ${message}`;
+        let bytes = Buffer.byteLength(entry, "utf8");
+        let publishedMessage = message;
+        if (logs.length >= maxEntries || logBytes + bytes > maxBytes) {
+            if (limitMarkerWritten || logs.length >= maxEntries)
+                return;
+            entry = `[${timestamp}] [WARN] workflow logger resource limit reached; further entries omitted`;
+            bytes = Buffer.byteLength(entry, "utf8");
+            if (logBytes + bytes > maxBytes)
+                return;
+            limitMarkerWritten = true;
+            publishedMessage = "workflow logger resource limit reached; further entries omitted";
+        }
         logs.push(entry);
+        logBytes += bytes;
         try {
-            options.onLog?.(message);
+            options.onLog?.(publishedMessage);
         }
         catch {
             // Logging observers are diagnostic only; they must never recursively turn
@@ -41,11 +78,11 @@ export function createWorkflowLogger(options = {}) {
         }
         if (persistLogs && logFile) {
             try {
-                assertSafeLogFile();
-                appendFileSync(logFile, `${entry}\n`, { encoding: "utf-8", mode: 0o600 });
-                // The live append already published this entry; persist() must not
-                // append it a second time.
-                persistedLogCount = logs.length;
+                if (appendBounded(entry)) {
+                    // The live append already published this entry; persist() must not
+                    // append it a second time.
+                    persistedLogCount = logs.length;
+                }
             }
             catch {
                 // Silent fail for log persistence; persist() can retry the suffix.
@@ -72,27 +109,22 @@ export function createWorkflowLogger(options = {}) {
                 mkdirSync(runsDir, { recursive: true, mode: 0o700 });
                 logFile = join(runsDir, `${runId}.log`);
                 assertSafeLogFile();
-                // A resumed execution must not clobber pre-pause history, and repeated
-                // persist() calls must not append this logger's prefix again.
-                let existing = "";
-                try {
-                    existing = readFileSync(logFile, "utf-8");
-                }
-                catch {
-                    existing = ""; // no prior log for this run
-                }
+                // Use stat-based bounded suffix writes. Never read or rewrite the
+                // existing run log: resumed/concurrent logger instances share this cap.
                 const pending = logs.slice(persistedLogCount);
-                if (pending.length > 0) {
-                    const prefix = existing && !existing.endsWith("\n") ? "\n" : "";
-                    // Append rather than rewriting the whole file: another logger
-                    // instance may have published entries after the read above. This
-                    // preserves concurrent entries (at worst a retry duplicates a
-                    // suffix, which is preferable to clobbering the log).
-                    appendFileSync(logFile, `${prefix}${pending.join("\n")}\n`, { encoding: "utf-8", mode: 0o600 });
-                    persistedLogCount = logs.length;
+                for (const entry of pending) {
+                    if (!appendBounded(entry))
+                        break;
+                    persistedLogCount++;
                 }
-                else if (!existing) {
-                    writeFileSync(logFile, "", { encoding: "utf-8", mode: 0o600 });
+                if (pending.length === 0) {
+                    try {
+                        if (statSync(logFile).size === 0)
+                            writeFileSync(logFile, "", { encoding: "utf-8", mode: 0o600 });
+                    }
+                    catch {
+                        /* retry later */
+                    }
                 }
                 return logFile;
             }

@@ -99,7 +99,10 @@ async function runScenario(
 ) {
   const isolatedRoot = await mkdtemp(join(tmpdir(), "workflow-delivery-choice-"));
   const captured: { value?: WorkflowToolInput } = {};
-  const workflow = createWorkflowTool({ cwd: isolatedRoot });
+  // This harness intentionally exercises the library compatibility schema so
+  // an explicit user token cap can be verified. It is not the Pi production
+  // surface; routing-choice.ts covers the model-facing start_workflow tool.
+  const workflow = createWorkflowTool({ cwd: isolatedRoot, allowResume: false, exposeAdvancedParameters: true });
   const captureTool = defineTool({
     name: workflow.name,
     label: workflow.label,
@@ -185,7 +188,8 @@ function parseArgs(args: string[]): CliOptions {
 function printUsage(): void {
   process.stdout.write(`Usage: npm run delivery-choice -- --model <provider/model> [--output <path>]
 
-Runs three optional timing and token-budget scenarios against the real workflow tool definition.
+Runs two optional timing and token-budget scenarios against the library compatibility tool definition.
+The Pi production model surface is the separate start_workflow tool in routing-choice.
 The evidence records background versus same-turn delivery, omitted budgets for ordinary requests, and exact user-supplied caps.\n`);
 }
 

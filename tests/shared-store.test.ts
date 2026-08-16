@@ -510,10 +510,11 @@ test("resume degrades gracefully (never corrupts) when replaying a pre-namespaci
 
   // Graceful degradation, not corruption: the surviving legacy entry belongs
   // to the parent's call (its hash matches "outer-call"'s hash under the
-  // collapsed key), so the parent cache-hits and the child — whose own entry
-  // was lost in the collapse — safely re-runs live instead of replaying the
-  // parent's (wrong) cached value. The end result is still correct.
-  assert.equal(secondCalls.count, 1, "the legacy child safely re-runs because its derived runId is absent");
+  // collapsed key), while the child — whose own entry was lost in the
+  // collapse — safely re-runs live. A child miss now propagates to the parent
+  // boundary, so the parent suffix also runs live instead of replaying a
+  // result that was computed against a different shared-store state.
+  assert.equal(secondCalls.count, 2, "a legacy child miss must invalidate the parent suffix");
   // JSON-compare — see the note in the previous test about cross-vm-realm
   // prototypes tripping up assert.deepEqual.
   assert.equal(

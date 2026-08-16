@@ -7,7 +7,8 @@ import type { WorkflowAgent } from "./agent.js";
 import { type WorkflowAgentSnapshot, type WorkflowSnapshot } from "./display.js";
 import { WorkflowError } from "./errors.js";
 import { type DeliveryBudgetState, type PersistedDeliveryRecord, type PersistedRunState, type RunLease, type RunPersistence, type RunStatus } from "./run-persistence.js";
-import { type JournalEntry, type WorkflowRunResult } from "./workflow.js";
+import { type JournalEntry, type WorkflowRunResult, type WorkflowSteeringKind, type WorkflowSteeringMessage } from "./workflow.js";
+import { type ExecutionReservation, type ResourceDiagnostics, WorkflowResourceCoordinator, type WorkflowResourceCoordinatorOptions } from "./workflow-resource-coordinator.js";
 export interface ManagedRun {
     runId: string;
     status: RunStatus;
@@ -29,6 +30,8 @@ export interface ManagedRun {
      * while the aborted provider generation may still be unwinding.
      */
     executionSettled?: boolean;
+    /** Last retention class published by the settled-tail cleanup. */
+    settledCleanupStatus?: "paused" | "terminal";
     /** Monotonic manager-local start/resume order for unqualified message routing. */
     activitySeq: number;
     /** Cross-process execution lease for this run, when it is actively executing. */
@@ -132,6 +135,14 @@ export interface ManagedRun {
     nextDeliverySequence: number;
     /** Finite explicit-delivery accounting, retained after acknowledgements. */
     deliveryBudget: DeliveryBudgetState;
+    /** Manager-wide execution reservation owned by this generation. */
+    resourceExecutionHeld?: boolean;
+    resourceExecutionReleased?: boolean;
+    /** Exact single-use coordinator capability for this execution generation. */
+    resourceExecutionReservation?: ExecutionReservation;
+    /** Distinguishes isolated worktree ownership across resume generations. */
+    executionGeneration?: string;
+    persistenceBlocked?: boolean;
 }
 /** Per-execution options shared by sync, background, and resume runs. */
 export interface ExecOptions {
@@ -198,6 +209,19 @@ export interface ExecOptions {
 export interface WorkflowManagerOptions {
     cwd?: string;
     concurrency?: number;
+    /** Bounded manager-wide execution/provider resources. */
+    resourceLimits?: WorkflowResourceCoordinatorOptions;
+    /** Convenience aliases for resourceLimits (kept explicit for host settings). */
+    maxActiveExecutions?: number;
+    maxProviderConcurrency?: number;
+    maxQueuedProviderAttempts?: number;
+    maxLateAttempts?: number;
+    maxPausedRunsOnDisk?: number;
+    maxPausedBytesOnDisk?: number;
+    /** Inject a coordinator so reloads/tests can retain one resource budget. */
+    resourceCoordinator?: WorkflowResourceCoordinator;
+    /** Namespace used when an explicitly shared coordinator is injected. */
+    resourceNamespace?: string;
     /** Resolve a saved-workflow name to its script, enabling nested `workflow('name')`. */
     loadSavedWorkflow?: (name: string) => string | undefined;
     /** Inject a custom agent runner (tests); defaults to a real subagent session. */
@@ -229,13 +253,13 @@ export interface WorkflowManagerOptions {
     toolsets?: Record<string, () => ToolDefinition[]>;
     /**
      * Extra tool NAMES to deny in every subagent session, on top of the always-on
-     * `workflow`/`workflow_control` defaults (see DEFAULT_EXCLUDED_SUBAGENT_TOOLS).
+     * workflow-family defaults (see DEFAULT_EXCLUDED_SUBAGENT_TOOLS).
      * Host wiring passes settings.excludeSubagentTools here so users can also block
      * other recursive-orchestration tools (#107).
      */
     excludeSubagentTools?: string[];
     /**
-     * Bridge for the workflow runtime's deliver(message) global. Host wiring
+     * Bridge for the workflow runtime's classified deliver() global. Host wiring
      * (extensions/workflow.ts) sets this per generation so messages land in the
      * current session's conversation. Delivery identity is supplied by the
      * manager's durable outbox and must be preserved by the host.
@@ -243,6 +267,7 @@ export interface WorkflowManagerOptions {
     onDeliver?: (message: string, source?: {
         runId: string;
         workflowName: string;
+        alertKind: "blocker" | "critical_finding" | "decision";
         deliveryId?: string;
         sequence?: number;
     }) => void | Promise<void>;
@@ -288,15 +313,13 @@ export declare class WorkflowManager extends EventEmitter {
      *  - An entry is added when a run starts (startInBackground/runSync) or is
      *    resumed (resume()), always with a live AbortController and (usually)
      *    an active RunLease.
-     *  - While status is "running" or "paused", the entry is NEVER evicted —
-     *    its execution could still settle (a pending executeRun() promise) or
-     *    it is mid-usage-limit-checkpoint/manually-paused and still considered
-     *    "the current state of this run" by callers. Eviction only ever
-     *    considers an entry AFTER executeRun() has fully settled it to
-     *    "completed" | "failed" | "aborted" (see IN_MEMORY_TERMINAL_STATUSES)
-     *    and persisted + released its lease — i.e. strictly after the same
-     *    isCurrent()-gated persistRun()/releaseRunLease() calls in
-     *    executeRun()'s success/catch tails.
+     *  - While status is "running", or "paused" with executeRun() still
+     *    unwinding, the entry is NEVER evicted. An abort-ignoring provider may
+     *    still own callbacks and the execution lease during that interval.
+     *  - Once a paused execution has settled and released its lease, it enters a
+     *    separate bounded FIFO (recordPausedRun()). A persistence-blocked pause
+     *    may still point at the last durable running checkpoint; eviction removes
+     *    only the in-memory snapshot and stale recovery keeps it resumable.
      *  - Once terminal, an entry becomes eviction-ELIGIBLE (recordTerminalRun())
      *    but is not necessarily evicted immediately: up to
      *    maxTerminalRunsInMemory terminal entries are kept, oldest evicted
@@ -331,6 +354,8 @@ export declare class WorkflowManager extends EventEmitter {
      * are harmless.
      */
     private terminalRunQueue;
+    /** Settled paused generations, not just runIds: a stale queue entry from a
+     * prior resume must never evict the current generation for the same runId. */
     private pausedRunQueue;
     private maxTerminalRunsInMemory;
     private maxPausedRunsInMemory;
@@ -353,27 +378,34 @@ export declare class WorkflowManager extends EventEmitter {
     private toolsets?;
     private excludeSubagentTools?;
     private persistAgentSessions;
+    private readonly resources;
+    private readonly resourceNamespace;
+    private readonly maxPausedRunsOnDisk;
+    private readonly ownedWorktreeTokens;
+    private readonly maxPausedBytesOnDisk;
     /** Runtime deliver() bridge; refreshed by host wiring each generation. */
-    onDeliver?: (message: string, source?: {
-        runId: string;
-        workflowName: string;
-        deliveryId?: string;
-        sequence?: number;
-    }) => void | Promise<void>;
+    onDeliver?: WorkflowManagerOptions["onDeliver"];
     /** Optional host observer for live subagent results; not provider delivery by default. */
     onAgentMessage?: WorkflowManagerOptions["onAgentMessage"];
     private pendingMessages;
+    private pendingMessageCount;
+    private pendingMessageBytes;
     private activeAgentSenders;
     constructor(options?: WorkflowManagerOptions);
+    /** Mark a generation as blocked on durable publication without reopening it.
+     * An aborted controller cannot be restarted, so restoring `running` here
+     * would leave a ghost entry that rejects both resume and new work. */
+    private markPersistenceBlocked;
     /** Bind the manager to the current pi session, so new runs are tagged with it and
      * the navigator/task-panel show only this session's runs (set on session_start). */
     setSessionId(id: string | undefined): void;
-    /** Queue a host-session message for a specific, or newest, running workflow. */
-    enqueueUserMessage(message: string, runId?: string): string | undefined;
+    /** Queue a host-session message for one explicitly identified running workflow. */
+    enqueueUserMessage(message: string, runId: string, kind: WorkflowSteeringKind): string | undefined;
     /** Atomically take messages queued for a run before its next agent() call. */
-    takePendingMessages(runId: string): string[];
-    /** Send immediately to a currently running child session by its agent id. */
-    sendToAgent(message: string, agentId: string, runId?: string): Promise<string | undefined>;
+    takePendingMessages(runId: string): WorkflowSteeringMessage[];
+    private dropPendingMessages;
+    /** Send immediately to a child in one explicitly identified running workflow. */
+    sendToAgent(message: string, agentId: string, runId: string, kind: WorkflowSteeringKind): Promise<string | undefined>;
     /** Project cwd this manager was constructed for (persistence + agent tools). */
     getCwd(): string;
     /**
@@ -428,6 +460,7 @@ export declare class WorkflowManager extends EventEmitter {
      * a caller (e.g. the workflow tool) drive its own inline display.
      */
     runSync(script: string, args?: unknown, exec?: ExecOptions): Promise<WorkflowRunResult>;
+    private assertPausedDurableCapacity;
     private admitArgs;
     /** Build a fresh managed run with an empty snapshot. */
     private createManaged;
@@ -459,6 +492,7 @@ export declare class WorkflowManager extends EventEmitter {
      * must not write to disk or touch lease state on the newer execution's
      * behalf — see writeRunToDisk() and executeRun()'s post-await persist calls.
      */
+    private releaseExecutionCapacity;
     private isCurrent;
     /** A bound session may only recover/control records explicitly owned by it.
      * Legacy unowned records fail closed once a session is known. */
@@ -490,18 +524,20 @@ export declare class WorkflowManager extends EventEmitter {
      */
     private safeEmit;
     /**
-     * Mark `runId` as eviction-eligible now that its execution has genuinely
-     * settled to a terminal status (completed/failed/aborted — see
-     * IN_MEMORY_TERMINAL_STATUSES), and evict the oldest eligible entries
-     * beyond maxTerminalRunsInMemory. Callers must only invoke this after the
-     * same isCurrent()-gated persistRun()/releaseRunLease() sequence executeRun()
-     * already uses (see the `runs` field doc comment for the full contract) —
-     * this method itself re-validates the CURRENT entry's status before
-     * deleting anything, so it never evicts a run that isn't (or is no longer)
-     * genuinely terminal, including one resumed back to "running" after being
-     * queued here but before its turn to be evicted came up.
+     * Mark a settled paused run as in-memory eviction-eligible. Callers invoke
+     * this only from executeRun's settled tail, after sender cleanup and lease
+     * release. Re-read the current entry before deleting so a stale queue item
+     * can never evict a resumed generation for the same runId. The durable record
+     * may be stale when publication is persistence-blocked; recovery still treats
+     * running/paused records as resumable boundaries.
      */
     private recordPausedRun;
+    /**
+     * Mark `runId` as eviction-eligible now that its execution has genuinely
+     * settled to a terminal status, and evict the oldest eligible entries.
+     * The current status is revalidated so stale queue entries cannot evict a
+     * resumed live generation.
+     */
     private recordTerminalRun;
     /**
      * Additively fold one agent-call's token cost into the run-wide persisted
@@ -514,6 +550,15 @@ export declare class WorkflowManager extends EventEmitter {
      */
     private accumulateTokenUsage;
     private cleanupManagedSenders;
+    /**
+     * Release every resource owned by a generation whose executeRun() tail has
+     * settled. This is intentionally idempotent: pause()/stop() can observe an
+     * already-settled generation while the normal catch/finally path may also
+     * be unwinding. The current-object check preserves generation fencing; a
+     * stale generation may release only resources already detached by
+     * deleteRun()/resume(), never a replacement run with the same runId.
+     */
+    private cleanupSettledGeneration;
     private releaseRunLease;
     /** Trailing-edge throttle window for high-frequency progress persists (see schedulePersist). */
     private static readonly PERSIST_THROTTLE_MS;
@@ -582,6 +627,15 @@ export declare class WorkflowManager extends EventEmitter {
      * Get status of a specific run.
      */
     getRun(runId: string): ManagedRun | undefined;
+    /** Fresh, bounded resource view for operators and regression tests. */
+    getResourceDiagnostics(): ResourceDiagnostics & {
+        inMemoryRuns: number;
+        persistedRunCount: number;
+        persistedRunBytes: number;
+        durableHighWaterBytes?: number;
+        durableHighWaterCount?: number;
+        ownedWorktrees: number;
+    };
     /**
      * List all runs (active + persisted).
      */
@@ -593,6 +647,13 @@ export declare class WorkflowManager extends EventEmitter {
     listRuns(): PersistedRunState[];
     /** All persisted runs regardless of session (used by cross-session recovery). */
     listAllRuns(): PersistedRunState[];
+    /** Explicit dry-run-by-default cleanup for abandoned paused records. */
+    prunePausedRuns(options?: {
+        before?: Date | string | number;
+        maxRuns?: number;
+        maxBytes?: number;
+        dryRun?: boolean;
+    }): import("./run-persistence.js").PausedPruneResult;
     /**
      * Get snapshot of a run.
      */

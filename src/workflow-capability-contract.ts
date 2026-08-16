@@ -43,7 +43,8 @@ export interface OptionShape {
     | "judge-panel-options"
     | "loop-until-dry-options"
     | "retry-options"
-    | "gate-options";
+    | "gate-options"
+    | "classified-delivery";
   options: readonly OptionDescriptor[];
 }
 
@@ -246,6 +247,13 @@ const GATE_OPTIONS: OptionShape = {
     ]),
   ],
 };
+const CLASSIFIED_DELIVERY: OptionShape = {
+  id: "classified-delivery",
+  options: [
+    option("kind", '"blocker" | "critical_finding" | "decision"', false),
+    option("message", "string", false, null, ["non-empty after trimming", "at most 8000 characters"]),
+  ],
+};
 
 interface RuntimeDescriptorOptions {
   signature?: string;
@@ -318,9 +326,9 @@ const capabilities: readonly CapabilityDescriptor[] = [
     evidence: ["tests/workflow-runtime.test.ts", "tests/agent-registry.test.ts", "tests/structured-output.test.ts"],
   }),
   runtimeGlobal("parallel", {
-    signature: "parallel(thunks) => Promise<Array<unknown | null>>",
+    signature: "parallel(thunks[] | ...thunks) => Promise<Array<unknown | null>>",
     constraints: [
-      "requires functions rather than promises",
+      "accepts one array of functions or variadic functions, never promises",
       "result order matches input order",
       "recoverable thunk failures become null; nonrecoverable failures throw",
     ],
@@ -441,8 +449,14 @@ const capabilities: readonly CapabilityDescriptor[] = [
   }),
   runtimeGlobal("log", { signature: "log(message) => void" }),
   runtimeGlobal("deliver", {
-    signature: "deliver(message) => Promise<void>",
-    constraints: ["delivers a message into the host conversation when the host wired onDeliver; no-op otherwise"],
+    signature: "deliver({ kind, message }) => Promise<void>",
+    optionShape: "classified-delivery",
+    constraints: [
+      "kind is blocker, critical_finding, or decision",
+      "message is non-empty and at most 8000 characters",
+      "progress, acknowledgements, and routine results are rejected by contract and belong in logs or final output",
+      "delivers into the host conversation when the host wired onDeliver; no-op otherwise",
+    ],
   }),
   runtimeGlobal("phase", {
     signature: "phase(title, options?) => void",
@@ -469,7 +483,6 @@ const capabilities: readonly CapabilityDescriptor[] = [
   toolInput("script", "script?: string", ["required raw JavaScript workflow source unless `name` is given"]),
   toolInput("name", "name?: string", [
     "resolves a project/user saved workflow first, then one of the 5 built-in patterns",
-    "mutually exclusive with resumeFromRunId",
   ]),
   toolInput("args", "args?: Record<string, unknown>", [
     "top-level JSON object; built-in workflows consume named fields",
@@ -484,11 +497,6 @@ const capabilities: readonly CapabilityDescriptor[] = [
   ]),
   toolInput("tokenBudget", "tokenBudget?: number = configured default or unlimited", [
     "soft pre-call gate; in-flight work can overshoot",
-  ]),
-  toolInput("resumeFromRunId", "resumeFromRunId?: string", [
-    "resumes a prior incomplete run with an edited script",
-    "unchanged positional agent calls replay from cache until the first changed or inserted call",
-    "always runs in the background",
   ]),
   {
     id: "workflow.script.metadata",
@@ -636,6 +644,7 @@ export const WORKFLOW_CAPABILITY_DEFINITION: WorkflowCapabilityDefinition = {
     LOOP_UNTIL_DRY_OPTIONS,
     RETRY_OPTIONS,
     GATE_OPTIONS,
+    CLASSIFIED_DELIVERY,
   ],
   capabilities,
   dynamicReferences: [

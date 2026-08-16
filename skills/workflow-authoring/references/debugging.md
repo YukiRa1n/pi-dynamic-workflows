@@ -5,7 +5,7 @@ Start from the symptom, then reproduce through the real workflow runtime with de
 | Symptom | Likely authoring cause | Check |
 | --- | --- | --- |
 | Parser says metadata is missing | `export const meta` is not the first statement or is nonliteral | [runtime](runtime.md#script-envelope) |
-| `parallel()` rejects input | Promises were passed instead of thunks | [runtime](runtime.md#topology) |
+| `parallel()` rejects input | Promises were passed instead of thunk functions, or array and variadic forms were mixed | [runtime](runtime.md#topology) |
 | Synthesis starts early | Fan-out was not awaited as one complete result set | [pattern selection](pattern-selection.md#fan-out-and-synthesize) |
 | Coverage silently disappears | `null` results were filtered before IDs were ledgered | [lifecycle](lifecycle.md#retry-and-recoverable-failure) |
 | Wrong model is used | A higher-priority selector overrides the expected route | [registry ownership](registry-ownership.md#priority) |

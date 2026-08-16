@@ -1,48 +1,76 @@
 {
-  "formatVersion": 3,
+  "formatVersion": 7,
   "encoding": "utf8",
   "sources": [
     "src/workflow-tool.ts",
+    "src/workflow-editor.ts",
     "skills/workflow-authoring",
     "package.json#pi.skills"
   ],
   "surfaces": {
     "permanentWorkflowPrompt": {
-      "serialization": "UTF-8 bytes of LF-joined Pi prompt lines",
-      "bytes": 772
+      "serialization": "UTF-8 bytes of LF-joined stable Pi prompt lines contributed by workflow",
+      "bytes": 0
     },
     "providerVisibleWorkflowToolDefinition": {
-      "serialization": "UTF-8 bytes of JSON.stringify({ name, description, parameters })",
-      "bytes": 4063
+      "serialization": "UTF-8 bytes of the stable JSON.stringify({ name, description, parameters }) workflow definition",
+      "bytes": 737
+    },
+    "providerVisibleAlwaysOnToolDefinitions": {
+      "serialization": "sum of stable provider-visible workflow tool definitions on ordinary turns",
+      "bytes": 737,
+      "tools": [
+        {
+          "name": "start_workflow",
+          "serialization": "UTF-8 bytes of JSON.stringify({ name, description, parameters })",
+          "bytes": 737
+        }
+      ]
+    },
+    "armedWorkflowPromptRewrite": {
+      "serialization": "UTF-8 bytes added by buildArmedWorkflowPrompt to an empty user message",
+      "bytes": 23
+    },
+    "forcedWorkflowPromptRewrite": {
+      "serialization": "UTF-8 bytes added by buildForcedWorkflowPrompt to an empty user message",
+      "bytes": 61
+    },
+    "stableWorkflowOwnedContext": {
+      "serialization": "sum of the stable Pi prompt and provider workflow definition",
+      "bytes": 737
+    },
+    "explicitWorkflowRequestOwnedContext": {
+      "serialization": "stable workflow-owned context plus the explicit-request suffix",
+      "bytes": 760
     },
     "registeredSkillsDiscovery": {
       "serialization": "sum of UTF-8 bytes of normalized Pi skill XML (name + description + location) across every root in package.json's pi.skills",
-      "bytes": 931,
+      "bytes": 453,
       "skills": [
         {
           "root": "skills/workflow-authoring",
           "serialization": "UTF-8 bytes of normalized Pi skill XML with package-relative location",
-          "bytes": 338
+          "bytes": 226
         },
         {
           "root": "skills/workflow-patterns",
           "serialization": "UTF-8 bytes of normalized Pi skill XML with package-relative location",
-          "bytes": 593
+          "bytes": 227
         }
       ]
     },
     "ordinaryWorkflowOwnedAlwaysOn": {
-      "serialization": "sum of permanent prompt, provider-visible tool definition, and every registered skill's discovery bytes",
-      "bytes": 5766
+      "serialization": "sum of the stable workflow definition and every registered skill discovery entry",
+      "bytes": 1190
     },
     "workflowAuthoringSkillCorpus": {
       "serialization": "sum of UTF-8 bytes for every file under skills/workflow-authoring",
       "files": 28,
-      "bytes": 75624
+      "bytes": 76706
     },
     "representativeAuthoringProfiles": {
       "serialization": "sum of UTF-8 bytes for each profile's declared package-relative files",
-      "medianBytes": 13384,
+      "medianBytes": 14360.5,
       "profiles": [
         {
           "name": "write",
@@ -54,7 +82,7 @@
             "skills/workflow-authoring/examples/fan-out-and-synthesize.js",
             "skills/workflow-authoring/examples/structured-output.js"
           ],
-          "bytes": 13278
+          "bytes": 14230
         },
         {
           "name": "edit",
@@ -66,7 +94,7 @@
             "skills/workflow-authoring/examples/phased-budgets.js",
             "skills/workflow-authoring/examples/saved-nested-workflows.js"
           ],
-          "bytes": 17893
+          "bytes": 18845
         },
         {
           "name": "review",
@@ -77,7 +105,7 @@
             "skills/workflow-authoring/references/quality-helpers.md",
             "skills/workflow-authoring/examples/adversarial-verification.js"
           ],
-          "bytes": 12124
+          "bytes": 13076
         },
         {
           "name": "debug",
@@ -88,7 +116,7 @@
             "skills/workflow-authoring/references/specialized-helpers.md",
             "skills/workflow-authoring/examples/validated-gate.js"
           ],
-          "bytes": 13490
+          "bytes": 14491
         },
         {
           "name": "loop",
@@ -101,7 +129,7 @@
             "skills/workflow-authoring/examples/loop-until-done.js",
             "skills/workflow-authoring/examples/structured-output.js"
           ],
-          "bytes": 18429
+          "bytes": 19381
         },
         {
           "name": "retry",
@@ -113,7 +141,7 @@
             "skills/workflow-authoring/examples/bounded-semantic-retry.js",
             "skills/workflow-authoring/examples/structured-output.js"
           ],
-          "bytes": 12256
+          "bytes": 13208
         }
       ]
     }

@@ -26,8 +26,19 @@ const RUN_EVENTS = [
     "resumed",
 ];
 /** Events after which a run is gone and its token-rate samples can be dropped. */
-const RUN_END_EVENTS = ["complete", "error", "stopped"];
+const RUN_END_EVENTS = ["complete", "error", "stopped", "paused", "deleted"];
+const MAX_TOKEN_SAMPLES_PER_RUN = 128;
+const MAX_TOKEN_SAMPLE_RUNS = 1024;
 const DEFAULT_DELIVERY_RESULT_CHARS = 12_000;
+/** Standalone retry projections are only a cache. Durable terminal deliveries
+ * remain authoritative in WorkflowManager's outbox and are reconstructed on
+ * every resume, so this queue can be hard-bounded without losing results. */
+const MAX_PENDING_DELIVERY_PROJECTIONS = 32;
+/** Standalone hosts cannot observe provider acceptance, so submit only a
+ * bounded number of durable records per host generation. Remaining records
+ * stay in the outbox for a later generation instead of expanding a process-
+ * lifetime dedup set without limit. */
+const MAX_STANDALONE_SUBMISSIONS_PER_GENERATION = 512;
 /**
  * Build a bounded provider-visible projection of the workflow's semantic return
  * value. The complete value remains in the persisted run and interactive pager.
@@ -156,24 +167,42 @@ function deliveryManager(manager) {
     return manager;
 }
 function enqueuePending(holder, payload) {
-    // Soft-cap only: warn loudly, never drop. The full result is also on disk
-    // via the run JSON pointer in deliverText, but conversation delivery is the
-    // contract the tool promises — silent shift() would break it.
-    if (holder.pending.length >= 32) {
-        console.warn(`[workflow-delivery] pending queue at ${holder.pending.length} entries; ` +
-            "delivery is stalled (no successful flush since suspend/failure). " +
-            "Results remain on disk via /workflows.");
+    const deliveryId = payload.details?.deliveryId;
+    if (deliveryId && holder.pending.some((item) => item.details?.deliveryId === deliveryId))
+        return;
+    if (holder.pending.length >= MAX_PENDING_DELIVERY_PROJECTIONS) {
+        // Durable records are replayed from WorkflowManager's stable-ID outbox on
+        // resume. Keep the bounded in-memory cache biased toward the newest event;
+        // an evicted durable projection is not acknowledged or deleted and will be
+        // reconstructed later. Non-durable usage-limit notices are best-effort and
+        // may be displaced under sustained delivery failure.
+        holder.pending.shift();
+        if (!holder.warnedProjectionEviction) {
+            holder.warnedProjectionEviction = true;
+            console.warn(`[workflow-delivery] pending projection cache reached ${MAX_PENDING_DELIVERY_PROJECTIONS} entries; ` +
+                "older projections may be evicted from memory. Durable results remain replayable via /workflows.");
+        }
     }
     holder.pending.push(payload);
 }
 function trySend(holder, payload) {
     const startedGeneration = holder.generation;
-    const durable = Boolean(payload.details?.runId && payload.details.deliveryId);
-    if (durable &&
-        !holder.manager.acknowledgeDelivery(payload.details.runId, payload.details.deliveryId, startedGeneration, "submitted")) {
+    const runId = payload.details?.runId;
+    const deliveryId = payload.details?.deliveryId;
+    const standalone = !holder.sendResult;
+    if (standalone &&
+        deliveryId &&
+        !holder.submittedGeneration.has(deliveryId) &&
+        holder.submittedGeneration.size >= MAX_STANDALONE_SUBMISSIONS_PER_GENERATION) {
         enqueuePending(holder, payload);
         return;
     }
+    if (runId && deliveryId && !holder.manager.acknowledgeDelivery(runId, deliveryId, startedGeneration, "submitted")) {
+        enqueuePending(holder, payload);
+        return;
+    }
+    if (standalone && deliveryId)
+        holder.submittedGeneration.set(deliveryId, startedGeneration);
     try {
         if (holder.sendResult) {
             holder.sendResult(payload);
@@ -190,6 +219,9 @@ function trySend(holder, payload) {
         // replay it at-least-once; only the full extension bridge can acknowledge
         // after provider acceptance.
         void Promise.resolve(ret).catch((err) => {
+            if (standalone && deliveryId && holder.submittedGeneration.get(deliveryId) === startedGeneration) {
+                holder.submittedGeneration.delete(deliveryId);
+            }
             enqueuePending(holder, payload);
             const msg = err instanceof Error ? err.message : String(err);
             console.warn(`[workflow-delivery] async send failed; queued for retry: ${msg}`);
@@ -199,6 +231,9 @@ function trySend(holder, payload) {
         });
     }
     catch (err) {
+        if (standalone && deliveryId && holder.submittedGeneration.get(deliveryId) === startedGeneration) {
+            holder.submittedGeneration.delete(deliveryId);
+        }
         enqueuePending(holder, payload);
         const msg = err instanceof Error ? err.message : String(err);
         console.warn(`[workflow-delivery] send failed; queued for retry: ${msg}`);
@@ -208,6 +243,7 @@ function flushPending(holder) {
     if (holder.suspended || holder.pending.length === 0)
         return;
     const queued = holder.pending.splice(0, holder.pending.length);
+    holder.warnedProjectionEviction = false;
     for (const payload of queued)
         trySend(holder, payload);
 }
@@ -215,9 +251,17 @@ function flushPending(holder) {
  * Standalone consumers do not have extensions/workflow.ts's richer bridge, so
  * they must refill from the manager's durable outbox themselves. */
 function replayStandaloneOutbox(holder) {
+    if (holder.sendResult)
+        return;
     try {
-        for (const record of holder.manager.listPendingDeliveries()) {
-            if (record.kind !== "terminal")
+        const records = holder.manager
+            .listPendingDeliveries()
+            .filter((record) => record.kind === "terminal")
+            .sort((a, b) => (a.generation ?? -1) - (b.generation ?? -1) || a.sequence - b.sequence);
+        for (const record of records) {
+            if (holder.pending.length >= MAX_PENDING_DELIVERY_PROJECTIONS)
+                break;
+            if (holder.submittedGeneration.get(record.deliveryId) === holder.generation)
                 continue;
             if (holder.pending.some((item) => item.details?.deliveryId === record.deliveryId))
                 continue;
@@ -267,8 +311,19 @@ export function resumeResultDelivery(manager) {
     if (!holder)
         return;
     holder.suspended = false;
-    replayStandaloneOutbox(holder);
+    // First submit the bounded live retry cache, then refill from the durable
+    // outbox in finite batches. Durable outboxes are schema-bounded (512 records),
+    // so this pump cannot grow memory or loop without progress.
     flushPending(holder);
+    while (true) {
+        const before = holder.submittedGeneration.size;
+        replayStandaloneOutbox(holder);
+        if (holder.pending.length === 0)
+            break;
+        flushPending(holder);
+        if (holder.pending.length > 0 || holder.submittedGeneration.size === before)
+            break;
+    }
 }
 /**
  * When a background run finishes (or fails), deliver its result back into the
@@ -302,7 +357,7 @@ function installResultContextBridge(pi) {
         const output = [];
         for (let index = 0; index < event.messages.length; index++) {
             const message = event.messages[index];
-            if (!message || message.role !== "custom" || message.customType !== "workflow-result") {
+            if (message?.role !== "custom" || message.customType !== "workflow-result") {
                 output.push(message && typeof message === "object" ? { ...message } : message);
                 continue;
             }
@@ -355,6 +410,7 @@ export function installResultDelivery(pi, manager, opts = {}) {
             m.__holder.loadSettings = opts.loadSettings;
             m.__holder.sendResult = opts.sendResult;
             m.__holder.generation += 1;
+            m.__holder.submittedGeneration.clear();
         }
         return;
     }
@@ -366,6 +422,8 @@ export function installResultDelivery(pi, manager, opts = {}) {
         sendResult: opts.sendResult,
         suspended: false,
         pending: [],
+        submittedGeneration: new Map(),
+        warnedProjectionEviction: false,
         generation: 0,
     };
     const deliver = (payload) => {
@@ -483,6 +541,13 @@ export function sampleTokens(runId, total, now) {
     if (last && last.ts === now && last.total === total)
         return;
     samples.push({ ts: now, total });
+    if (samples.length > MAX_TOKEN_SAMPLES_PER_RUN)
+        samples.splice(0, samples.length - MAX_TOKEN_SAMPLES_PER_RUN);
+    if (!tokenSamples.has(runId) && tokenSamples.size >= MAX_TOKEN_SAMPLE_RUNS) {
+        const oldestRun = tokenSamples.keys().next().value;
+        if (oldestRun)
+            tokenSamples.delete(oldestRun);
+    }
     // Drop samples beyond the rolling window, always keeping ≥2 so a rate is computable.
     while (samples.length > 2 && now - samples[0].ts > RATE_WINDOW_MS)
         samples.shift();
@@ -650,20 +715,48 @@ export function installTaskPanel(_pi, manager, ui, opts = {}) {
     };
     const hasActiveRun = () => manager.listRuns().some((r) => r.status === "running" || r.status === "paused");
     ui.setWidget("workflow-tasks", (tui, theme) => {
-        const onEvent = () => tui.requestRender();
+        let timer;
+        let disposed = false;
+        const stopTimer = () => {
+            if (!timer)
+                return;
+            clearTimeout(timer);
+            timer = undefined;
+        };
+        const syncTimer = () => {
+            if (disposed)
+                return;
+            if (settings().progressPanelMode !== "detailed" || !hasActiveRun()) {
+                stopTimer();
+                return;
+            }
+            if (timer)
+                return;
+            timer = setTimeout(() => {
+                timer = undefined;
+                if (disposed)
+                    return;
+                tui.requestRender();
+                syncTimer();
+            }, 2000);
+            timer.unref?.();
+        };
+        const onEvent = () => {
+            tui.requestRender();
+            syncTimer();
+        };
         for (const ev of RUN_EVENTS)
             manager.on(ev, onEvent);
-        const onRunEnd = ({ runId }) => clearTokenSamples(runId);
+        const onRunEnd = ({ runId }) => {
+            clearTokenSamples(runId);
+            syncTimer();
+        };
         for (const ev of RUN_END_EVENTS)
             manager.on(ev, onRunEnd);
-        // In detailed mode, force a redraw every 2s while a run is active so the
-        // token/s rate keeps updating between sparse token events — and decays to 0
-        // when an agent stalls. Gated + unref'd so it costs nothing when idle.
-        const timer = setInterval(() => {
-            if (settings().progressPanelMode === "detailed" && hasActiveRun())
-                tui.requestRender();
-        }, 2000);
-        timer.unref?.();
+        // Detailed mode samples token/s only while at least one run is active.
+        // Compact/idle panels own no periodic timer and perform no settings/disk
+        // reads merely because the widget exists.
+        syncTimer();
         // Purely informational: it lists running runs and re-renders on events. To
         // open the navigator, the user runs /workflows (the panel takes no input).
         const comp = {
@@ -676,7 +769,8 @@ export function installTaskPanel(_pi, manager, ui, opts = {}) {
             },
             invalidate: () => { },
             dispose: () => {
-                clearInterval(timer);
+                disposed = true;
+                stopTimer();
                 for (const ev of RUN_EVENTS)
                     manager.off(ev, onEvent);
                 for (const ev of RUN_END_EVENTS)

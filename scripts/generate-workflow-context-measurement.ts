@@ -12,13 +12,26 @@ const measurement = check ? measureWorkflowContextSurfaces() : writeWorkflowCont
 const {
   permanentWorkflowPrompt,
   providerVisibleWorkflowToolDefinition,
+  providerVisibleAlwaysOnToolDefinitions,
+  armedWorkflowPromptRewrite,
+  forcedWorkflowPromptRewrite,
+  stableWorkflowOwnedContext,
+  explicitWorkflowRequestOwnedContext,
   registeredSkillsDiscovery,
   workflowAuthoringSkillCorpus,
   representativeAuthoringProfiles,
 } = measurement.surfaces;
 
-console.log(`Permanent workflow prompt: ${permanentWorkflowPrompt.bytes} bytes`);
-console.log(`Provider-visible workflow tool definition: ${providerVisibleWorkflowToolDefinition.bytes} bytes`);
+console.log(`Stable workflow prompt: ${permanentWorkflowPrompt.bytes} bytes`);
+console.log(`Stable workflow tool definition: ${providerVisibleWorkflowToolDefinition.bytes} bytes`);
+console.log(`Explicit-request rewrite: ${armedWorkflowPromptRewrite.bytes} bytes`);
+console.log(`Forced command rewrite: ${forcedWorkflowPromptRewrite.bytes} bytes`);
+console.log(`Stable workflow-owned context: ${stableWorkflowOwnedContext.bytes} bytes`);
+console.log(`Explicit workflow request context: ${explicitWorkflowRequestOwnedContext.bytes} bytes`);
+console.log(`Ordinary stable workflow tool definitions: ${providerVisibleAlwaysOnToolDefinitions.bytes} bytes`);
+for (const tool of providerVisibleAlwaysOnToolDefinitions.tools) {
+  console.log(`  - ${tool.name}: ${tool.bytes} bytes`);
+}
 console.log(
   `Registered skills discovery (all ${registeredSkillsDiscovery.skills.length}): ${registeredSkillsDiscovery.bytes} bytes`,
 );

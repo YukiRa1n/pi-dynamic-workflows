@@ -465,21 +465,44 @@ describe("installResultDelivery", () => {
     assert.ok(calls[0].content.includes("test-workflow"));
   });
 
-  it("never silently drops pending deliveries when the queue grows past the soft cap", () => {
+  it("hard-bounds pending projections and replays evicted durable results from the outbox", () => {
     const pi1 = createMockPi();
     const pi2 = createMockPi();
-    const manager = createMockManager(makeRun());
+    let records = Array.from({ length: 40 }, (_, index) => ({
+      runId: `run-${index}`,
+      workflowName: `workflow-${index}`,
+      runStatus: "completed",
+      kind: "terminal",
+      sequence: index,
+      deliveryId: `delivery-${index}`,
+    }));
+    const manager = createMockManager(makeRun()) as ReturnType<typeof createMockManager> & {
+      listPendingDeliveries: () => typeof records;
+      acknowledgeDelivery: (...args: unknown[]) => boolean;
+    };
+    manager.getRun = (runId: unknown) => makeRun({ runId, snapshot: { ...makeRun().snapshot, name: String(runId) } });
+    manager.listPendingDeliveries = () => records;
+    manager.acknowledgeDelivery = () => true;
 
     mod.installResultDelivery(pi1 as unknown as ExtensionAPI, manager);
     mod.suspendResultDelivery(manager);
-    for (let i = 0; i < 40; i++) {
-      manager.emit("complete", { runId: "test-run-1" });
+    for (const record of records) {
+      manager.emit("complete", {
+        runId: record.runId,
+        deliveryId: record.deliveryId,
+        sequence: record.sequence,
+      });
     }
+
+    const holder = (manager as unknown as { __holder: { pending: unknown[] } }).__holder;
+    assert.equal(holder.pending.length, 32, "the in-memory retry projection cache has a hard limit");
 
     mod.installResultDelivery(pi2 as unknown as ExtensionAPI, manager);
     mod.resumeResultDelivery(manager);
     const calls = (pi2 as unknown as { _calls: unknown[] })._calls;
-    assert.equal(calls.length, 40, "soft-cap must warn, never shift() away a queued result");
+    assert.equal(calls.length, 40, "records evicted from memory are reconstructed from the durable outbox");
+
+    records = [];
   });
 
   it("keeps delivery suspended across factory install until resumeResultDelivery", () => {
@@ -661,6 +684,36 @@ describe("installTaskPanel", () => {
     mod.installTaskPanel(null, manager, ui);
     assert.equal(registeredName, "workflow-tasks");
     assert.equal(registeredPlacement, "belowEditor");
+  });
+
+  it("compact/idle panels do not perform periodic settings reads", async () => {
+    const manager = new EventEmitter() as ReturnType<typeof EventEmitter> & {
+      getRun: (...args: unknown[]) => unknown;
+      listRuns: () => unknown[];
+    };
+    manager.getRun = () => undefined;
+    manager.listRuns = () => [];
+    let settingsReads = 0;
+    let factory:
+      | ((tui: { requestRender(): void }, theme: unknown) => { render(width: number): string[]; dispose?(): void })
+      | undefined;
+    const ui = {
+      setWidget: (_name: string, registeredFactory: typeof factory) => {
+        factory = registeredFactory;
+      },
+    };
+
+    mod.installTaskPanel(null, manager, ui, {
+      loadSettings: () => {
+        settingsReads++;
+        return { progressPanelMode: "compact" };
+      },
+    });
+    const component = factory?.({ requestRender: () => {} }, {});
+    const readsAfterInstall = settingsReads;
+    await new Promise((resolve) => setTimeout(resolve, 2100));
+    assert.equal(settingsReads, readsAfterInstall, "no idle interval should poll settings in compact mode");
+    component?.dispose?.();
   });
 
   it("passes the render width through to the task panel", () => {

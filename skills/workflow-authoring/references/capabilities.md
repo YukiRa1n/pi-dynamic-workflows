@@ -12,7 +12,7 @@ This compact generated index covers supported runtime globals and workflow-tool 
 | Name | Classification | Signature | Options and defaults |
 | --- | --- | --- | --- |
 | agent | runtime-global | `agent(prompt, options?) => Promise<string \| structured value \| null>` | `label`: string (optional; default: derived from phase and call count)<br>`phase`: string (optional; default: current phase)<br>`schema`: plain JSON Schema (optional)<br>`model`: string (optional)<br>`tier`: string (optional)<br>`isolation`: "worktree" (optional)<br>`agentType`: string (optional)<br>`timeoutMs`: number \| null (optional; default: run timeout; null disables)<br>`retries`: number (optional; default: run retry count) |
-| parallel | runtime-global | `parallel(thunks) => Promise<Array<unknown \| null>>` | — |
+| parallel | runtime-global | `parallel(thunks[] \| ...thunks) => Promise<Array<unknown \| null>>` | — |
 | pipeline | runtime-global | `pipeline(items, ...stages) => Promise<Array<unknown \| null>>` | — |
 | createTeam | runtime-global | `createTeam(name, options?) => AgentTeam` | — |
 | workflow | runtime-global | `workflow(savedName, childArgs?) => Promise<unknown>` | — |
@@ -24,7 +24,7 @@ This compact generated index covers supported runtime globals and workflow-tool 
 | gate | runtime-global | `gate(thunk: (feedback: string \| undefined, attempt: number) => unknown \| Promise<unknown>, validator: (value: unknown) => { ok: boolean; feedback?: string } \| Promise<{ ok: boolean; feedback?: string }>, options?: { attempts?: number }) => Promise<{ ok: boolean; value: unknown; attempts: number }>` | `attempts`: number (optional; default: 3) |
 | checkpoint | runtime-global | `checkpoint(prompt, options?) => Promise<unknown>` | `default`: unknown (optional; default: true when no UI and omitted)<br>`headless`: "default" \| "abort" (optional; default: "default")<br>`kind`: "confirm" \| "input" \| "select" (optional; default: "confirm")<br>`choices`: string[] (optional)<br>`timeoutMs`: number (optional) |
 | log | runtime-global | `log(message) => void` | — |
-| deliver | runtime-global | `deliver(message) => Promise<void>` | — |
+| deliver | runtime-global | `deliver({ kind, message }) => Promise<void>` | `kind`: "blocker" \| "critical_finding" \| "decision" (required)<br>`message`: string (required) |
 | phase | runtime-global | `phase(title, options?) => void` | `budget`: number (optional) |
 | args | runtime-global | `args: unknown` | — |
 | cwd | runtime-global | `cwd: string` | — |
@@ -39,5 +39,4 @@ This compact generated index covers supported runtime globals and workflow-tool 
 | agentTimeoutMs | workflow-tool-input | `agentTimeoutMs?: number = configured default or no per-agent limit` | — |
 | workflowTimeoutMs | workflow-tool-input | `workflowTimeoutMs?: number = 30 minute default, up to 24 hours` | — |
 | tokenBudget | workflow-tool-input | `tokenBudget?: number = configured default or unlimited` | — |
-| resumeFromRunId | workflow-tool-input | `resumeFromRunId?: string` | — |
 <!-- END GENERATED SUPPORTED WORKFLOW CAPABILITIES -->

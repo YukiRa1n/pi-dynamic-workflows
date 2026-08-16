@@ -2,17 +2,17 @@
 
 This document preserves the decision-by-decision record behind the workflow tool's compact model guidance. It records each reviewed insertion, removal, and compaction with its reasoning, evidence, and confidence.
 
-## Current placement in 3.0.0
+## Current placement in 3.5.1-yuki.2
 
-The record originated in [Whamp/pi-dynamic-workflows#23](https://github.com/Whamp/pi-dynamic-workflows/pull/23). The 3.0.0 target later merged [QuintinShaw/pi-dynamic-workflows#93](https://github.com/QuintinShaw/pi-dynamic-workflows/pull/93), which changed workflow triggering from forced execution to authorization and established one always-on workflow gate. The current implementation preserves that gate and its background-delivery behavior while applying the concision decisions recorded below.
+The record originated in [Whamp/pi-dynamic-workflows#23](https://github.com/Whamp/pi-dynamic-workflows/pull/23). The 3.0.0 target later merged [QuintinShaw/pi-dynamic-workflows#93](https://github.com/QuintinShaw/pi-dynamic-workflows/pull/93), which changed workflow triggering from forced execution to explicit intent. The current extension is compatible with stock Pi: it registers one stable, start-only `workflow` tool, does not mutate the active tool set between turns, and keeps lifecycle control on explicit `/workflows` commands. Existing runs are never a model-facing routing target; a new requirement stays in the main session or starts a fresh run.
 
 | Decision area | Current authority |
 | --- | --- |
-| Capability summary | `description` and `promptSnippet` in [`src/workflow-tool.ts`](../src/workflow-tool.ts) |
-| First-attempt script syntax and composition | `script.description` in [`src/workflow-tool.ts`](../src/workflow-tool.ts) |
+| Capability summary | `description` in [`src/workflow-tool.ts`](../src/workflow-tool.ts) |
+| First-attempt script syntax and composition | The on-demand [`workflow-authoring` skill](../skills/workflow-authoring/SKILL.md), pointed to by `script.description`, plus parser/runtime checks |
 | Background and outer resource controls | Their parameter descriptions plus runtime behavior |
-| Workflow authorization | The single `WORKFLOW_GATE_GUIDELINE`; #93 supersedes the older exact selection wording below |
-| Detailed authoring policy | The on-demand [`workflow-authoring` skill](../skills/workflow-authoring/SKILL.md), not permanent prompt guidelines |
+| Workflow selection | The stable start-only tool description/schema plus explicit user intent; existing-run lifecycle stays on `/workflows` |
+| Detailed authoring policy | The on-demand [`workflow-authoring` skill](../skills/workflow-authoring/SKILL.md), not ordinary-turn prompt context |
 | Exact capability facts | The executable contract and generated [workflow-authoring reference](workflow-authoring.md) |
 | Dynamic model routes and agent types | Active user and project configuration, not static prompt catalogues |
 | Context and comprehension evidence | [Workflow authoring evidence](workflow-authoring-evidence.md) and generated context measurements |
@@ -21,7 +21,35 @@ The original reviewed record follows. Its quoted before-and-after text documents
 
 ## Prompt surfaces
 
-Pi renders `promptSnippet` as the workflow tool's one-line entry in the system prompt's `Available tools` section. Pi appends each `promptGuidelines` entry as a flat bullet in the system prompt's `Guidelines` section. The provider-visible tool definition separately carries the tool `description` and parameter schema.
+Pi renders `promptSnippet` as a tool's one-line entry in the system prompt's `Available tools` section and appends `promptGuidelines` as flat bullets. The `workflow` tool keeps a concise capability description and a stable provider-visible schema across turns. The default extension registers no model-facing control, steer, or status schemas; `/workflows status|watch|pause|resume|stop|steer` remains the explicit user/UI path.
+
+The generated [context measurement](workflow-context-surfaces.json) should measure the stable workflow definition and its cache-prefix contribution. It must not describe per-turn tool mutation as the current contract.
+
+## Current lifecycle, cache, and replay invariants
+
+The provider surface is a stable start capability, not a lifecycle control menu:
+
+- The extension keeps one start-only `workflow` definition registered so the provider-visible prefix remains cache-stable.
+- The model-facing tool starts a new workflow only. Existing runs are inspected or changed through explicit `/workflows status|watch|pause|resume|stop|steer` commands.
+- A new requirement is not an existing-run continuation. It stays in the main session or starts a fresh workflow, even when another run mentions similar words.
+- `resumeFromRunId` is an embedded compatibility option only for `createWorkflowTool({ allowResume: true })`; it is absent from the default extension schema.
+
+The Anthropic cache-warm gate is a bounded optimization, not a replay condition. It applies only to compatible non-worktree requests sharing the same provider-visible prefix. One request owns the warm-up; followers are released on the owner's first assistant `message_start`, when Anthropic makes the prompt-cache entry available, rather than waiting for the full answer. A provider failure before response start promotes one follower. `PI_CACHE_RETENTION=none` disables the gate; the default window is short and `long` selects the longer window.
+
+Replay identity is run-scoped. The run-level provider context (`cwd`, instructions, tools, excluded tools, and session) is serialized and hashed once, then included in every call identity. Nested workflow context, run instructions, model-resolution inputs, schemas, agent definitions, and timeout/retry inheritance remain part of the call key. Opaque or unstable context fails closed instead of replaying a result under a guessed identity. This separates journal replay from provider cache warming: disabling `PI_CACHE_RETENTION` does not disable durable workflow replay.
+
+The current measurement target is the stable start-only workflow definition, approximately 1.1–1.3 KiB depending on the serialized schema. The important invariant is that this prefix does not change merely because the user message mentions a workflow or an existing run; regenerated measurements are the authority after source changes.
+
+## Current external design references
+
+The current surface was re-reviewed against the official [OpenAI latest-model prompting guide](https://developers.openai.com/api/docs/guides/latest-model), [OpenAI multi-agent guide](https://developers.openai.com/api/docs/guides/responses-multi-agent), [Codex subagents guide](https://learn.chatgpt.com/docs/agent-configuration/subagents), [Claude Code subagents guide](https://code.claude.com/docs/en/sub-agents), [Claude Code tools reference](https://code.claude.com/docs/en/tools-reference), [Claude Code agent teams guide](https://code.claude.com/docs/en/agent-teams), and [Anthropic tool-definition guide](https://platform.claude.com/docs/en/agents-and-tools/tool-use/define-tools).
+
+Those sources support four placement decisions used here:
+
+1. Keep the parent surface stable and task-relevant. One concise start-only workflow schema avoids per-turn tool mutation and preserves the prompt-cache prefix.
+2. Give the model one scoped action. `workflow` starts new work; lifecycle commands handle existing runs, while child-to-parent delivery carries only classified urgent messages.
+3. Put argument semantics next to the argument and keep detailed authoring contracts in the on-demand skill. This preserves precise tool descriptions without repeating a manual in every ordinary provider request.
+4. Treat subagents as isolated, bounded workers. Routine progress and finals remain in workflow state; only classified blockers, critical findings, or decisions may cross into another live context.
 
 ## Original approved changes
 
@@ -171,7 +199,7 @@ Confidence is very high that both mechanics are stable runtime contracts, useful
 
 ### Keep always-background behavior in the tool result and lifecycle guidance
 
-The public `workflow` tool has one execution mode: every new invocation and every resume starts in the background. The tool returns immediately with a run ID, the turn ends so the user is not blocked, and the bounded terminal result is delivered back into the conversation when the run finishes. The result also names `/workflows` and `workflow_control` as the inspection and lifecycle controls.
+The public `workflow` tool has one execution mode: every new invocation starts in the background. The tool returns immediately with a run ID, the turn ends so the user is not blocked, and the bounded terminal result is delivered back into the conversation through the durable safe-point queue when the run finishes. `/workflows status|watch|pause|resume|stop|steer` remains the explicit user-facing inspection and lifecycle path; no separate model-facing lifecycle schemas are registered. This prevents model-driven status polling from creating provider-turn storms while a workflow is active.
 
 #### Reasoning
 
@@ -179,7 +207,7 @@ Background execution is no longer a caller-selectable parameter. Keeping one pub
 
 #### Evidence
 
-`src/workflow-tool.ts` starts every public invocation with `WorkflowManager.startInBackground()` and rejects the legacy `background` argument. `backgroundStartedText()` supplies the post-call explanation and run-management commands. Internal `runSync()` and persisted `background` flags remain available for programmatic lifecycle and snapshot compatibility, but are not public tool behavior.
+`src/workflow-tool.ts` starts every public invocation with `WorkflowManager.startInBackground()` and rejects the legacy `background` argument. `backgroundStartedText()` supplies a compact run-ID/result-return acknowledgement; `/workflows` remains the command/UI path for inspection and lifecycle actions. Internal `runSync()` and persisted `background` flags remain available for programmatic lifecycle and snapshot compatibility, but are not public tool behavior.
 
 #### Confidence
 
@@ -417,13 +445,13 @@ Retain intent-level assertions for the approved authoring contracts, static guid
 
 Guideline count does not measure prompt size or clarity. Five arbitrarily long bullets pass, six concise bullets fail, and the limit encourages unrelated contracts to be combined. The approved guidance should group related ideas naturally rather than target an arbitrary array length.
 
-Rendered system-prompt bytes and provider-visible tool-definition bytes remain useful audit measurements, but they should not become byte-level test ratchets. Prompt quality depends on what each surface teaches and where the contract belongs, not on freezing an incidental serialized size.
+Rendered system-prompt bytes and provider-visible tool-definition bytes remain useful release guardrails when their limits are derived from current measurements with bounded headroom. They are not prose ratchets: an intentional contract change should regenerate the artifact and reassess the limit, while accidental multi-kilobyte growth should fail early.
 
-Exact-copy tests also remain inappropriate for prose that may receive harmless editorial improvements. Intent, placement, absence, and runtime behavior provide the regression signals; surface sizes may be reported during review as evidence without becoming pass/fail thresholds.
+Exact-copy tests remain inappropriate for prose that may receive harmless editorial improvements. Intent, placement, absence, runtime behavior, and measured surface budgets provide the regression signals.
 
 #### Confidence
 
-Confidence is very high that guideline-count and byte-level ratchet tests should be omitted while behavioral, static-guidance, and placement assertions remain.
+Confidence is very high that guideline-count tests should be omitted. Measured byte budgets are appropriate as coarse growth guards alongside behavioral, static-guidance, and placement assertions.
 
 ### Require explicit workflow intent
 
@@ -442,16 +470,16 @@ For workflow, prefer it for decomposable work: repository inspection, independen
 with:
 
 ```text
-Use workflow only for explicit workflow intent: a request for a workflow, subagent delegation, fan-out, or multi-agent orchestration, or an enabled mode that requires workflow. Use ordinary tools for work you can perform directly.
+Use workflow only for explicit workflow intent: a request for a workflow, subagent delegation, fan-out, or multi-agent orchestration. Use ordinary tools for work you can perform directly.
 ```
 
 #### Reasoning
 
 Workflow selection is an authorization decision rather than a test of whether a parent model can recognize decomposable work. One run permits up to 1,000 agents, up to 16 concurrently, and no token budget by default. A capable model can choose an appropriate topology after authorization, but it cannot infer the user's tolerance for that potential expense from task complexity alone.
 
-The boundary does not require a magic trigger word. Explicit intent includes a direct workflow request, delegation to even one subagent, fan-out, multi-agent orchestration, or standing intent established by an enabled workflow or effort mode. The runtime requires at least one agent rather than multiple agents, so singular subagent delegation is valid.
+The boundary does not require a magic trigger word. Explicit intent includes a direct workflow request, delegation to even one subagent, fan-out, or multi-agent orchestration. The runtime requires at least one agent rather than multiple agents, so singular subagent delegation is valid.
 
-Enabled modes must count because the extension deliberately transforms matching messages into a workflow requirement. Recognizing that standing opt-in prevents the permanent guidance from conflicting with the extension's own trigger behavior.
+`/effort` changes guidance for an explicitly requested workflow only. It does not transform an ordinary message into a workflow request or select an unrelated existing run.
 
 “Work you can perform directly” replaces arbitrary one-read, one-edit, and one-command tests. Decomposability shapes the workflow after selection; it does not independently authorize delegation.
 
@@ -459,13 +487,13 @@ Permission to use workflow is distinct from permission for a large fan-out. Scal
 
 #### Evidence
 
-The workflow runtime enforces a 1,000-agent total cap and a 16-agent concurrency cap, while `tokenBudget` is unbounded by default. The workflow editor's forced-mode prompt requires at least one `agent()` call even for a small task. See [`src/config.ts`](../src/config.ts), [`src/workflow-tool.ts`](../src/workflow-tool.ts), and [`src/workflow-editor.ts`](../src/workflow-editor.ts).
+The workflow runtime enforces a 1,000-agent total cap and a 16-agent concurrency cap, while `tokenBudget` is unbounded by default. The start-only workflow tool requires at least one `agent()` call even for a small task. Invocation-level token and time caps remain explicit user constraints; the model should omit them when the user did not request them. See [`src/config.ts`](../src/config.ts) and [`src/workflow-tool.ts`](../src/workflow-tool.ts).
 
 The schema-comprehension experiment showed that all four tested parent models selected the workflow tool for an explicit orchestration request. It did not test autonomous workflow selection, so it supports comprehension of explicit intent rather than broad autonomous permission. See [What the workflow schema teaches parent models](https://github.com/Whamp/pi-dynamic-workflows/blob/f8b6f5c34e9476e014d2906a257344e410a00364/docs/research/workflow-schema-comprehension.md).
 
 #### Confidence
 
-Confidence is high that potentially high-scale delegation requires explicit current or standing user intent, that one-subagent delegation is valid intent, and that ordinary tools should handle work the parent can perform directly. Large-fan-out authorization should be decided separately from workflow selection.
+Confidence is high that potentially high-scale delegation requires explicit user intent, that one-subagent delegation is valid intent, and that ordinary tools should handle work the parent can perform directly. Large-fan-out authorization should be decided separately from workflow selection.
 
 ### Scope each agent at a natural, context-sized boundary
 

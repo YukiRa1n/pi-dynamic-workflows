@@ -75,5 +75,5 @@ test("delivery-choice CLI is package-wired and exposes help without provider cal
   );
   assert.match(help, /--model <provider\/model>/i);
   assert.match(help, /--output <path>/i);
-  assert.match(help, /three.*timing and token-budget scenarios/is);
+  assert.match(help, /two.*timing and token-budget scenarios/is);
 });

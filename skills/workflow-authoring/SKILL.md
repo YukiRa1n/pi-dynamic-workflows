@@ -1,13 +1,20 @@
 ---
 name: workflow-authoring
-description: Guidance for writing, editing, reviewing, and debugging JavaScript workflow code for pi-dynamic-workflows. Use when authoring or changing workflow scripts; not for merely running an existing workflow.
+description: Write, edit, review, or debug Workflow JavaScript; not for running an existing workflow.
 metadata:
   version: "3.5.1-yuki.2"
 ---
 
 # Workflow authoring
 
-Load this skill when workflow JavaScript changes. Running an existing workflow needs no authoring reference.
+Load this skill only when workflow JavaScript changes. Do not load it for an ordinary user task or for an existing-run lifecycle command. Running, watching, pausing, resuming, stopping, or steering an existing workflow is handled explicitly by `/workflows`.
+
+## Main-session routing
+
+- The extension exposes one stable, start-only `start_workflow` tool. Use it only when the user explicitly requests a workflow, delegation, fan-out, or multi-agent orchestration.
+- A new requirement must stay in the main session or start a fresh run. Never send it to an existing run because the wording happens to mention that run.
+- `/effort` changes guidance only for an explicitly requested workflow. It does not take over ordinary messages.
+- Use `deliver({ kind, message })` only for a concise `blocker`, `critical_finding`, or `decision`; keep routine progress and ordinary child finals in workflow state.
 
 ## Choose a branch
 

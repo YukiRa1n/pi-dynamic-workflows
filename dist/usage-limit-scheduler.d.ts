@@ -28,6 +28,8 @@ export interface SchedulableWorkflowManager {
 /** Opaque timer handle so tests can inject a fake clock/timer. */
 export type TimerHandle = unknown;
 export interface UsageLimitSchedulerOptions {
+    /** Current Pi session. Cold-start recovery is deferred until bindSession(). */
+    sessionId?: string;
     /** Injectable clock (default Date.now). */
     now?: () => number;
     /** Injectable timer scheduler (default setTimeout). */
@@ -42,6 +44,8 @@ export interface UsageLimitSchedulerOptions {
     fallbackDelayMs?: number;
     /** Delay ceiling — backoff is clamped here. Default 6h. */
     maxDelayMs?: number;
+    /** Maximum simultaneously armed auto-resume timers. */
+    maxArmedTimers?: number;
     /** Diagnostics sink; defaults to console.warn. Never throws back into the caller. */
     onDiagnostic?: (message: string, detail?: unknown) => void;
 }
@@ -94,9 +98,15 @@ export declare class UsageLimitScheduler {
     private readonly minDelayMs;
     private readonly fallbackDelayMs;
     private readonly maxDelayMs;
+    private readonly maxArmedTimers;
     private readonly diagnostic;
+    private boundSessionId;
+    private sessionBound;
     private readonly state;
     private disposed;
+    /** Resolves on dispose so an in-flight resume wait can stop retaining this scheduler. */
+    private readonly shutdownPromise;
+    private readonly resolveShutdown;
     /**
      * Runs this scheduler is currently auto-resuming (its own timer fired). Used to
      * tell an auto-resume's "resumed" event apart from a manual one: an auto-resume
@@ -107,6 +117,12 @@ export declare class UsageLimitScheduler {
     private readonly onTerminal;
     private readonly onResumed;
     constructor(manager: SchedulableWorkflowManager, options?: UsageLimitSchedulerOptions);
+    /**
+     * Bind recovery to the host session after session_start has supplied the
+     * authoritative session id. This is intentionally separate from construction:
+     * extension factories run before Pi has selected/resumed the target session.
+     */
+    bindSession(sessionId: string | undefined): void;
     /** Clear every armed timer and unsubscribe from the manager. Idempotent. */
     dispose(): void;
     /** Test/diagnostic helper: in-memory attempt count tracked for a run, if any. */
@@ -125,6 +141,7 @@ export declare class UsageLimitScheduler {
      */
     private handleResumed;
     private coldStartRearm;
+    private ownsBoundSession;
     private arm;
     private onTimerFire;
     private safeLoad;

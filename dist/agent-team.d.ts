@@ -1,6 +1,9 @@
 import { type ToolDefinition } from "@earendil-works/pi-coding-agent";
 export type AgentTeamMemberStatus = "registered" | "running" | "done" | "failed" | "aborted";
 export type AgentTeamTaskStatus = "pending" | "claimed" | "completed";
+/** Classification retained on every team message, including workflow-side instructions. */
+export type AgentTeamMessageKind = "blocker" | "task_changing_fact" | "decision" | "workflow_instruction";
+type ModelFacingAgentTeamMessageKind = Exclude<AgentTeamMessageKind, "workflow_instruction">;
 export interface AgentTeamMemberSnapshot {
     id: string;
     label: string;
@@ -11,6 +14,7 @@ export interface AgentTeamMessage {
     id: string;
     from: string;
     to: string;
+    kind: AgentTeamMessageKind;
     message: string;
 }
 export interface AgentTeamTaskSnapshot {
@@ -37,6 +41,20 @@ export interface AgentTeamSpawnSpec {
     /** Regular agent() options such as model, tier, schema, isolation, and retries. */
     options?: Record<string, unknown>;
 }
+interface SpawnPlanEntry {
+    memberId: string;
+    label: string;
+    role?: string;
+    isNew: boolean;
+}
+export interface AgentTeamQuota {
+    reserveMembers(count: number): void;
+    reserveTasks(count: number): void;
+    reserveMessages(count: number): void;
+    releaseMembers?(count: number): void;
+    releaseTasks?(count: number): void;
+    releaseMessages?(count: number): void;
+}
 /**
  * In-process coordination state for one workflow agent team.
  *
@@ -58,9 +76,14 @@ export declare class WorkflowAgentTeam {
     private readonly maxMembers;
     private readonly maxTasks;
     private readonly maxMessages;
+    private readonly quota?;
+    private quotaSuppressed;
+    private readonly spawnReservations;
+    private readonly spawnCommits;
     constructor(id: string, name: string, maxMembers?: number, options?: {
         maxTasks?: number;
         maxMessages?: number;
+        quota?: AgentTeamQuota;
     });
     addMember(label: string, role?: string, requestedId?: string): string;
     /** Register a new attempt for a member; only this generation may mutate status. */
@@ -92,19 +115,16 @@ export declare class WorkflowAgentTeam {
      * Returns planned entries; callers must check cross-team ownership of any
      * requestedId against their own registry, then {@link commitSpawn}.
      */
-    planSpawn(specs: AgentTeamSpawnSpec[]): Array<{
-        memberId: string;
-        label: string;
-        role?: string;
-        isNew: boolean;
-    }>;
+    planSpawn(specs: AgentTeamSpawnSpec[]): SpawnPlanEntry[];
+    /** Roll back a planned batch that never reached commit. */
+    releaseSpawnReservation(planned: SpawnPlanEntry[]): void;
     /** Commit a previously planned spawn batch; no validation happens here. */
-    commitSpawn(planned: Array<{
-        memberId: string;
-        label: string;
-        role?: string;
-        isNew: boolean;
-    }>): string[];
+    commitSpawn(planned: SpawnPlanEntry[]): string[];
+    /** Roll back a committed batch when the scheduler rejects it synchronously. */
+    rollbackCommittedSpawn(planned: SpawnPlanEntry[]): string[];
+    /** The scheduler accepted the batch; membership and quota now belong to the team. */
+    finalizeCommittedSpawn(planned: SpawnPlanEntry[]): void;
+    private restoreSpawnCommit;
     memberPrompt(memberId: string): string;
     addTask(title: string, description?: string, assignee?: string): string;
     addTasks(tasks: Array<{
@@ -112,8 +132,8 @@ export declare class WorkflowAgentTeam {
         description?: string;
         assignee?: string;
     }>): string[];
-    send(from: string, to: string, message: string, attemptGen?: number): AgentTeamMessage;
-    broadcast(from: string, message: string, attemptGen?: number): number;
+    send(from: string, to: string, kind: ModelFacingAgentTeamMessageKind, message: string, attemptGen?: number): AgentTeamMessage;
+    broadcast(from: string, kind: ModelFacingAgentTeamMessageKind, message: string, attemptGen?: number): number;
     sendFromWorkflow(to: string, message: string): AgentTeamMessage;
     broadcastFromWorkflow(message: string): number;
     readInbox(memberId: string, attemptGen?: number): AgentTeamMessage[];
@@ -123,10 +143,11 @@ export declare class WorkflowAgentTeam {
     completeTask(memberId: string, taskId: string, result?: string, attemptGen?: number): AgentTeamTaskSnapshot;
     snapshot(): AgentTeamSnapshot;
     /** Static tool schemas; dynamic team/member identity stays in closures. */
-    createTools(memberId: string, attemptGen?: number): ToolDefinition[];
+    createTools(memberId: string, attemptGen?: number, isAdmitted?: () => boolean): ToolDefinition[];
     private assertMemberAttempt;
     private ensureMessageCapacity;
     private ensureBroadcastCapacity;
     private member;
     private task;
 }
+export {};

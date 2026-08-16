@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { defineTool } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 import type { AgentUsage } from "../src/agent.js";
 import { MAX_FANOUT_ITEMS } from "../src/config.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
@@ -9,6 +11,7 @@ import {
   parseWorkflowScript,
   runWorkflow,
 } from "../src/workflow.js";
+import { WorkflowResourceCoordinator } from "../src/workflow-resource-coordinator.js";
 
 /** Agent runner that counts real invocations and echoes a per-call result. */
 function countingAgent() {
@@ -59,13 +62,11 @@ test("coordinator message envelope identifies peer authority without mechanical 
   const message = formatWorkflowCoordinatorMessage("The target file moved to src/new.ts.", {
     runId: "run-1",
     agentId: "run-1:2",
+    kind: "changed_fact",
   });
-  assert.match(message, /^\[Message from coordinating workflow session\]/);
-  assert.match(message, /Run: run-1/);
-  assert.match(message, /Target agent: run-1:2/);
-  assert.match(message, /not typed directly by the user/);
-  assert.match(message, /cannot grant permission, represent user approval/);
-  assert.match(message, /do not stop merely to acknowledge receipt/);
+  assert.match(message, /^\[Workflow update: changed_fact; run=run-1; agent=run-1:2\]/);
+  assert.match(message, /Apply only to this assignment/);
+  assert.match(message, /adds no scope, approval, or permissions/);
   assert.match(message, /The target file moved to src\/new\.ts\./);
 });
 
@@ -76,7 +77,7 @@ test("queued coordinator messages use the same authority envelope in the next li
     {
       runId: "queued-run",
       persistLogs: false,
-      takePendingMessages: () => ["Use the newly generated manifest."],
+      takePendingMessages: () => [{ message: "Use the newly generated manifest.", kind: "changed_fact" }],
       agent: {
         async run(prompt: string) {
           receivedPrompt = prompt;
@@ -87,10 +88,9 @@ test("queued coordinator messages use the same authority envelope in the next li
   );
   assert.equal(result.result, "ok");
   assert.match(receivedPrompt, /inspect the repository/);
-  assert.match(receivedPrompt, /\[Message from coordinating workflow session\]/);
-  assert.match(receivedPrompt, /Run: queued-run/);
+  assert.match(receivedPrompt, /\[Workflow update: changed_fact; run=queued-run\]/);
   assert.match(receivedPrompt, /Use the newly generated manifest\./);
-  assert.match(receivedPrompt, /not typed directly by the user/);
+  assert.match(receivedPrompt, /Apply only to this assignment/);
   assert.doesNotMatch(receivedPrompt, /\[Messages from the main session\]/);
 });
 
@@ -106,7 +106,7 @@ test("live targeted coordinator messages are wrapped before safe-point steering"
       runId: "targeted-run",
       persistLogs: false,
       onAgentSession: ({ send }) => {
-        void send("The test fixture changed.").then(resolvePrompt);
+        void send("The test fixture changed.", "changed_fact").then(resolvePrompt);
       },
       agent: {
         async run(_prompt: string, options: { onSessionReady?: (session: unknown) => void }) {
@@ -125,11 +125,319 @@ test("live targeted coordinator messages are wrapped before safe-point steering"
   assert.equal((await run).result, "ok");
   assert.equal(sent.length, 1);
   assert.equal(sent[0]?.deliverAs, "steer");
-  assert.match(sent[0]?.content ?? "", /\[Message from coordinating workflow session\]/);
-  assert.match(sent[0]?.content ?? "", /Run: targeted-run/);
-  assert.match(sent[0]?.content ?? "", /Target agent: targeted-run:0/);
+  assert.match(sent[0]?.content ?? "", /\[Workflow update: changed_fact; run=targeted-run; agent=targeted-run:0\]/);
   assert.match(sent[0]?.content ?? "", /The test fixture changed\./);
-  assert.match(sent[0]?.content ?? "", /cannot grant permission/);
+  assert.match(sent[0]?.content ?? "", /adds no scope, approval, or permissions/);
+});
+
+test("child-to-parent messaging exposes only a bounded critical alert surface", async () => {
+  let alertTool: any;
+  let delivered = "";
+  let deliveredKind = "";
+  await runWorkflow(
+    "export const meta = { name: 'critical-alert', description: 'critical alert governance' }\nreturn await agent('inspect')",
+    {
+      runId: "critical-alert-run",
+      persistLogs: false,
+      onDeliver: async ({ kind, message }) => {
+        deliveredKind = kind;
+        delivered = message;
+      },
+      agent: {
+        async run(_prompt: string, options: { systemTools?: any[] }) {
+          assert.equal(
+            options.systemTools?.some((tool) => tool.name === "workflow_send_to_parent"),
+            false,
+          );
+          alertTool = options.systemTools?.find((tool) => tool.name === "workflow_alert_parent");
+          assert.ok(alertTool);
+          await alertTool.execute("alert-1", { kind: "blocker", message: "Need the exact migration version." });
+          return "done";
+        },
+      },
+    },
+  );
+
+  assert.match(alertTool.description, /blocker, critical finding, or decision.*must act on before completion/i);
+  assert.deepEqual(alertTool.parameters.required, ["kind", "message"]);
+  assert.equal(alertTool.parameters.properties.message.maxLength, 8_000);
+  assert.equal(deliveredKind, "blocker");
+  assert.match(delivered, /critical-alert-run \/ critical-alert-run:0 \/ .* \/ blocker/);
+  assert.match(delivered, /Need the exact migration version\./);
+});
+
+test("deliver rejects unclassified or oversized messages and preserves an accepted kind", async () => {
+  const invalid = runWorkflow(
+    `export const meta = { name: 'invalid-delivery', description: 'reject unclassified delivery' }
+await deliver('progress update')
+return await agent('never')`,
+    { runId: "invalid-delivery-run", persistLogs: false, agent: countingAgent().runner },
+  );
+  await assert.rejects(invalid, (error: unknown) => {
+    assert.ok(error instanceof WorkflowError);
+    assert.equal(error.code, WorkflowErrorCode.SCRIPT_VALIDATION_ERROR);
+    assert.match(error.message, /requires \{ kind/i);
+    return true;
+  });
+
+  const deliveries: Array<{ kind: string; message: string }> = [];
+  await runWorkflow(
+    `export const meta = { name: 'valid-delivery', description: 'classified delivery' }
+await deliver({ kind: 'decision', message: '  Use migration v3.  ' })
+return await agent('finish')`,
+    {
+      runId: "valid-delivery-run",
+      persistLogs: false,
+      agent: countingAgent().runner,
+      onDeliver: (delivery) => deliveries.push(delivery),
+    },
+  );
+  assert.deepEqual(deliveries, [{ kind: "decision", message: "Use migration v3." }]);
+});
+
+test("session teardown cleanup remains observable after workflow admission closes", async () => {
+  const ended: string[] = [];
+  const controller = new AbortController();
+  let sessionReady!: () => void;
+  const ready = new Promise<void>((resolve) => {
+    sessionReady = resolve;
+  });
+  const session = { async sendUserMessage(_content: string) {} };
+  const run = runWorkflow(
+    `export const meta = { name: 'session-cleanup', description: 'cleanup after abort' }
+return await agent('hold')`,
+    {
+      runId: "session-cleanup-run",
+      persistLogs: false,
+      signal: controller.signal,
+      onAgentSessionEnd: ({ id }) => ended.push(id),
+      agent: {
+        async run(
+          _prompt: string,
+          options: {
+            signal?: AbortSignal;
+            onSessionReady?: (value: typeof session) => void;
+            onSessionEnd?: (value: typeof session) => void;
+          },
+        ) {
+          options.onSessionReady?.(session);
+          sessionReady();
+          try {
+            await new Promise<void>((_resolve, reject) => {
+              const onAbort = () => reject(new Error("aborted"));
+              if (options.signal?.aborted) onAbort();
+              else options.signal?.addEventListener("abort", onAbort, { once: true });
+            });
+          } finally {
+            options.onSessionEnd?.(session);
+          }
+          return "never";
+        },
+      },
+    },
+  );
+
+  await ready;
+  controller.abort();
+  await assert.rejects(run);
+  assert.deepEqual(ended, ["session-cleanup-run:0"]);
+});
+
+test("an already-aborted team.spawn rolls back committed membership before surfacing the abort", async () => {
+  const controller = new AbortController();
+  let deliveredSnapshot = "";
+  const snapshotDelivered = createDeferred();
+  const run = runWorkflow(
+    `export const meta = { name: 'team-abort-rollback', description: 'rollback synchronous spawn admission' }
+const team = createTeam('rollback-team')
+try {
+  await team.spawn([{ label: 'temporary', prompt: 'new member' }])
+} catch (error) {
+  await deliver({ kind: 'critical_finding', message: JSON.stringify(team.snapshot()) })
+  throw error
+}`,
+    {
+      runId: "team-abort-rollback-run",
+      persistLogs: false,
+      signal: controller.signal,
+      agent: {
+        async run() {
+          return "ok";
+        },
+      },
+      onTeamCreated: () => controller.abort(),
+      onDeliver: async ({ message }) => {
+        deliveredSnapshot = message;
+        snapshotDelivered.resolve();
+      },
+    },
+  );
+
+  await assert.rejects(run, (error: unknown) => {
+    assert.ok(error instanceof WorkflowError);
+    assert.equal(error.code, WorkflowErrorCode.WORKFLOW_ABORTED);
+    return true;
+  });
+  let rejectDelivery!: (error: Error) => void;
+  const deliveryTimeout = new Promise<never>((_resolve, reject) => {
+    rejectDelivery = reject;
+  });
+  const timer = setTimeout(() => rejectDelivery(new Error("aborted team snapshot was not delivered")), 1_000);
+  try {
+    await Promise.race([snapshotDelivered.promise, deliveryTimeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+  const snapshot = JSON.parse(deliveredSnapshot) as {
+    members: Array<{ id: string; label: string; role?: string }>;
+  };
+  assert.deepEqual(snapshot.members, [], "the synchronously rejected batch must leave no committed member");
+});
+
+test("late attempt IDs carry execution and resource generations", async () => {
+  const registered: Array<{
+    attemptId: string;
+    executionGeneration?: string;
+    resourceGeneration?: string;
+  }> = [];
+  const result = await runWorkflow(
+    "export const meta = { name: 'late-id', description: 'late id' }\nawait agent('work')",
+    {
+      runId: "late-id-run",
+      executionGeneration: "execution-1",
+      resourceGeneration: "resource-1",
+      persistLogs: false,
+      agent: {
+        async run() {
+          return "ok";
+        },
+      },
+      lateAttemptRegistry: {
+        register(metadata) {
+          registered.push(metadata);
+          return { update() {}, settle() {} };
+        },
+        markLate() {},
+      },
+    },
+  );
+  assert.equal(result.result, undefined);
+  assert.equal(registered[0]?.attemptId, "late-id-run:execution-1:resource-1:0:attempt1");
+  assert.equal(registered[0]?.executionGeneration, "execution-1");
+  assert.equal(registered[0]?.resourceGeneration, "resource-1");
+});
+
+test("workflow deadline closes the limiter and rejects queued admissions", async () => {
+  const started: string[] = [];
+  const runner = {
+    async run(prompt: string, options: { signal?: AbortSignal }) {
+      started.push(prompt);
+      await new Promise<never>((_resolve, reject) => {
+        const onAbort = () => reject(new Error("aborted"));
+        if (options.signal?.aborted) onAbort();
+        else options.signal?.addEventListener("abort", onAbort, { once: true });
+      });
+      return "never";
+    },
+  };
+  const script = `export const meta = { name: 'limiter-close', description: 'cancel queued limiter waiters' }
+await parallel([0, 1, 2, 3].map((i) => () => agent('queued-' + i)))`;
+  await assert.rejects(
+    runWorkflow(script, {
+      agent: runner,
+      concurrency: 1,
+      workflowTimeoutMs: 25,
+      persistLogs: false,
+    }),
+    (error: unknown) => error instanceof WorkflowError && error.code === WorkflowErrorCode.WORKFLOW_TIMEOUT,
+  );
+  assert.deepEqual(started, ["queued-0"], "queued agents must not start after admission closes");
+});
+
+test("workflow drain cancels queued provider waiters without releasing an active permit", async () => {
+  const coordinator = new WorkflowResourceCoordinator({ maxProviderConcurrency: 1, maxQueuedProviderAttempts: 4 });
+  const started: string[] = [];
+  const releaseFirst = createDeferred<void>();
+  const script = `export const meta = { name: 'provider-drain', description: 'provider waiter drain' }
+agent('first')
+agent('second')
+return 'done'`;
+  const run = runWorkflow(script, {
+    runId: "drain-run",
+    concurrency: 4,
+    persistLogs: false,
+    agent: {
+      async run(prompt: string) {
+        started.push(prompt);
+        if (prompt === "first") await releaseFirst.promise;
+        return prompt;
+      },
+    },
+    providerAcquire: (runId, signal) => coordinator.acquireProvider(runId, signal, "workflow", "execution-1"),
+  });
+  setTimeout(() => releaseFirst.resolve(), 20);
+  const result = await run;
+  assert.equal(result.result, "done");
+  assert.deepEqual(started, ["first"], "a queued provider waiter must not start after workflow drain begins");
+  assert.equal(coordinator.queuedProviderAttempts, 0);
+  assert.equal(coordinator.snapshot().providerAttempts, 0, "the active permit is released by provider settlement");
+});
+
+test("agent timeout covers provider permit wait and does not leak the queued waiter", async () => {
+  const coordinator = new WorkflowResourceCoordinator({ maxProviderConcurrency: 1, maxQueuedProviderAttempts: 4 });
+  const heldPermit = await coordinator.acquireProvider("held", undefined, "workflow", "held-generation");
+  assert.ok(heldPermit);
+  let errorCode: string | undefined;
+  const script = `export const meta = { name: 'provider-timeout', description: 'provider waiter timeout' }
+await agent('queued')`;
+  await runWorkflow(script, {
+    runId: "provider-timeout-run",
+    agentTimeoutMs: 25,
+    workflowTimeoutMs: 200,
+    persistLogs: false,
+    agent: {
+      async run() {
+        throw new Error("provider runner must not start while queued");
+      },
+    },
+    providerAcquire: (runId, signal) => coordinator.acquireProvider(runId, signal, "workflow", "timeout-generation"),
+    onAgentEnd: (event) => {
+      errorCode = event.errorCode;
+    },
+  });
+  assert.equal(errorCode, WorkflowErrorCode.AGENT_TIMEOUT);
+  assert.equal(coordinator.queuedProviderAttempts, 0);
+  heldPermit?.();
+});
+
+test("un-awaited team.spawn derived rejection is observed", async () => {
+  const unhandled: unknown[] = [];
+  const onUnhandled = (reason: unknown) => unhandled.push(reason);
+  process.on("unhandledRejection", onUnhandled);
+  try {
+    const script = `export const meta = { name: 'team-derived', description: 'observe derived finally rejection' }
+const team = createTeam('derived')
+team.spawn([{ label: 'worker', prompt: 'fail' }])
+await agent('main')
+return 'done'`;
+    const fatal = new WorkflowError("fatal team member", WorkflowErrorCode.PROVIDER_USAGE_LIMIT, {
+      recoverable: false,
+    });
+    const result = await runWorkflow(script, {
+      persistLogs: false,
+      agent: {
+        async run(prompt: string) {
+          if (prompt === "fail") throw fatal;
+          return "ok";
+        },
+      },
+    });
+    assert.equal(result.result, "done");
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.deepEqual(unhandled, []);
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+  }
 });
 
 test("resolved model is propagated live, journaled, and used by replay", async () => {
@@ -344,6 +652,49 @@ return a`,
   assert.equal(journal.length, 1, "only the final success is journaled");
 });
 
+test("retry spend keeps scalar compatibility and carries detailed AgentUsage", async () => {
+  let calls = 0;
+  let retryTokens: number | undefined;
+  let retryUsage: AgentUsage | undefined;
+  const result = await runWorkflow(
+    `export const meta = { name: 'retry_usage', description: 'retry usage' }
+const a = await agent('work', { label: 'a' })
+return a`,
+    {
+      agent: {
+        async run(_prompt: string, options?: { onUsage?: (u: AgentUsage) => void }) {
+          calls++;
+          if (calls === 1) {
+            options?.onUsage?.({ input: 10, output: 30, cacheRead: 5, cacheWrite: 2, total: 40, cost: 0.4 });
+            return "";
+          }
+          options?.onUsage?.({ input: 7, output: 18, cacheRead: 3, cacheWrite: 1, total: 25, cost: 0.25 });
+          return "ok";
+        },
+      },
+      agentRetries: 1,
+      persistLogs: false,
+      onRetrySpend: (tokens, usage) => {
+        retryTokens = tokens;
+        retryUsage = usage;
+      },
+    },
+  );
+
+  assert.equal(result.result, "ok");
+  assert.equal(calls, 2);
+  assert.equal(retryTokens, 40, "the historical scalar retry spend remains available");
+  assert.deepEqual(retryUsage, {
+    input: 10,
+    output: 30,
+    cacheRead: 5,
+    cacheWrite: 2,
+    total: 40,
+    cost: 0.4,
+  });
+  assert.equal(result.tokenUsage?.total, 65, "all attempts remain in the run-wide total");
+});
+
 test("runWorkflow returns null when recoverable retries are exhausted", async () => {
   let calls = 0;
   const logs: string[] = [];
@@ -438,6 +789,42 @@ test("runWorkflow accumulates real per-agent usage (incl. cost + cache tokens)",
   assert.ok(Math.abs((result.tokenUsage?.cost ?? 0) - 0.004) < 1e-9, "should be within tolerance");
   assert.equal(result.tokenUsage?.cacheRead, 100, "cacheRead accumulates across agents");
   assert.equal(result.tokenUsage?.cacheWrite, 20, "cacheWrite accumulates across agents");
+});
+
+test("Anthropic cache fan-out gate is disabled when PI_CACHE_RETENTION=none", async () => {
+  const previous = process.env.PI_CACHE_RETENTION;
+  const script = `export const meta = { name: 'cache_retention', description: 'gate policy' }
+return await agent('work', { model: 'anthropic/claude-test' })`;
+  try {
+    delete process.env.PI_CACHE_RETENTION;
+    let defaultGate: unknown;
+    await runWorkflow(script, {
+      agent: {
+        async run(_prompt, options) {
+          defaultGate = options?.cacheWarmGate;
+          return "ok";
+        },
+      },
+      persistLogs: false,
+    });
+    assert.ok(defaultGate, "Anthropic default short retention uses the fan-out gate");
+
+    process.env.PI_CACHE_RETENTION = "none";
+    let disabledGate: unknown;
+    await runWorkflow(script, {
+      agent: {
+        async run(_prompt, options) {
+          disabledGate = options?.cacheWarmGate;
+          return "ok";
+        },
+      },
+      persistLogs: false,
+    });
+    assert.equal(disabledGate, undefined, "no-cache mode must not serialize siblings for a cache that cannot exist");
+  } finally {
+    if (previous === undefined) delete process.env.PI_CACHE_RETENTION;
+    else process.env.PI_CACHE_RETENTION = previous;
+  }
 });
 
 test("meta.model is parsed and routes as the default model for agents", async () => {
@@ -605,6 +992,41 @@ test("resume replays cached results without re-running agents", async () => {
   assert.equal(JSON.stringify(r2.result), JSON.stringify(r1.result));
 });
 
+test("resume hashes realized args at the call boundary without invalidating unrelated prefix work", async () => {
+  const script = `export const meta = { name: 'resume_args', description: 'args-aware replay' }
+const stable = await agent('stable', { label: 'stable' })
+const scoped = await agent('scope:' + args.scope, { label: 'scoped' })
+return { stable, scoped }`;
+  const journal: JournalEntry[] = [];
+  await runWorkflow(script, {
+    agent: countingAgent().runner,
+    args: { scope: "a", displayOnly: 1 },
+    persistLogs: false,
+    runId: "resume-args-boundary-run",
+    onAgentJournal: (entry) => journal.push(entry),
+  });
+
+  const sameRealizedCalls = countingAgent();
+  await runWorkflow(script, {
+    agent: sameRealizedCalls.runner,
+    args: { scope: "a", displayOnly: 2 },
+    persistLogs: false,
+    runId: "resume-args-boundary-run",
+    resumeJournal: new Map(journal.map((entry) => [`${entry.runId}:${entry.index}`, entry])),
+  });
+  assert.equal(sameRealizedCalls.state.calls, 0, "an unused args edit does not invalidate identical call inputs");
+
+  const changedRealizedCalls = countingAgent();
+  await runWorkflow(script, {
+    agent: changedRealizedCalls.runner,
+    args: { scope: "b", displayOnly: 2 },
+    persistLogs: false,
+    runId: "resume-args-boundary-run",
+    resumeJournal: new Map(journal.map((entry) => [`${entry.runId}:${entry.index}`, entry])),
+  });
+  assert.equal(changedRealizedCalls.state.calls, 1, "only the first call whose realized args changed runs live");
+});
+
 test("resume re-runs only the changed call (hash mismatch)", async () => {
   const first = countingAgent();
   const journal: JournalEntry[] = [];
@@ -701,6 +1123,276 @@ test("callSeq is deterministic under parallel()", async () => {
     journal.map((e) => e.index).sort((a, b) => a - b),
     [0, 1, 2],
   );
+});
+
+test("a nested child miss invalidates the parent suffix", async () => {
+  const childScript = (prompt: string) => `
+    export const meta = { name: 'nested-cache-child', description: 'nested cache child' }
+    return await agent(${JSON.stringify(prompt)})
+  `;
+  const script = (prompt: string) => `
+    export const meta = { name: 'nested-cache-parent', description: 'nested cache parent' }
+    const child = await workflow(${JSON.stringify(childScript(prompt))})
+    const suffix = await agent('parent-suffix')
+    return { child, suffix }
+  `;
+  const journal: JournalEntry[] = [];
+  let firstCalls = 0;
+  await runWorkflow(script("child-v1"), {
+    runId: "nested-cache-propagation-run",
+    persistLogs: false,
+    onAgentJournal: (entry) => journal.push(entry),
+    agent: {
+      async run(prompt: string) {
+        firstCalls++;
+        return `live:${prompt}`;
+      },
+    },
+  });
+  assert.equal(firstCalls, 2);
+
+  let resumedCalls = 0;
+  const resumed = await runWorkflow<{ child: string; suffix: string }>(script("child-v2"), {
+    runId: "nested-cache-propagation-run",
+    persistLogs: false,
+    resumeJournal: new Map(journal.map((entry) => [`${entry.runId}:${entry.index}`, entry])),
+    agent: {
+      async run(prompt: string) {
+        resumedCalls++;
+        return `live:${prompt}`;
+      },
+    },
+  });
+  assert.equal(resumedCalls, 2, "a live child miss must force the parent suffix live");
+  assert.equal(resumed.result.child, "live:child-v2");
+  assert.equal(resumed.result.suffix, "live:parent-suffix");
+});
+
+test("run-level instructions are part of replay identity", async () => {
+  const script = `export const meta = { name: 'run-context-hash', description: 'run context hash' }
+return await agent('same')`;
+  const journal: JournalEntry[] = [];
+  await runWorkflow(script, {
+    runId: "run-context-hash",
+    instructions: "context-v1",
+    persistLogs: false,
+    onAgentJournal: (entry) => journal.push(entry),
+    agent: {
+      async run() {
+        return "old";
+      },
+    },
+  });
+
+  let liveCalls = 0;
+  const resumed = await runWorkflow(script, {
+    runId: "run-context-hash",
+    instructions: "context-v2",
+    persistLogs: false,
+    resumeJournal: new Map(journal.map((entry) => [`${entry.runId}:${entry.index}`, entry])),
+    agent: {
+      async run() {
+        liveCalls++;
+        return "new";
+      },
+    },
+  });
+  assert.equal(liveCalls, 1);
+  assert.equal(resumed.result, "new");
+});
+
+test("run-level tool definitions have stable replay identity and invalidate when their provider contract changes", async () => {
+  const script = `export const meta = { name: 'tool-context-hash', description: 'tool context hash' }
+return await agent('same')`;
+  const makeTool = (description: string) =>
+    defineTool({
+      name: "lookup",
+      label: "Lookup",
+      description,
+      parameters: Type.Object({ query: Type.String() }),
+      async execute(_id, params) {
+        return { content: [{ type: "text" as const, text: params.query }], details: params };
+      },
+    });
+  const journal: JournalEntry[] = [];
+  let liveCalls = 0;
+  const runner = {
+    async run() {
+      liveCalls++;
+      return `live-${liveCalls}`;
+    },
+  };
+  await runWorkflow(script, {
+    runId: "tool-context-hash",
+    tools: [makeTool("Lookup v1")],
+    persistLogs: false,
+    onAgentJournal: (entry) => journal.push(entry),
+    agent: runner,
+  });
+
+  const resumeJournal = new Map(journal.map((entry) => [`${entry.runId}:${entry.index}`, entry]));
+  const replayed = await runWorkflow(script, {
+    runId: "tool-context-hash",
+    tools: [makeTool("Lookup v1")],
+    persistLogs: false,
+    resumeJournal,
+    agent: runner,
+  });
+  assert.equal(liveCalls, 1, "an equivalent tool definition keeps the replay hit");
+  assert.equal(replayed.result, "live-1");
+
+  const invalidated = await runWorkflow(script, {
+    runId: "tool-context-hash",
+    tools: [makeTool("Lookup v2")],
+    persistLogs: false,
+    resumeJournal,
+    agent: runner,
+  });
+  assert.equal(liveCalls, 2, "a changed provider-visible tool contract invalidates replay");
+  assert.equal(invalidated.result, "live-2");
+});
+
+test("opaque session/resource context disables replay instead of guessing its identity", async () => {
+  const script = `export const meta = { name: 'opaque-context', description: 'opaque context' }
+return await agent('same')`;
+  const journal: JournalEntry[] = [];
+  const session = { resourceLoader: () => ({}) } as any;
+  await runWorkflow(script, {
+    runId: "opaque-context-run",
+    session,
+    persistLogs: false,
+    onAgentJournal: (entry) => journal.push(entry),
+    agent: {
+      async run() {
+        return "old";
+      },
+    },
+  });
+
+  let liveCalls = 0;
+  await runWorkflow(script, {
+    runId: "opaque-context-run",
+    session,
+    persistLogs: false,
+    resumeJournal: new Map(journal.map((entry) => [`${entry.runId}:${entry.index}`, entry])),
+    agent: {
+      async run() {
+        liveCalls++;
+        return "new";
+      },
+    },
+  });
+  assert.equal(liveCalls, 1, "a dynamic resource loader must fail closed for replay");
+});
+
+test("parallel shared-store writes use the same order live and on replay", async () => {
+  const journal: JournalEntry[] = [];
+  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+  const runner = {
+    async run(
+      prompt: string,
+      options: { systemTools?: Array<{ name: string; execute: (id: string, params: any) => Promise<any> }> },
+    ) {
+      const put = options.systemTools?.find((tool) => tool.name === "store_put");
+      const get = options.systemTools?.find((tool) => tool.name === "store_get");
+      if (prompt === "a") {
+        await sleep(30);
+        await put?.execute("", { key: "conflict", value: "A" });
+        return "a";
+      }
+      if (prompt === "b") {
+        await sleep(1);
+        await put?.execute("", { key: "conflict", value: "B" });
+        return "b";
+      }
+      const result = await get?.execute("", { key: "conflict" });
+      return result?.details?.value;
+    },
+  };
+  const script = (readPrompt: string) => `
+    export const meta = { name: 'ordered-store', description: 'ordered store' }
+    await parallel([() => agent('a'), () => agent('b')])
+    return await agent(${JSON.stringify(readPrompt)})
+  `;
+  const first = await runWorkflow(script("read"), {
+    runId: "ordered-store-run",
+    persistLogs: false,
+    onAgentJournal: (entry) => journal.push(entry),
+    agent: runner,
+  });
+  assert.equal(first.result, "B", "live state must use lexical admission order");
+
+  const resumed = await runWorkflow(script("read-edited"), {
+    runId: "ordered-store-run",
+    persistLogs: false,
+    resumeJournal: new Map(journal.map((entry) => [`${entry.runId}:${entry.index}`, entry])),
+    agent: runner,
+  });
+  assert.equal(resumed.result, "B", "replay must reconstruct the same conflicting write order");
+});
+
+test("replay rejects a journal entry whose runId does not match the lookup run", async () => {
+  const script = `export const meta = { name: 'run-id-fence', description: 'run id fence' }
+return await agent('same')`;
+  const journal: JournalEntry[] = [];
+  await runWorkflow(script, {
+    runId: "run-id-fence",
+    persistLogs: false,
+    onAgentJournal: (entry) => journal.push(entry),
+    agent: {
+      async run() {
+        return "old";
+      },
+    },
+  });
+  const foreign = { ...journal[0], runId: "foreign-run" } as JournalEntry;
+  let liveCalls = 0;
+  const resumed = await runWorkflow(script, {
+    runId: "run-id-fence",
+    persistLogs: false,
+    resumeJournal: new Map([["run-id-fence:0", foreign]]),
+    agent: {
+      async run() {
+        liveCalls++;
+        return "new";
+      },
+    },
+  });
+  assert.equal(liveCalls, 1);
+  assert.equal(resumed.result, "new");
+});
+
+test("an unrelated model-registry change does not invalidate a canonical model pin", async () => {
+  const script = `export const meta = { name: 'canonical-model-cache', description: 'canonical model cache' }
+return await agent('same', { model: 'provider/model-a' })`;
+  const model = (id: string) => ({ provider: "provider", id });
+  const journal: JournalEntry[] = [];
+  await runWorkflow(script, {
+    runId: "canonical-model-cache",
+    modelRegistry: { getAll: () => [model("model-a"), model("unrelated-v1")] } as any,
+    persistLogs: false,
+    onAgentJournal: (entry) => journal.push(entry),
+    agent: {
+      async run() {
+        return "old";
+      },
+    },
+  });
+  let liveCalls = 0;
+  const resumed = await runWorkflow(script, {
+    runId: "canonical-model-cache",
+    modelRegistry: { getAll: () => [model("model-a"), model("unrelated-v2")] } as any,
+    persistLogs: false,
+    resumeJournal: new Map(journal.map((entry) => [`${entry.runId}:${entry.index}`, entry])),
+    agent: {
+      async run() {
+        liveCalls++;
+        return "new";
+      },
+    },
+  });
+  assert.equal(liveCalls, 0);
+  assert.equal(resumed.result, "old");
 });
 
 test("workflow() runs a nested saved workflow and shares the global agent counter", async () => {
@@ -1094,6 +1786,22 @@ return results`;
   const result = await runWorkflow<unknown[]>(script, { agent, persistLogs: false });
   assert.ok(Array.isArray(result.result), "result.result should be an array");
   assert.equal(result.result.length, 3);
+});
+
+test("runWorkflow parallel accepts variadic thunks with array-equivalent semantics", async () => {
+  const script = `export const meta = { name: 'parallel_variadic', description: 'accept common model-authored syntax' }
+const results = await parallel(
+  () => agent('first', { label: 'first' }),
+  () => agent('second', { label: 'second' })
+)
+return results`;
+
+  const result = await runWorkflow<string[]>(script, {
+    agent: fakeAgent({ total: 50 }, "done"),
+    persistLogs: false,
+  });
+  assert.deepEqual(result.result, ["done", "done"]);
+  assert.equal(result.agentCount, 2);
 });
 
 test("runWorkflow pipeline stages in order", async () => {

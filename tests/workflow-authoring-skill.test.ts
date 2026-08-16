@@ -70,7 +70,7 @@ test("publishable Pi package discovers the workflow-authoring skill and all link
 
   const skill = readFileSync(join(ROOT, SKILL_ROOT, "SKILL.md"), "utf8");
   const description = /^description:\s*(.+)$/m.exec(skill)?.[1] ?? "";
-  for (const trigger of ["writing", "editing", "reviewing", "debugging"]) {
+  for (const trigger of ["write", "edit", "review", "debug"]) {
     assert.match(description, new RegExp(`\\b${trigger}\\b`, "i"));
   }
   assert.match(description, /not (?:for )?(?:merely )?running an existing workflow/i);

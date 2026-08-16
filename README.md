@@ -8,19 +8,21 @@
 
 After installation, Pi gains:
 
-- `workflow` — run a generated script, a saved workflow, or one of the built-in patterns.
-- `workflow_control` — list, inspect, pause, resume, and stop workflow runs.
-- `workflow_send` — send follow-up instructions to a live workflow subagent.
+- `start_workflow` — one stable, start-only tool for a generated script or curated built-in preset.
 - `/workflows` — interactive workflow navigator.
+- `/workflows status|watch|pause|resume|stop|steer` — explicit lifecycle and existing-run commands.
 - `/workflows-models` — configure `small`, `medium`, and `big` model tiers.
 - `/deep-research`, `/code-review`, `/codebase-audit`, `/adversarial-review`, and `/multi-perspective`.
 - Workflow-scoped Agent Teams with peer messages, inboxes, and a shared task board.
 - One bounded background workflow result is delivered to the main session using Pi's safe-point steering queue; an active provider request is not cancelled. Routine per-subagent finals stay in the run journal/pager instead of consuming parent context.
 
+The extension uses the stock Pi extension API and keeps one start-only `start_workflow` definition registered. Its provider-visible prefix therefore stays stable for prompt caching; there is no per-turn tool lease or dynamic `setActiveTools` rewrite. Existing runs are managed explicitly with `/workflows`; a new requirement stays in the main session or starts a fresh run and is never routed into an unrelated run.
+
 ## Requirements
 
 - Node.js 20 or newer is recommended.
 - [`@earendil-works/pi-coding-agent`](https://www.npmjs.com/package/@earendil-works/pi-coding-agent) version `0.80.8` or newer.
+- The extension uses Pi's public extension API; no Pi core patch or fork is required.
 - At least one authenticated model/provider configured in Pi.
 - Git is optional, but required when a workflow requests `isolation: "worktree"`.
 
@@ -35,7 +37,7 @@ pi install git:github.com/YukiRa1n/pi-dynamic-workflows
 For a reproducible installation, pin a release tag once tags are available:
 
 ```bash
-pi install git:github.com/YukiRa1n/pi-dynamic-workflows@v3.5.1-yuki.1
+pi install git:github.com/YukiRa1n/pi-dynamic-workflows@v3.5.1-yuki.2
 ```
 
 Reload Pi after installation:
@@ -94,7 +96,7 @@ Inside Pi, open:
 /workflows
 ```
 
-The model should also have access to `workflow`, `workflow_control`, and `workflow_send`.
+The compact start-only `start_workflow` tool is stable across ordinary turns and explicit workflow requests. It accepts a custom `script` or one of five curated `preset` names; it does not accept saved/run IDs, limits, replay, or lifecycle controls. Lifecycle and existing-run actions are command/UI paths under `/workflows`, so the model does not receive separate control, steer, or status tool schemas.
 
 ### 2. Configure model tiers
 
@@ -120,7 +122,7 @@ Or use the explicit command path:
 /workflows run Review the current project from three independent perspectives and synthesize the findings.
 ```
 
-Workflow tool runs are always backgrounded, so Pi remains usable while subagents run. Use `/workflows` or `workflow_control` to inspect them.
+Workflow tool runs are always backgrounded, so Pi remains usable while subagents run. Terminal results return automatically through the durable safe-point delivery queue; users can inspect progress with `/workflows`.
 
 ## Built-in workflow patterns
 
@@ -132,11 +134,11 @@ Workflow tool runs are always backgrounded, so Pi remains usable while subagents
 | Adversarial review | `/adversarial-review Check this migration plan for hidden failure modes.` |
 | Multiple perspectives | `/multi-perspective "Should this service be split?" security operations architecture` |
 
-The same patterns can be invoked through the `workflow` tool by name.
+The same patterns can be invoked through the `start_workflow` tool with `preset` and `args`.
 
 ## Writing a workflow
 
-A workflow is deterministic JavaScript. Its first statement exports metadata and it must call `agent()` at least once:
+A workflow is constrained JavaScript orchestration code. Its first statement exports metadata and it must call `agent()` at least once:
 
 ```js
 export const meta = {
@@ -165,7 +167,7 @@ Important globals include:
 | Name | Classification | Signature | Options and defaults |
 | --- | --- | --- | --- |
 | agent | runtime-global | `agent(prompt, options?) => Promise<string \| structured value \| null>` | `label`: string (optional; default: derived from phase and call count)<br>`phase`: string (optional; default: current phase)<br>`schema`: plain JSON Schema (optional)<br>`model`: string (optional)<br>`tier`: string (optional)<br>`isolation`: "worktree" (optional)<br>`agentType`: string (optional)<br>`timeoutMs`: number \| null (optional; default: run timeout; null disables)<br>`retries`: number (optional; default: run retry count) |
-| parallel | runtime-global | `parallel(thunks) => Promise<Array<unknown \| null>>` | — |
+| parallel | runtime-global | `parallel(thunks[] \| ...thunks) => Promise<Array<unknown \| null>>` | — |
 | pipeline | runtime-global | `pipeline(items, ...stages) => Promise<Array<unknown \| null>>` | — |
 | createTeam | runtime-global | `createTeam(name, options?) => AgentTeam` | — |
 | workflow | runtime-global | `workflow(savedName, childArgs?) => Promise<unknown>` | — |
@@ -177,7 +179,7 @@ Important globals include:
 | gate | runtime-global | `gate(thunk: (feedback: string \| undefined, attempt: number) => unknown \| Promise<unknown>, validator: (value: unknown) => { ok: boolean; feedback?: string } \| Promise<{ ok: boolean; feedback?: string }>, options?: { attempts?: number }) => Promise<{ ok: boolean; value: unknown; attempts: number }>` | `attempts`: number (optional; default: 3) |
 | checkpoint | runtime-global | `checkpoint(prompt, options?) => Promise<unknown>` | `default`: unknown (optional; default: true when no UI and omitted)<br>`headless`: "default" \| "abort" (optional; default: "default")<br>`kind`: "confirm" \| "input" \| "select" (optional; default: "confirm")<br>`choices`: string[] (optional)<br>`timeoutMs`: number (optional) |
 | log | runtime-global | `log(message) => void` | — |
-| deliver | runtime-global | `deliver(message) => Promise<void>` | — |
+| deliver | runtime-global | `deliver({ kind, message }) => Promise<void>` | `kind`: "blocker" \| "critical_finding" \| "decision" (required)<br>`message`: string (required) |
 | phase | runtime-global | `phase(title, options?) => void` | `budget`: number (optional) |
 | args | runtime-global | `args: unknown` | — |
 | cwd | runtime-global | `cwd: string` | — |
@@ -192,8 +194,9 @@ Important globals include:
 | agentTimeoutMs | workflow-tool-input | `agentTimeoutMs?: number = configured default or no per-agent limit` | — |
 | workflowTimeoutMs | workflow-tool-input | `workflowTimeoutMs?: number = 30 minute default, up to 24 hours` | — |
 | tokenBudget | workflow-tool-input | `tokenBudget?: number = configured default or unlimited` | — |
-| resumeFromRunId | workflow-tool-input | `resumeFromRunId?: string` | — |
 <!-- END GENERATED SUPPORTED WORKFLOW CAPABILITIES -->
+
+The generated table describes the full workflow authoring/library contract. The model-facing `start_workflow` surface is intentionally smaller: `script`, `preset`, and `args`. Programmatic embedders can opt into saved names, resource controls, and the separate `resumeFromRunId` compatibility path with `createWorkflowTool({ allowResume: true })`; the Pi extension never exposes those fields.
 
 See the [workflow authoring guide](docs/workflow-authoring.md) for the generated capability contract and the packaged skill for detailed authoring instructions and examples:
 
@@ -204,13 +207,14 @@ skills/workflow-patterns/
 
 ## Runtime behavior
 
-- Workflow tool invocations always start in the background; use the returned run ID with `/workflows` or `workflow_control` to inspect, pause, resume, or stop them.
+- Workflow tool invocations always start in the background. Terminal results return automatically through the durable safe-point delivery queue. Use the returned run ID with `/workflows status|watch|pause|resume|stop|steer <id>` for explicit inspection and lifecycle actions. A new user requirement starts in the main session or a fresh workflow; it is never sent to an existing unrelated run.
 - `concurrency` is bounded by the runtime maximum.
 - `maxAgents`, retry counts, per-agent timeouts, and optional token budgets can be set per run. Every workflow also has a finite logical wall-clock deadline (30 minutes by default, configurable up to 24 hours with `workflowTimeoutMs`).
 - A deadline races the complete script frame, closes admission, and aborts cooperative provider attempts. It cannot interrupt a pending Promise or a microtask-starved event loop; late provider settlement is observed and bounded drain cleanup is best effort.
-- Completed calls are journaled. A resumed workflow replays the unchanged completed prefix and runs changed/new calls live.
+- Replay identity is run-scoped: provider context such as `cwd`, instructions, tools, and session is hashed once and included in each call key. Nested and retried calls cannot collide on a bare call index. A resumed workflow replays the unchanged completed prefix and runs changed/new calls live.
+- Anthropic-compatible, non-worktree fan-out uses a short cache-warm gate: one compatible request leads, and followers are released when its first assistant response starts. Set `PI_CACHE_RETENTION=none` to disable the gate; `short` is the default and `long` keeps the warm window longer.
 - `isolation: "worktree"` is fail-closed: if a Git worktree cannot be created, that agent does not silently edit the shared checkout.
-- Explicit child-to-parent `deliver()` messages and the single terminal workflow result use `deliverAs: "steer"` with `triggerTurn: true`. They are queued for the next safe point and do not abort an already-running provider request.
+- Explicit child-to-parent `deliver({ kind, message })` messages and the single terminal workflow result use the durable safe-point delivery path with `triggerTurn: true`. Explicit messages must be classified as `blocker`, `critical_finding`, or `decision`; progress and routine results stay in logs/finals. Delivery waits for the next safe point and does not abort an already-running provider request.
 - Explicit delivery admission is finite per run: at most 32 messages, 256 KiB of UTF-8 payload, and 8 messages per 10-second window. A rejected delivery reports `DELIVERY_BUDGET_EXCEEDED`; terminal lifecycle delivery is reserved and is never downgraded or displaced by an explicit burst.
 - Automatic per-subagent final reports are retained in `/workflows` details and persisted run JSON, but are not injected into the parent model context by default. Execution order is not used to guess that the last agent is the final product.
 - The workflow's explicit return value is the semantic terminal product. Its provider projection prioritizes conventional `report`, `synthesis`, `summary`, or `answer` fields and is bounded to 12,000 characters; omitted content remains in the persisted run.
@@ -232,7 +236,7 @@ This can include:
 - token/cost accounting;
 - saved workflows and model-tier configuration.
 
-Full subagent transcripts are in memory by default. Enabling `persistAgentSessions` stores full child sessions in Pi's session directory and may retain sensitive source or prompt material. Enable it only when that retention is desired.
+Full subagent transcripts are in memory by default. Enabling `persistAgentSessions` stores full child sessions in Pi's session directory and may retain sensitive source or prompt material. Enable it only when that retention is desired. `PI_CACHE_RETENTION=none` is separate: it disables the Anthropic cache-warm gate, not durable workflow journals.
 
 Accepted explicit deliveries and terminal notifications are written to the run's durable at-least-once outbox before safe-point submission. Delivery IDs remain stable across reloads and retries; provider-context projection is acknowledged at `before_provider_request`, while transport confirmation is best effort after the provider response. This provides stable-ID projection deduplication and durable at-least-once delivery, not provider-side or end-to-end exactly-once processing. Outbox records are removed only after the generation-fenced acknowledgement; uncertain sends remain replayable from the persisted run.
 
@@ -257,16 +261,17 @@ Additional boundaries:
 | Command | Purpose |
 | --- | --- |
 | `/workflows` | Open the run navigator. |
-| `/workflows run <prompt>` | Explicitly arm a workflow request. |
-| `/workflows status <id>` | Watch one run. |
+| `/workflows run <prompt>` | Start a workflow explicitly. |
+| `/workflows status <id>` | Inspect one run from the command/UI path. |
+| `/workflows watch <id>` | Watch one run from the command/UI path. |
 | `/workflows pause <id>` | Pause and journal a run. |
 | `/workflows resume <id>` | Resume a paused/failed run. |
 | `/workflows stop <id>` | Stop a run. |
+| `/workflows steer <id> [kind] <message>` | Send an explicit same-task update to one exact run. |
 | `/workflows save <name>` | Save the latest workflow as a reusable command. |
 | `/workflows-models` | Configure model tiers. |
-| `/workflows-trigger on\|off\|status` | Configure keyword arming. |
 | `/workflows-progress compact\|detailed` | Configure the live panel. |
-| `/effort off\|high\|ultra` | Configure standing workflow effort. |
+| `/effort off\|high\|ultra` | Set effort guidance for an explicitly requested workflow; it does not take over ordinary messages. |
 
 ## Package layout
 
@@ -281,9 +286,9 @@ assets/readme/                README images
 
 ## Current verification status
 
-This repository includes synchronized `src` and `dist` runtime surfaces. The current snapshot has passed JavaScript syntax checks, extension transpilation, source-to-dist transpile parity, package dry-run inspection, and a local injected-agent smoke test.
+This repository includes synchronized `src` and `dist` runtime surfaces together with its tests, generation scripts, and release checks. The current snapshot passes `npm run release:check`: TypeScript build, generated capability documentation, context-surface verification, the full unit suite, and publishable-package validation.
 
-The installed snapshot from which this fork was prepared did not include the upstream development `tests/`, `scripts/`, documentation site, or reproducible build configuration. Consequently, those upstream full-suite/release checks cannot be reproduced from this repository alone. Treat this repository as a tested Pi package snapshot, not as a claim that every authenticated provider and cross-process stress scenario has been certified.
+Provider-backed routing samples and authenticated end-to-end smoke tests remain environment-dependent and are reported separately from the deterministic release gate. Passing the local gate does not claim that every provider, operating system, or cross-process stress scenario has been certified.
 
 ## Attribution
 

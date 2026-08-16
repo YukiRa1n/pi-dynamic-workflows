@@ -1,4 +1,4 @@
-/** One model-facing timing and token-budget decision for invoking the workflow tool. */
+/** Library-compatibility timing and token-budget evidence (not the Pi model surface). */
 export interface WorkflowDeliveryChoiceScenario {
   id: string;
   prompt: string;
@@ -14,7 +14,7 @@ export interface WorkflowDeliveryChoiceEvaluation {
   assertions: Array<{ name: string; passed: boolean; details: string }>;
 }
 
-/** Focused #89 scenarios for delivery timing and opt-in token budgets. */
+/** Focused compatibility scenarios for delivery timing and opt-in token budgets. */
 export const WORKFLOW_DELIVERY_CHOICE_SCENARIOS: readonly WorkflowDeliveryChoiceScenario[] = [
   {
     id: "background-delivery",

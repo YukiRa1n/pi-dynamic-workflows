@@ -36,8 +36,8 @@ Every exact fact below is projected from the installed extension's capability co
 
 - Classification: `runtime-global`
 - Support: `supported`
-- Signature: `parallel(thunks) => Promise<Array<unknown \| null>>`
-- Constraint: requires functions rather than promises
+- Signature: `parallel(thunks[] \| ...thunks) => Promise<Array<unknown \| null>>`
+- Constraint: accepts one array of functions or variadic functions, never promises
 - Constraint: result order matches input order
 - Constraint: recoverable thunk failures become null; nonrecoverable failures throw
 
@@ -182,8 +182,14 @@ Every exact fact below is projected from the installed extension's capability co
 
 - Classification: `runtime-global`
 - Support: `supported`
-- Signature: `deliver(message) => Promise<void>`
-- Constraint: delivers a message into the host conversation when the host wired onDeliver; no-op otherwise
+- Signature: `deliver({ kind, message }) => Promise<void>`
+- Option shape: `classified-delivery`
+- `kind`: "blocker" | "critical_finding" | "decision" (required)
+- `message`: string (required; non-empty after trimming; at most 8000 characters)
+- Constraint: kind is blocker, critical_finding, or decision
+- Constraint: message is non-empty and at most 8000 characters
+- Constraint: progress, acknowledgements, and routine results are rejected by contract and belong in logs or final output
+- Constraint: delivers into the host conversation when the host wired onDeliver; no-op otherwise
 
 <a id="phase"></a>
 ## phase
@@ -249,7 +255,6 @@ Every exact fact below is projected from the installed extension's capability co
 - Support: `supported`
 - Signature: `name?: string`
 - Constraint: resolves a project/user saved workflow first, then one of the 5 built-in patterns
-- Constraint: mutually exclusive with resumeFromRunId
 
 <a id="tool-input-args"></a>
 ## args
@@ -306,16 +311,6 @@ Every exact fact below is projected from the installed extension's capability co
 - Support: `supported`
 - Signature: `tokenBudget?: number = configured default or unlimited`
 - Constraint: soft pre-call gate; in-flight work can overshoot
-
-<a id="tool-input-resumefromrunid"></a>
-## resumeFromRunId
-
-- Classification: `workflow-tool-input`
-- Support: `supported`
-- Signature: `resumeFromRunId?: string`
-- Constraint: resumes a prior incomplete run with an edited script
-- Constraint: unchanged positional agent calls replay from cache until the first changed or inserted call
-- Constraint: always runs in the background
 
 <a id="metadata"></a>
 ## export const meta

@@ -9,6 +9,7 @@ export { applyToolPolicy, listAgentTypes, loadAgentRegistry, resolveAgentType } 
 export {
   type AgentTeamMemberSnapshot,
   type AgentTeamMessage,
+  type AgentTeamMessageKind,
   type AgentTeamSnapshot,
   type AgentTeamSpawnSpec,
   type AgentTeamTaskSnapshot,
@@ -127,6 +128,8 @@ export type {
   WorkflowMetaPhase,
   WorkflowRunOptions,
   WorkflowRunResult,
+  WorkflowSteeringKind,
+  WorkflowSteeringMessage,
 } from "./workflow.js";
 export { parseWorkflowScript, runWorkflow } from "./workflow.js";
 export type {
@@ -167,6 +170,7 @@ export {
   buildForcedWorkflowPrompt,
   endsWithTrigger,
   hasTrigger,
+  hasWorkflowRequestTrigger,
   type InstallWorkflowKeywordArmingOptions,
   installWorkflowKeywordArming,
   registerWorkflowProgressCommands,
@@ -190,6 +194,20 @@ export {
   workflowProjectPaths,
   workflowUserSavedDir,
 } from "./workflow-paths.js";
+export {
+  defaultWorkflowResourceCoordinator,
+  type ExecutionReservation,
+  type ResourceDiagnostics,
+  WorkflowResourceCoordinator,
+  type WorkflowResourceCoordinatorOptions,
+} from "./workflow-resource-coordinator.js";
+export type {
+  CapturedWorkflowRoutingCall,
+  WorkflowRoutingChoiceEvaluation,
+  WorkflowRoutingChoiceScenario,
+  WorkflowRoutingToolName,
+} from "./workflow-routing-choice.js";
+export { evaluateWorkflowRoutingChoice, WORKFLOW_ROUTING_CHOICE_SCENARIOS } from "./workflow-routing-choice.js";
 export type { SavedWorkflow, WorkflowStorage } from "./workflow-saved.js";
 export { assertSafeSavedWorkflowName, createWorkflowStorage, isSafeSavedWorkflowName } from "./workflow-saved.js";
 export type { WorkflowSettings, WorkflowSettingsOptions, WorkflowSettingsStore } from "./workflow-settings.js";
@@ -200,6 +218,8 @@ export {
   saveWorkflowSettings,
   saveWorkflowSettingsForCwd,
 } from "./workflow-settings.js";
+export type { WorkflowSteerInput, WorkflowSteerToolOptions } from "./workflow-steer-tool.js";
+export { createWorkflowSteerTool } from "./workflow-steer-tool.js";
 export type { WorkflowToolInput, WorkflowToolOptions } from "./workflow-tool.js";
 export { backgroundStartedText, createWorkflowTool } from "./workflow-tool.js";
 export {
@@ -212,5 +232,5 @@ export {
   type ViewKind,
 } from "./workflow-ui.js";
 export { registerWorkflowModelsCommand } from "./workflows-models-command.js";
-export type { Worktree } from "./worktree.js";
-export { createWorktree, removeWorktree } from "./worktree.js";
+export type { Worktree, WorktreeRemovalResult } from "./worktree.js";
+export { createWorktree, removeWorktree, removeWorktreeDetailed } from "./worktree.js";

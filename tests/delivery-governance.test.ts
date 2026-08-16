@@ -30,7 +30,7 @@ test("explicit delivery admission is finite while terminal delivery remains rese
       delivered.push(message);
     };
     const burst = `export const meta = { name: "burst", description: "burst" }
-for (let i = 0; i < ${MAX_EXPLICIT_DELIVERIES_PER_WINDOW + 1}; i++) await deliver("delivery-" + i)
+for (let i = 0; i < ${MAX_EXPLICIT_DELIVERIES_PER_WINDOW + 1}; i++) await deliver({ kind: "critical_finding", message: "delivery-" + i })
 return "done"`;
     const run = m.startInBackground(burst);
     await assert.rejects(run.promise, (error: unknown) => {
@@ -42,6 +42,11 @@ return "done"`;
     assert.equal(
       state?.deliveryOutbox?.filter((item) => item.kind === "explicit").length,
       MAX_EXPLICIT_DELIVERIES_PER_WINDOW,
+    );
+    assert.ok(
+      state?.deliveryOutbox
+        ?.filter((item) => item.kind === "explicit")
+        .every((item) => item.alertKind === "critical_finding"),
     );
     assert.equal(state?.deliveryOutbox?.filter((item) => item.terminal).length, 1);
     assert.equal(new Set(state?.deliveryOutbox?.map((item) => item.deliveryId)).size, state?.deliveryOutbox?.length);
@@ -85,7 +90,7 @@ test("acknowledged explicit delivery cannot reuse its stable ID for terminal com
       explicit = source;
     };
     const run = m.startInBackground(`export const meta = { name: "sequence", description: "monotonic delivery ids" }
-await deliver("early")
+await deliver({ kind: "decision", message: "early" })
 return await agent("finish", { label: "finisher" })`);
     while (!explicit?.deliveryId) await new Promise((resolve) => setTimeout(resolve, 5));
     assert.equal(m.acknowledgeDelivery(run.runId, explicit.deliveryId, 1, "submitted"), true);

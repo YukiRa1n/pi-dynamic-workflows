@@ -13,11 +13,10 @@ import { createWorkflowTool } from "../src/workflow-tool.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
 
 // Measure the two provider-visible prompt surfaces as UTF-8, not JavaScript
-// character counts. Keep the compact definition under the common 4 KiB tool
-// payload limit while leaving the detailed authoring guidance discoverable on
-// demand through the workflow skill.
-const RENDERED_PROMPT_BUDGET_BYTES = 800;
-const TOOL_DEFINITION_BUDGET_BYTES = 4_096;
+// character counts. The detailed authoring guidance is discoverable on demand
+// through the workflow skill, so regressions cannot grow back toward a multi-kilobyte surface.
+const RENDERED_PROMPT_BUDGET_BYTES = 160;
+const TOOL_DEFINITION_BUDGET_BYTES = 1_600;
 
 test("rendered workflow prompt contribution stays within its accepted size", async () => {
   await withRenderedWorkflow(async ({ systemPrompt, promptLines }) => {
@@ -68,7 +67,12 @@ async function withRenderedWorkflow(
   try {
     process.env.PI_CODING_AGENT_DIR = root;
     await withFakeHomeAsync(root, async () => {
-      const workflow = createWorkflowTool({ cwd: root });
+      const workflow = createWorkflowTool({
+        cwd: root,
+        allowResume: false,
+        exposeAdvancedParameters: false,
+        modelFacing: true,
+      });
       const loader = new DefaultResourceLoader({
         cwd: root,
         agentDir: root,
@@ -79,7 +83,7 @@ async function withRenderedWorkflow(
       const { session } = await createAgentSession({
         cwd: root,
         agentDir: root,
-        tools: ["workflow"],
+        tools: ["start_workflow"],
         customTools: [workflow],
         resourceLoader: loader,
         sessionManager: SessionManager.inMemory(root),
@@ -87,14 +91,14 @@ async function withRenderedWorkflow(
       });
 
       try {
-        const wrappedWorkflow = session.agent.state.tools.find((tool) => tool.name === "workflow");
+        const wrappedWorkflow = session.agent.state.tools.find((tool) => tool.name === "start_workflow");
         assert.ok(wrappedWorkflow, "Pi should expose the wrapped workflow tool");
 
         await inspect({
           systemPrompt: session.agent.state.systemPrompt,
           promptLines: [
-            `- workflow: ${workflow.promptSnippet}`,
-            ...workflow.promptGuidelines.map((guideline) => `- ${guideline}`),
+            ...(workflow.promptSnippet ? [`- workflow: ${workflow.promptSnippet}`] : []),
+            ...(workflow.promptGuidelines ?? []).map((guideline) => `- ${guideline}`),
           ],
           wrappedWorkflow,
         });

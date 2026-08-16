@@ -42,7 +42,6 @@ const EXPECTED_TOOL_INPUTS = [
   "concurrency",
   "maxAgents",
   "name",
-  "resumeFromRunId",
   "script",
   "tokenBudget",
   "workflowTimeoutMs",
@@ -67,6 +66,7 @@ test("capability definition inventories the settled runtime and invocation contr
   assert.deepEqual(WORKFLOW_CAPABILITY_DEFINITION.optionShapes.map((shape) => shape.id).sort(), [
     "agent-options",
     "checkpoint-options",
+    "classified-delivery",
     "gate-options",
     "judge-panel-options",
     "loop-until-dry-options",
@@ -93,10 +93,10 @@ test("capability definition inventories the settled runtime and invocation contr
   assert.equal(WORKFLOW_CAPABILITY_DEFINITION.versions.content.kind, "present-at");
 });
 
-test("createTeam and deliver remain supported runtime globals", () => {
+test("createTeam and classified deliver remain supported runtime globals", () => {
   for (const [name, signature] of [
     ["createTeam", "createTeam(name, options?) => AgentTeam"],
-    ["deliver", "deliver(message) => Promise<void>"],
+    ["deliver", "deliver({ kind, message }) => Promise<void>"],
   ] as const) {
     const capability = WORKFLOW_CAPABILITY_DEFINITION.capabilities.find(({ id }) => id === `workflow.runtime.${name}`);
     assert.equal(capability?.support, CapabilitySupport.SUPPORTED);

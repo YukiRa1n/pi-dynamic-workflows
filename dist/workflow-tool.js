@@ -1,29 +1,19 @@
 import { defineTool } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { BUILTIN_WORKFLOW_NAMES, resolveWorkflowInvocation } from "./builtin-workflows.js";
+import { BUILTIN_WORKFLOW_NAMES, findBuiltinWorkflow, resolveWorkflowInvocation } from "./builtin-workflows.js";
 import { MAX_WORKFLOW_TIMEOUT_MS } from "./config.js";
 import { renderWorkflowText } from "./display.js";
 import { parseWorkflowScript } from "./workflow.js";
 import { WorkflowManager } from "./workflow-manager.js";
 import { createWorkflowStorage } from "./workflow-saved.js";
 import { loadWorkflowSettings } from "./workflow-settings.js";
-/** The single always-on gate that authorizes workflow use without forcing it. */
-export const WORKFLOW_GATE_GUIDELINE = "The `workflow` tool runs multi-agent orchestration — it fans decomposable work out across subagents, and fits tasks shaped like: repo-wide inspection, independent parallel research/checks, multi-perspective review, or fan-out/fan-in synthesis. ONLY call it when the user explicitly opts in — via the workflow trigger word, `/workflows run`, or their own words (e.g. 'run a workflow', 'fan this out', '并行审一遍'). For any other task — even one that would clearly benefit — do not call it; you may briefly offer it (with a rough cost) as an option instead.";
 const workflowToolSchema = Type.Object({
     script: Type.Optional(Type.String({
-        description: [
-            "Raw JavaScript workflow script; no Markdown fences. Required unless `name` is given. First statement: export const meta = { name: 'short_snake_case', description: 'non-empty description' }. Add phases: [{ title: 'Phase' }] only when the workflow has named phases, and declare only phases it will use. For multiple phases, call phase('Exact Title') before work or set `phase` in agent options.",
-            "Use await workflow(savedName, childArgs) to run a saved workflow inline; nesting is limited to one level and shares the parent run's concurrency, agent, and token limits. Optional quality helpers include verify(), judgePanel(), loopUntilDry(), and completenessCheck(). Optional control helpers include retry() and gate(); budget exposes total, spent(), and remaining(); phase('Name', { budget: N }) sets a phase token limit.",
-            "The optional `agentType` option selects a named user or project definition to bind tools, a model, and role instructions; use only when its name and purpose are provided in context. Its bound model overrides `tier`; explicit `model` overrides both.",
-            "Plain JavaScript only: imports, require(), filesystem modules, Date.now(), Math.random(), and new Date() are unavailable.",
-            "Available: phase('Name'), agent(prompt, opts), parallel(arrayOfFunctions), pipeline(items, ...stages), createTeam(name), deliver(message), args, cwd, process.cwd(), and budget. createTeam gives workflow-scoped peer messaging/task board; team.spawn() reuses scheduler/concurrency budget. deliver(message) sends to host conversation when wired; otherwise no-op. Must call agent() at least once.",
-            "parallel() requires functions, not promises; results in input order.",
-            "pipeline(items, ...stages): stages sequentially per item; items proceed concurrently; each stage receives (previousValue, originalItem, index).",
-        ].join(" "),
+        description: "JavaScript workflow; omitted metadata is filled in. Use await agent('task', { label: 'id' }); call agent() at least once.",
     })),
     name: Type.Optional(Type.String({
-        description: "Saved or built-in workflow name; pass args in `args`. Not combinable with resumeFromRunId.",
+        description: "Saved or built-in workflow name; this is not an existing run ID.",
     })),
     args: Type.Optional(
     // Must be an explicitly typed object schema, not Type.Any(). Type.Any()
@@ -41,39 +31,76 @@ const workflowToolSchema = Type.Object({
     // provider-visible tool definition's byte budget.
     Type.Unsafe({
         type: "object",
-        description: "Optional JSON object exposed as global `args`.",
+        description: "Arguments for a named workflow.",
     })),
     maxAgents: Type.Optional(Type.Integer({
         minimum: 1,
         maximum: 1000,
-        description: "Maximum agents. Default: 1000; this is a safety ceiling, not a target. Use a lower limit for dynamic or exploratory fan-out; reserve large fan-outs for explicit user intent.",
+        description: "Maximum agent() calls.",
     })),
     concurrency: Type.Optional(Type.Integer({
         minimum: 1,
         maximum: 16,
-        description: "Maximum concurrent agents; clamped to runtime maximum. Use for provider/transport stability.",
+        description: "Maximum concurrent calls.",
     })),
     agentRetries: Type.Optional(Type.Integer({
         minimum: 0,
         maximum: 3,
-        description: "Retry attempts for recoverable agent failures (timeout, connection, empty output). Default 0 unless configured.",
+        description: "Retries per agent() call.",
     })),
     agentTimeoutMs: Type.Optional(Type.Integer({
         minimum: 1,
-        description: "Timeout per agent (ms). Omit to use configured `defaultAgentTimeoutMs`; without one, no hard timeout for individual agents. Set only when the user asks to bound them.",
+        description: "Per-call timeout (ms).",
     })),
     workflowTimeoutMs: Type.Optional(Type.Integer({
         minimum: 1,
         maximum: MAX_WORKFLOW_TIMEOUT_MS,
-        description: `Finite wall-clock deadline for the background workflow (1-${MAX_WORKFLOW_TIMEOUT_MS}ms). The default is 30 minutes; logical settlement does not interrupt a starved event loop.`,
+        description: "Workflow timeout (ms).",
     })),
     tokenBudget: Type.Optional(Type.Integer({
         minimum: 1,
-        description: "Optional user-requested soft spend gate, not a planning target. Do not set `tokenBudget` unless the user explicitly supplies a cap or asks you to choose one; never infer or invent one from task size. If omitted, the configured `defaultTokenBudget` applies; without one, the run is unlimited. Reaching the gate blocks later `agent()` calls; concurrent in-flight work can overshoot.",
+        description: "User-requested soft cap; omit otherwise.",
     })),
     resumeFromRunId: Type.Optional(Type.String({
-        description: "Resume a prior run (this ID) with an edited `script`. Unchanged agent() calls replay from cache; the first changed/new call onward re-runs. Calls match by position; keep earlier calls identical/in order. Always background.",
+        description: "Resume a run with an edited script; cached prefix calls replay.",
     })),
+}, { additionalProperties: false });
+/**
+ * The model-facing Pi contract is intentionally smaller than the library
+ * execution API. Limits and replay are useful to embedders that already own
+ * policy, but exposing them to a general model turns optional implementation
+ * knobs into invented plans. Keep this schema beside the full schema so the
+ * public extension surface can opt into the small contract without losing
+ * backwards compatibility for programmatic callers.
+ */
+const modelFacingWorkflowToolSchema = Type.Object({
+    script: Type.Optional(Type.String({
+        description: "JavaScript workflow; omitted metadata is filled in. Use await agent('task', { label: 'id' }); call agent() at least once.",
+    })),
+    preset: Type.Optional(Type.Unsafe({
+        type: "string",
+        enum: [...BUILTIN_WORKFLOW_NAMES],
+        description: "Built-in workflow preset; use script for a custom workflow.",
+    })),
+    args: Type.Optional(Type.Unsafe({
+        type: "object",
+        description: "Arguments for the selected preset.",
+    })),
+}, {
+    additionalProperties: false,
+});
+/** Compact library schema: retain saved-name lookup, without policy knobs. */
+const workflowCompactToolSchema = Type.Unsafe({
+    ...Type.Omit(workflowToolSchema, [
+        "maxAgents",
+        "concurrency",
+        "agentRetries",
+        "agentTimeoutMs",
+        "workflowTimeoutMs",
+        "tokenBudget",
+        "resumeFromRunId",
+    ]),
+    additionalProperties: false,
 });
 export function createWorkflowTool(options = {}) {
     const fallbackCwd = options.cwd ?? process.cwd();
@@ -90,17 +117,27 @@ export function createWorkflowTool(options = {}) {
     const getManager = () => options.getManager?.() ?? fallbackManager;
     const getStorage = () => options.getStorage?.() ?? fallbackStorage;
     const getCwd = () => options.getCwd?.() ?? fallbackCwd;
+    const allowResume = options.allowResume ?? false;
+    const exposeAdvancedParameters = options.exposeAdvancedParameters ?? true;
+    const modelFacing = options.modelFacing ?? false;
+    const parameters = (modelFacing
+        ? modelFacingWorkflowToolSchema
+        : exposeAdvancedParameters
+            ? allowResume
+                ? workflowToolSchema
+                : Type.Omit(workflowToolSchema, ["resumeFromRunId"])
+            : workflowCompactToolSchema);
     return defineTool({
-        name: "workflow",
-        label: "Workflow",
-        description: "Run a JavaScript workflow that delegates work to subagents via agent(), optionally composing calls with parallel() and pipeline().",
-        promptSnippet: "Delegate substantive independent or staged work to subagents with a JavaScript workflow, optionally composing agent calls with parallel(), pipeline(), or peer coordination via createTeam()",
-        get promptGuidelines() {
-            return [WORKFLOW_GATE_GUIDELINE];
-        },
-        parameters: workflowToolSchema,
+        name: modelFacing ? "start_workflow" : "workflow",
+        label: modelFacing ? "Start workflow" : "Workflow",
+        description: modelFacing
+            ? "Start a new background workflow only when the user asks for a new multi-agent run. It cannot update an existing run; existing runs use /workflows. Use a script or built-in preset."
+            : allowResume
+                ? "Run a saved/built-in or JavaScript workflow in the background; results return automatically. Use resumeFromRunId only to revise the same paused run."
+                : "Start a new background workflow for an explicitly requested multi-agent task. Provide a saved name or JavaScript using agent(), parallel(), and pipeline(); results return automatically. Existing runs use /workflows.",
+        parameters,
         prepareArguments(args) {
-            return normalizeWorkflowToolArgs(args);
+            return normalizeWorkflowToolArgs(args, allowResume, exposeAdvancedParameters, modelFacing);
         },
         async execute(_toolCallId, params) {
             const manager = getManager();
@@ -116,13 +153,16 @@ export function createWorkflowTool(options = {}) {
             let invocationTools;
             let invocationToolset;
             let script;
-            if (params.name) {
+            const invocationName = modelFacing ? params.preset : params.name;
+            if (invocationName) {
                 if (params.resumeFromRunId) {
                     throw new Error("workflow: `name` cannot be combined with `resumeFromRunId` — resume with an edited `script` instead.");
                 }
-                const resolved = resolveWorkflowInvocation(params.name, params.args, { storage, cwd });
+                const resolved = modelFacing
+                    ? findBuiltinWorkflow(invocationName)?.resolve(cwd, params.args)
+                    : resolveWorkflowInvocation(invocationName, params.args, { storage, cwd });
                 if (!resolved) {
-                    throw new Error(`workflow: no saved or built-in workflow named "${params.name}". Built-in names: ${BUILTIN_WORKFLOW_NAMES.join(", ")}.`);
+                    throw new Error(`workflow: no saved or built-in workflow named "${invocationName}". Built-in names: ${BUILTIN_WORKFLOW_NAMES.join(", ")}.`);
                 }
                 script = normalizeWorkflowScript(resolved.script);
                 invocationTools = resolved.tools;
@@ -130,8 +170,8 @@ export function createWorkflowTool(options = {}) {
             }
             else {
                 if (!params.script)
-                    throw new Error("workflow requires either `script` or `name`");
-                script = normalizeWorkflowScript(params.script);
+                    throw new Error(`workflow requires either \`script\` or \`${modelFacing ? "preset" : "name"}\``);
+                script = normalizeWorkflowScript(params.script, modelFacing);
             }
             const parsed = parseWorkflowScript(script);
             // Iteration / cached-prefix reuse: resume a prior run with THIS (edited)
@@ -148,6 +188,11 @@ export function createWorkflowTool(options = {}) {
                 return {
                     content: [{ type: "text", text: resumedText(parsed.meta.name, runId) }],
                     details: { runId, background: true, resumedFrom: runId },
+                    // Starting or resuming a detached run is the terminal action for this
+                    // agent turn.  Do not rely on the model obeying prose such as "end
+                    // this turn": without the runtime flag it can enter another provider
+                    // cycle and immediately stop or replace the run it just created.
+                    terminate: true,
                 };
             }
             // Public tool invocations are always detached. This keeps one lifecycle,
@@ -166,10 +211,16 @@ export function createWorkflowTool(options = {}) {
             return {
                 content: [{ type: "text", text: backgroundStartedText(parsed.meta.name, runId) }],
                 details: { runId, background: true },
+                // The extension's start-only tool must let Pi consume the tool result
+                // and produce a normal acknowledgement. It cannot mutate an existing
+                // run, so the legacy library guard against a follow-up control action
+                // is unnecessary here. Keep that guard for embedders using the broader
+                // `workflow` tool to preserve their turn contract.
+                ...(modelFacing ? {} : { terminate: true }),
             };
         },
         renderCall(_args, theme) {
-            return new Text(theme.fg("toolTitle", theme.bold("workflow")), 0, 0);
+            return new Text(theme.fg("toolTitle", theme.bold(modelFacing ? "start_workflow" : "workflow")), 0, 0);
         },
         renderResult(result, { isPartial }, theme) {
             const snapshot = result.details;
@@ -201,49 +252,23 @@ function resolveWorkflowToolDefaults(options, cwd) {
         agentRetries: options.defaultAgentRetries ?? settings.defaultAgentRetries ?? 0,
     };
 }
-/**
- * The tool result returned when a workflow starts in the background. It both
- * informs the model and tells it to reassure the user: the run continues on its
- * own and the conversation will resume automatically when it finishes, so the
- * user can just wait here (or go do something else).
- */
+/** Compact acknowledgement for a detached workflow start. */
 export function backgroundStartedText(name, runId) {
-    return [
-        `Workflow "${name}" started in the background.`,
-        `Run ID: ${runId}`,
-        "It keeps running on its own. When it finishes, the result is delivered back",
-        "here and the conversation continues automatically — the user does not need to",
-        "do anything. Tell the user they can simply wait here for it to finish (it will",
-        "resume the conversation by itself), or keep chatting / working on other things",
-        "in the meantime; either way the result will come back to this conversation.",
-        `They can also track or cancel it with /workflows status ${runId} or /workflows stop ${runId}.`,
-        reviseHint(runId),
-    ].join("\n");
+    return `Workflow "${name}" started in background (run ${runId}). Result returns automatically.`;
 }
 /**
- * One-line hint telling the model it can iterate on a finished/running run by
- * resuming it with an edited script instead of re-running the whole workflow.
- * Unchanged agent() calls replay from the journal (cache); only edited/new ones
- * re-run. Omitted when there is no runId to reference.
+ * One-line hint for iterating on a run with cached-prefix replay.
  */
 export function reviseHint(runId) {
     if (!runId)
         return "";
-    return `To revise without re-running everything: re-call workflow with resumeFromRunId="${runId}" and an edited script — unchanged agent() calls replay from cache, only edited/new ones re-run.`;
+    return `Revise run ${runId} with resumeFromRunId and an edited script; cached calls replay.`;
 }
 /**
- * The tool result returned when the model resumes a run with an edited script.
- * The resumed run is always background, so its result is delivered back later.
+ * Compact acknowledgement for resuming a run with an edited script.
  */
 export function resumedText(name, runId) {
-    return [
-        `Workflow "${name}" resumed from run ${runId} with your edited script.`,
-        "Unchanged agent() calls replay from that run's journal (cache); the first",
-        "edited or newly inserted agent() call — and everything after it — re-runs live.",
-        "It runs in the background; the result is delivered back here when it finishes,",
-        "and the conversation continues automatically. The user can wait or keep working.",
-        `Track or cancel it with /workflows status ${runId} or /workflows stop ${runId}.`,
-    ].join("\n");
+    return `Workflow "${name}" resumed (run ${runId}); cached prefix calls replay, later calls run live. Result returns automatically.`;
 }
 /**
  * Explain why a resumeFromRunId could not be resumed, so the model gets a clear
@@ -270,12 +295,38 @@ export function resumeFailureText(manager, runId) {
     }
     return `Cannot resume workflow run "${runId}": it is not currently resumable (it may be busy under another process). Try again shortly, or start a new run.`;
 }
-function normalizeWorkflowToolArgs(args) {
+const WORKFLOW_TOOL_KEYS = [
+    "script",
+    "name",
+    "args",
+    "maxAgents",
+    "concurrency",
+    "agentRetries",
+    "agentTimeoutMs",
+    "workflowTimeoutMs",
+    "tokenBudget",
+    "resumeFromRunId",
+];
+function normalizeWorkflowToolArgs(args, allowResume = true, exposeAdvancedParameters = true, modelFacing = false) {
     if (!args || typeof args !== "object")
-        throw new Error("workflow requires an object argument with a `script` string or a `name`");
+        throw new Error(`workflow requires an object argument with a \`script\` string or a \`${modelFacing ? "preset" : "name"}\``);
     const value = args;
+    if (!allowResume && Object.hasOwn(value, "resumeFromRunId")) {
+        throw new Error("workflow starts a new run; use /workflows to control or resume an existing run");
+    }
     if (Object.hasOwn(value, "background")) {
         throw new Error("workflow is background-only; omit the unsupported `background` argument");
+    }
+    const allowedKeys = new Set(modelFacing ? ["script", "preset", "args"] : ["script", "name", "args"]);
+    if (exposeAdvancedParameters && !modelFacing) {
+        for (const key of WORKFLOW_TOOL_KEYS)
+            allowedKeys.add(key);
+    }
+    if (allowResume && exposeAdvancedParameters)
+        allowedKeys.add("resumeFromRunId");
+    const unknownKeys = Object.keys(value).filter((key) => !allowedKeys.has(key));
+    if (unknownKeys.length > 0) {
+        throw new Error(`workflow received unsupported field(s): ${unknownKeys.join(", ")}`);
     }
     // Finite, bounded domain checks (tool-api-types-006 / LIMIT-001): the schema
     // constrains these, but a defense-in-depth pass here rejects NaN/Infinity/
@@ -291,20 +342,51 @@ function normalizeWorkflowToolArgs(args) {
         }
         return v;
     };
-    const normalized = {
-        ...value,
-        maxAgents: validateInteger(value.maxAgents, "maxAgents", 1, 1000),
-        concurrency: validateInteger(value.concurrency, "concurrency", 1, 16),
-        agentRetries: validateInteger(value.agentRetries, "agentRetries", 0, 3),
-        agentTimeoutMs: validateInteger(value.agentTimeoutMs, "agentTimeoutMs", 1, MAX_WORKFLOW_TIMEOUT_MS),
-        workflowTimeoutMs: validateInteger(value.workflowTimeoutMs, "workflowTimeoutMs", 1, MAX_WORKFLOW_TIMEOUT_MS),
-        tokenBudget: validateInteger(value.tokenBudget, "tokenBudget", 1, Number.MAX_SAFE_INTEGER),
-    };
+    const normalized = { ...value };
+    if (exposeAdvancedParameters && !modelFacing) {
+        Object.assign(normalized, {
+            maxAgents: validateInteger(value.maxAgents, "maxAgents", 1, 1000),
+            concurrency: validateInteger(value.concurrency, "concurrency", 1, 16),
+            agentRetries: validateInteger(value.agentRetries, "agentRetries", 0, 3),
+            agentTimeoutMs: validateInteger(value.agentTimeoutMs, "agentTimeoutMs", 1, MAX_WORKFLOW_TIMEOUT_MS),
+            workflowTimeoutMs: validateInteger(value.workflowTimeoutMs, "workflowTimeoutMs", 1, MAX_WORKFLOW_TIMEOUT_MS),
+            tokenBudget: validateInteger(value.tokenBudget, "tokenBudget", 1, Number.MAX_SAFE_INTEGER),
+        });
+    }
     // `name` resolves a saved/built-in workflow at execute() time, so `script` is
     // optional here — but if `script` is present at all it must still be a
     // string (same requirement as the script-only path below), so a caller
     // passing a malformed `script` alongside `name` gets a clear error instead
     // of it being silently dropped.
+    if (modelFacing) {
+        const hasScript = typeof value.script === "string" && value.script.trim().length > 0;
+        const hasPreset = typeof value.preset === "string" && value.preset.trim().length > 0;
+        if (hasScript && hasPreset) {
+            throw new Error("workflow accepts exactly one of `script` or `preset`");
+        }
+        if (value.preset !== undefined && (typeof value.preset !== "string" || !value.preset.trim())) {
+            throw new Error("workflow's `preset` must be a non-empty built-in workflow name");
+        }
+        if (value.script !== undefined && typeof value.script !== "string") {
+            throw new Error("workflow's `script` must be a string when provided alongside `preset`");
+        }
+        if (typeof value.preset === "string" &&
+            value.preset.trim() &&
+            !BUILTIN_WORKFLOW_NAMES.includes(value.preset.trim())) {
+            throw new Error(`workflow's \`preset\` must be one of: ${BUILTIN_WORKFLOW_NAMES.join(", ")}`);
+        }
+        if (Object.hasOwn(value, "args") && !hasPreset) {
+            throw new Error("workflow's `args` requires a `preset`");
+        }
+        if (hasScript || hasPreset) {
+            return {
+                ...normalized,
+                ...(hasPreset ? { preset: value.preset.trim() } : {}),
+                ...(hasScript ? { script: normalizeWorkflowScript(value.script, true) } : {}),
+            };
+        }
+        throw new Error("workflow requires either `script` or `preset` to be a string");
+    }
     if (typeof value.name === "string" && value.name.trim()) {
         if (value.script !== undefined && typeof value.script !== "string") {
             throw new Error("workflow's `script` must be a string when provided alongside `name`");
@@ -312,17 +394,23 @@ function normalizeWorkflowToolArgs(args) {
         return {
             ...normalized,
             name: value.name.trim(),
-            script: typeof value.script === "string" ? normalizeWorkflowScript(value.script) : undefined,
+            script: typeof value.script === "string" ? normalizeWorkflowScript(value.script, false) : undefined,
         };
     }
     if (typeof value.script !== "string")
         throw new Error("workflow requires either `script` or `name` to be a string");
-    return { ...normalized, script: normalizeWorkflowScript(value.script) };
+    return {
+        ...normalized,
+        script: normalizeWorkflowScript(value.script, modelFacing),
+    };
 }
-function normalizeWorkflowScript(script) {
+function normalizeWorkflowScript(script, fillMetadata = false) {
     let text = script.trim();
     const fence = text.match(/^```(?:js|javascript)?\s*\n([\s\S]*?)\n```$/i);
     if (fence)
         text = fence[1].trim();
+    if (fillMetadata && !/^export\s+const\s+meta\s*=/.test(text) && !/\bexport\s+const\s+meta\s*=/.test(text)) {
+        text = `export const meta = { name: "model_workflow", description: "Model-authored workflow" }\n${text}`;
+    }
     return text;
 }

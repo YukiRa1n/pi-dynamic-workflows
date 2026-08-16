@@ -28,13 +28,24 @@ test("workflow context measurement reports Pi-rendered prompt and provider tool 
   const artifact = measureWorkflowContextSurfaces(ROOT);
   assert.deepEqual(JSON.parse(renderWorkflowContextMeasurement()), artifact);
 
-  assert.equal(artifact.formatVersion, 3);
+  assert.equal(artifact.formatVersion, 7);
   assert.equal(artifact.encoding, "utf8");
-  assert.deepEqual(artifact.sources, ["src/workflow-tool.ts", "skills/workflow-authoring", "package.json#pi.skills"]);
-  assert.equal(artifact.surfaces.permanentWorkflowPrompt.serialization, "UTF-8 bytes of LF-joined Pi prompt lines");
+  assert.deepEqual(artifact.sources, [
+    "src/workflow-tool.ts",
+    "src/workflow-editor.ts",
+    "skills/workflow-authoring",
+    "package.json#pi.skills",
+  ]);
+  assert.match(artifact.surfaces.permanentWorkflowPrompt.serialization, /stable/i);
+  assert.match(artifact.surfaces.providerVisibleWorkflowToolDefinition.serialization, /stable/i);
+  assert.deepEqual(
+    artifact.surfaces.providerVisibleAlwaysOnToolDefinitions.tools.map((tool) => tool.name),
+    ["start_workflow"],
+  );
+  assert.ok(artifact.surfaces.providerVisibleAlwaysOnToolDefinitions.bytes > 0);
   assert.equal(
-    artifact.surfaces.providerVisibleWorkflowToolDefinition.serialization,
-    "UTF-8 bytes of JSON.stringify({ name, description, parameters })",
+    artifact.surfaces.providerVisibleAlwaysOnToolDefinitions.bytes,
+    artifact.surfaces.providerVisibleAlwaysOnToolDefinitions.tools.reduce((sum, tool) => sum + tool.bytes, 0),
   );
   // Every skill in package.json's pi.skills contributes to the always-on
   // discovery tally — not just workflow-authoring — so adding a new skill
@@ -53,6 +64,30 @@ test("workflow context measurement reports Pi-rendered prompt and provider tool 
   for (const skill of artifact.surfaces.registeredSkillsDiscovery.skills) {
     assert.ok(skill.bytes > 0, `${skill.root} should report a positive discovery byte count`);
   }
+  assert.equal(
+    artifact.surfaces.explicitWorkflowRequestOwnedContext.bytes,
+    artifact.surfaces.permanentWorkflowPrompt.bytes +
+      artifact.surfaces.providerVisibleWorkflowToolDefinition.bytes +
+      artifact.surfaces.armedWorkflowPromptRewrite.bytes,
+  );
+  assert.ok(artifact.surfaces.armedWorkflowPromptRewrite.bytes < 240);
+  assert.ok(artifact.surfaces.forcedWorkflowPromptRewrite.bytes < 96);
+  assert.equal(
+    artifact.surfaces.stableWorkflowOwnedContext.bytes,
+    artifact.surfaces.permanentWorkflowPrompt.bytes + artifact.surfaces.providerVisibleWorkflowToolDefinition.bytes,
+  );
+  assert.equal(
+    artifact.surfaces.ordinaryWorkflowOwnedAlwaysOn.bytes,
+    artifact.surfaces.providerVisibleAlwaysOnToolDefinitions.bytes + artifact.surfaces.registeredSkillsDiscovery.bytes,
+  );
+  assert.ok(
+    artifact.surfaces.ordinaryWorkflowOwnedAlwaysOn.bytes <= 2_000,
+    "ordinary turns keep the stable start-only workflow surface and skill discovery below 2 KiB",
+  );
+  assert.ok(
+    artifact.surfaces.explicitWorkflowRequestOwnedContext.bytes <= 1_800,
+    "explicit workflow turns keep the stable tool and request suffix below 1.8 KiB",
+  );
   assert.equal(artifact.surfaces.workflowAuthoringSkillCorpus.files, 28);
   assert.ok(artifact.surfaces.workflowAuthoringSkillCorpus.bytes > 0);
   assert.equal(artifact.surfaces.representativeAuthoringProfiles.profiles.length, 6);
@@ -100,11 +135,19 @@ test("workflow context measurement generation is deterministic and committed art
   assert.match(packageJson.scripts["release:check"], /context:check/);
 });
 
-test("context freshness command prints both current byte counts", () => {
+test("context freshness command prints stable and on-demand byte counts", () => {
   const output = execSync(`${NPM_COMMAND} run context:check`, { cwd: ROOT, encoding: "utf8" });
 
-  assert.match(output, /Permanent workflow prompt: \d+ bytes/);
-  assert.match(output, /Provider-visible workflow tool definition: \d+ bytes/);
+  assert.match(output, /Stable workflow prompt: \d+ bytes/);
+  assert.match(output, /Stable workflow tool definition: \d+ bytes/);
+  assert.match(output, /Explicit-request rewrite: \d+ bytes/);
+  assert.match(output, /Forced command rewrite: \d+ bytes/);
+  assert.match(output, /Stable workflow-owned context: \d+ bytes/);
+  assert.match(output, /Explicit workflow request context: \d+ bytes/);
+  assert.match(output, /Ordinary stable workflow tool definitions: \d+ bytes/);
+  assert.match(output, /- start_workflow: \d+ bytes/);
+  assert.doesNotMatch(output, /- workflow_control: \d+ bytes/);
+  assert.doesNotMatch(output, /- workflow_steer: \d+ bytes/);
   assert.match(output, /Registered skills discovery \(all \d+\): \d+ bytes/);
   assert.match(output, /- skills\/workflow-authoring: \d+ bytes/);
   assert.match(output, /- skills\/workflow-patterns: \d+ bytes/);
@@ -126,7 +169,12 @@ async function withRenderedWorkflow(
   try {
     process.env.PI_CODING_AGENT_DIR = root;
     await withFakeHomeAsync(root, async () => {
-      const workflow = createWorkflowTool({ cwd: root });
+      const workflow = createWorkflowTool({
+        cwd: root,
+        allowResume: false,
+        exposeAdvancedParameters: false,
+        modelFacing: true,
+      });
       const loader = new DefaultResourceLoader({
         cwd: root,
         agentDir: root,
@@ -137,7 +185,7 @@ async function withRenderedWorkflow(
       const { session } = await createAgentSession({
         cwd: root,
         agentDir: root,
-        tools: ["workflow"],
+        tools: ["start_workflow"],
         customTools: [workflow],
         resourceLoader: loader,
         sessionManager: SessionManager.inMemory(root),
@@ -145,12 +193,12 @@ async function withRenderedWorkflow(
       });
 
       try {
-        const wrappedWorkflow = session.agent.state.tools.find((tool) => tool.name === "workflow");
+        const wrappedWorkflow = session.agent.state.tools.find((tool) => tool.name === "start_workflow");
         assert.ok(wrappedWorkflow, "Pi should expose the wrapped workflow tool");
         await inspect({
           systemPrompt: session.agent.state.systemPrompt,
           promptLines: [
-            `- workflow: ${workflow.promptSnippet}`,
+            ...(workflow.promptSnippet ? [`- workflow: ${workflow.promptSnippet}`] : []),
             ...(workflow.promptGuidelines ?? []).map((guideline) => `- ${guideline}`),
           ],
           wrappedWorkflow,

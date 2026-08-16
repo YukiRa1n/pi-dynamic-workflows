@@ -1,16 +1,9 @@
 /**
  * Tests for tools availability when workflows mode is triggered.
  *
- * The bug: when a user message contains "workflow" (trigger keyword),
- * installWorkflowKeywordArming's input handler calls:
- *   pi.setActiveTools?.([WORKFLOW_TOOL_NAME]);
- * which restricts ALL tools to ONLY the workflow tool.
- * The model then cannot use read, bash, edit, write, web_search, etc.
- * and gets "Tool X not found" errors.
- *
- * The fix: preserve default Pi tools alongside the workflow tool.
- * These tests verify that default tools remain available after the
- * workflows-mode trigger fires.
+ * The workflow extension exposes one stable start-only workflow tool. Input
+ * arming only adds a compact marker to an explicit request; it never mutates
+ * Pi's active tool set.
  */
 
 import assert from "node:assert/strict";
@@ -25,7 +18,7 @@ import {
   handoffWorkflowRuntime,
   takeWorkflowRuntime,
 } from "../src/extension-reload.js";
-import { buildArmedWorkflowPrompt, WORKFLOW_TOOL_NAME, type WorkflowModeState } from "../src/workflow-editor.js";
+import { buildArmedWorkflowPrompt, type WorkflowModeState } from "../src/workflow-editor.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
 
 // ---------------------------------------------------------------------------
@@ -43,7 +36,6 @@ const DEFAULT_PI_TOOLS = [
   "advisor",
   "subagent",
   "workflow",
-  "workflow_control",
 ];
 
 // Additional tools from context-mode plugin (common but not guaranteed)
@@ -84,12 +76,20 @@ function testSettingsOptions(keywordTriggerEnabled = true, keywordTriggerWord?: 
   };
 }
 
+function emitSessionStart(
+  handlers: Record<string, Array<(...args: any[]) => any>>,
+  event: unknown,
+  context: unknown,
+): void {
+  for (const handler of handlers.session_start ?? []) handler(event, context);
+}
+
 // ---------------------------------------------------------------------------
 // Test: installWorkflowKeywordArming keeps default tools available
 // ---------------------------------------------------------------------------
 
 describe("installWorkflowKeywordArming - tool availability", () => {
-  it("should include default Pi tools when input handler fires with 'workflow'", async () => {
+  it("should transform an explicit request without changing active tools", async () => {
     const { installWorkflowKeywordArming } = await import("../src/workflow-editor.js");
 
     const mockPi = createMockPi([...DEFAULT_PI_TOOLS]);
@@ -103,43 +103,20 @@ describe("installWorkflowKeywordArming - tool availability", () => {
 
     const result = inputHandlers[0]({
       source: "interactive",
-      text: "przetestuj to workflow zadanie",
+      text: "run a workflow to audit the repository",
     });
 
     // Verify transform result
     assert.deepEqual(result, {
       action: "transform",
-      text: buildArmedWorkflowPrompt("przetestuj to workflow zadanie"),
+      text: buildArmedWorkflowPrompt("run a workflow to audit the repository"),
     });
 
-    // Verify getActiveTools was called
-    assert.equal(mockPi.getActiveTools.mock.callCount(), 1);
-
-    // Verify setActiveTools was called
-    assert.equal(mockPi.setActiveTools.mock.callCount(), 1);
-
-    const calledWith = mockPi.setActiveTools.mock.calls[0].arguments[0];
-    assert.ok(Array.isArray(calledWith), "setActiveTools should be called with an array");
-
-    // The critical assertion: the workflow tool must be present
-    assert.ok(calledWith.includes(WORKFLOW_TOOL_NAME), `"${WORKFLOW_TOOL_NAME}" must be in active tools`);
-
-    // The critical assertion: default Pi tools must still be available
-    for (const tool of DEFAULT_PI_TOOLS) {
-      assert.ok(
-        calledWith.includes(tool),
-        `"${tool}" should still be available when workflows mode is triggered (got: [${calledWith.join(", ")}])`,
-      );
-    }
-
-    // Verify tools are not restricted to just workflow
-    assert.ok(
-      calledWith.length > 1,
-      `More than one tool should be active, not just workflow (got: [${calledWith.join(", ")}])`,
-    );
+    assert.equal(mockPi.getActiveTools.mock.callCount(), 0);
+    assert.equal(mockPi.setActiveTools.mock.callCount(), 0);
   });
 
-  it("should restore original tools on turn_end", async () => {
+  it("does not install an agent_settled restoration lease", async () => {
     const { installWorkflowKeywordArming } = await import("../src/workflow-editor.js");
 
     // Add a bonus tool to simulate a plugin adding a tool
@@ -148,29 +125,15 @@ describe("installWorkflowKeywordArming - tool availability", () => {
 
     installWorkflowKeywordArming(mockPi as unknown as ExtensionAPI, undefined, testSettingsOptions());
 
-    // Trigger input with "workflows"
+    // Trigger an explicit request.
     const inputHandlers = mockPi.handlers.input;
     inputHandlers[0]({
       source: "interactive",
-      text: "run workflows",
+      text: "run a workflow",
     });
-
-    // Verify tools were set (with default tools preserved)
-    const toolsWhenActive = mockPi.setActiveTools.mock.calls[0].arguments[0];
-    for (const t of originalTools) {
-      assert.ok(toolsWhenActive.includes(t), `"${t}" should be in active tools`);
-    }
-
-    // Simulate turn_end
-    const turnEndHandlers = mockPi.handlers.turn_end;
-    assert.ok(turnEndHandlers, "turn_end handler should be registered");
-    assert.equal(turnEndHandlers.length, 1);
-
-    turnEndHandlers[0]();
-
-    // Verify original tools were restored exactly
-    const restoredTools = mockPi.setActiveTools.mock.calls[1].arguments[0];
-    assert.deepEqual(restoredTools, originalTools, "original tools should be restored exactly");
+    assert.equal(mockPi.setActiveTools.mock.callCount(), 0);
+    assert.equal(mockPi.handlers.agent_settled, undefined);
+    assert.equal(mockPi.handlers.turn_end, undefined);
   });
 
   it("should fire for a configured trigger word but not the default word", async () => {
@@ -189,7 +152,7 @@ describe("installWorkflowKeywordArming - tool availability", () => {
 
     const result = inputHandlers[0]({ source: "interactive", text: "run pi-workflow" });
     assert.equal(result.action, "transform");
-    assert.equal(mockPi.setActiveTools.mock.callCount(), 1);
+    assert.equal(mockPi.setActiveTools.mock.callCount(), 0);
   });
 
   it('should not fire for "/workflows" (slash command, not trigger)', async () => {
@@ -265,7 +228,7 @@ describe("installWorkflowKeywordArming - tool availability", () => {
     });
   });
 
-  it("should handle setActiveTools throwing gracefully (best-effort)", async () => {
+  it("does not call setActiveTools even when the host implementation throws", async () => {
     const { installWorkflowKeywordArming } = await import("../src/workflow-editor.js");
 
     const mockPi = createMockPi();
@@ -276,17 +239,16 @@ describe("installWorkflowKeywordArming - tool availability", () => {
     installWorkflowKeywordArming(mockPi as unknown as ExtensionAPI, undefined, testSettingsOptions());
 
     const inputHandlers = mockPi.handlers.input;
-    // Should not throw — the catch block handles it
     const result = inputHandlers[0]({
       source: "interactive",
-      text: "test workflow",
+      text: "run a workflow",
     });
 
-    // Should still return the transform action even if setActiveTools failed
     assert.equal(result.action, "transform");
+    assert.equal(mockPi.setActiveTools.mock.callCount(), 0);
   });
 
-  it("should handle multiple trigger events and restore correctly", async () => {
+  it("handles repeated explicit requests without a dynamic lease", async () => {
     const { installWorkflowKeywordArming } = await import("../src/workflow-editor.js");
 
     const originalTools = ["bash", "read", "edit", "write"];
@@ -294,30 +256,19 @@ describe("installWorkflowKeywordArming - tool availability", () => {
 
     installWorkflowKeywordArming(mockPi as unknown as ExtensionAPI, undefined, testSettingsOptions());
 
-    // First trigger
     const inputHandlers = mockPi.handlers.input;
     inputHandlers[0]({
       source: "interactive",
-      text: "test workflow 1",
+      text: "run a workflow test 1",
     });
 
-    // Second trigger (before turn_end)
     inputHandlers[0]({
       source: "interactive",
-      text: "test workflow 2",
+      text: "run a workflow test 2",
     });
 
-    // setActiveTools should only have been called once (savedTools is already set)
-    assert.equal(mockPi.setActiveTools.mock.callCount(), 1);
-
-    // turn_end restores
-    const turnEndHandlers = mockPi.handlers.turn_end;
-    turnEndHandlers[0]();
-
-    // Subsequent turn_end should NOT restore again (savedTools is now undefined)
-    mockPi.setActiveTools.mock.resetCalls();
-    turnEndHandlers[0]();
-    assert.equal(mockPi.setActiveTools.mock.callCount(), 0, "second turn_end should not call setActiveTools");
+    assert.equal(mockPi.setActiveTools.mock.callCount(), 0);
+    assert.equal(mockPi.handlers.agent_settled, undefined);
   });
 
   it("should work with different keyword variations: 'workflow', 'workflows', 'WORKFLOW'", async () => {
@@ -335,10 +286,8 @@ describe("installWorkflowKeywordArming - tool availability", () => {
         text: `run ${keyword} test`,
       });
 
-      const tools = mockPi.setActiveTools.mock.calls[0]?.arguments[0];
-      assert.ok(tools?.includes("bash"), `bash should be available for keyword "${keyword}"`);
-      assert.ok(tools?.includes("read"), `read should be available for keyword "${keyword}"`);
-      assert.ok(tools?.includes(WORKFLOW_TOOL_NAME), `workflow should be in active tools for keyword "${keyword}"`);
+      assert.equal(mockPi.setActiveTools.mock.callCount(), 0);
+      assert.equal(mockPi.handlers.input.length, 1);
     }
   });
 
@@ -358,26 +307,30 @@ describe("installWorkflowKeywordArming - tool availability", () => {
   });
 });
 
-describe("workflow extension - control tool availability", () => {
-  it("registers both control tools and hands the live runtime across reload", async () => {
+describe("workflow extension - stable tool availability", () => {
+  it("keeps one start-only workflow tool visible and hands runtime across reload", async () => {
     const fakeHome = mkdtempSync(join(tmpdir(), "pi-dw-control-extension-"));
     try {
       await withFakeHomeAsync(fakeHome, async () => {
         discardWorkflowRuntime(process.cwd());
         const registeredTools: string[] = [];
         const activeTools = ["bash", "read"];
+        let setActiveToolsCalls = 0;
+        const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> }>();
         const handlers: Record<string, Array<(...args: any[]) => any>> = {};
         const pi = {
           registerTool: (tool: { name: string }) => registeredTools.push(tool.name),
-          registerCommand: () => {},
-          getCommands: () => [],
+          registerCommand: (name: string, command: { handler: (args: string, ctx: unknown) => Promise<void> }) => {
+            commands.set(name, command);
+          },
+          getCommands: () => [...commands.keys()].map((name) => ({ name })),
           on: (event: string, handler: (...args: any[]) => any) => {
             if (!handlers[event]) handlers[event] = [];
             handlers[event].push(handler);
           },
           getActiveTools: () => [...activeTools],
-          setActiveTools: (tools: string[]) => {
-            activeTools.splice(0, activeTools.length, ...tools);
+          setActiveTools: () => {
+            setActiveToolsCalls++;
           },
           sendMessage: () => {},
         } as unknown as ExtensionAPI;
@@ -385,9 +338,10 @@ describe("workflow extension - control tool availability", () => {
 
         installExtension(pi);
 
-        assert.deepEqual(registeredTools.slice(0, 2), ["workflow", "workflow_control"]);
-        assert.equal(handlers.session_start.length, 1);
-        handlers.session_start[0](
+        assert.deepEqual(registeredTools, ["start_workflow"]);
+        assert.ok(handlers.session_start.length >= 1);
+        emitSessionStart(
+          handlers,
           {},
           {
             cwd: process.cwd(),
@@ -398,8 +352,36 @@ describe("workflow extension - control tool availability", () => {
           },
         );
 
-        assert.ok(activeTools.includes("workflow"));
-        assert.ok(activeTools.includes("workflow_control"));
+        assert.equal(registeredTools.includes("workflow_control"), false);
+        assert.equal(registeredTools.includes("workflow_steer"), false);
+        const input = handlers.input?.[0];
+        assert.ok(input, "workflow input hook should register");
+        assert.deepEqual(input({ source: "interactive", text: "Discuss workflow status and the bug." }), {
+          action: "continue",
+        });
+        assert.deepEqual(input({ source: "interactive", text: "run a workflow to audit the repository" }), {
+          action: "transform",
+          text: buildArmedWorkflowPrompt("run a workflow to audit the repository"),
+        });
+        await commands.get("workflows")?.handler("run audit lifecycle", {
+          ui: { notify: () => {} },
+        });
+        handlers.agent_settled?.forEach((handler) => {
+          handler({ type: "agent_settled" });
+        });
+        emitSessionStart(
+          handlers,
+          { reason: "same-session" },
+          {
+            cwd: process.cwd(),
+            model: undefined,
+            modelRegistry: {},
+            sessionManager: { getSessionId: () => "session-1b" },
+            ui: { setWidget: () => {}, notify: () => {} },
+          },
+        );
+        assert.deepEqual(activeTools, ["bash", "read"]);
+        assert.equal(setActiveToolsCalls, 0);
 
         handlers.session_shutdown?.[0]?.({ reason: "reload" });
         const staged = takeWorkflowRuntime(process.cwd());
@@ -417,15 +399,20 @@ describe("workflow extension - control tool availability", () => {
             secondHandlers[event].push(handler);
           },
           getActiveTools: () => [...activeTools],
-          setActiveTools: (tools: string[]) => {
-            activeTools.splice(0, activeTools.length, ...tools);
+          setActiveTools: () => {
+            setActiveToolsCalls++;
           },
           sendMessage: () => {},
         } as unknown as ExtensionAPI;
         installExtension(secondPi);
+        assert.equal(
+          registeredTools.slice(0, 2).every((name) => name === "start_workflow"),
+          true,
+        );
         assert.equal(takeWorkflowRuntime(process.cwd()), undefined, "the fresh factory consumes the staged runtime");
 
-        secondHandlers.session_start?.[0]?.(
+        emitSessionStart(
+          secondHandlers,
           { reason: "reload" },
           {
             cwd: process.cwd(),
@@ -440,6 +427,7 @@ describe("workflow extension - control tool availability", () => {
         const restaged = takeWorkflowRuntime(process.cwd());
         assert.equal(restaged?.manager, staged.manager, "a compatible generation keeps the exact live manager");
         assert.equal(restaged?.effort.level, "high", "session effort survives with the compatible runtime");
+        assert.equal(setActiveToolsCalls, 0);
         discardWorkflowRuntime(process.cwd());
       });
     } finally {
@@ -525,7 +513,8 @@ describe("workflow extension - control tool availability", () => {
           installExtension(secondPi);
           assert.equal(takeWorkflowRuntime(process.cwd()), undefined, "second generation claims the staged runtime");
 
-          secondHandlers.session_start?.[0]?.(
+          emitSessionStart(
+            secondHandlers,
             { reason },
             {
               cwd: process.cwd(),
@@ -762,7 +751,8 @@ describe("workflow extension - control tool availability", () => {
           "factory must not register project saved commands before session_start",
         );
 
-        handlers.session_start?.[0]?.(
+        emitSessionStart(
+          handlers,
           { reason: "resume" },
           {
             cwd: otherProject,
@@ -881,7 +871,8 @@ describe("workflow extension - control tool availability", () => {
         assert.equal(delivered.length, 0, "must not deliver while runtime unbound");
 
         pi2._bound = true;
-        handlers2.session_start?.[0]?.(
+        emitSessionStart(
+          handlers2,
           { reason: "reload" },
           {
             cwd: process.cwd(),
@@ -951,7 +942,8 @@ describe("workflow extension - control tool availability", () => {
         } as unknown as ExtensionAPI;
         installExtension(pi2);
 
-        handlers2.session_start?.[0]?.(
+        emitSessionStart(
+          handlers2,
           { reason: "resume" },
           {
             cwd: otherProject,
@@ -988,7 +980,8 @@ describe("workflow extension - control tool availability", () => {
           sendMessage: () => {},
         } as unknown as ExtensionAPI;
         installExtension(pi3);
-        handlers3.session_start?.[0]?.(
+        emitSessionStart(
+          handlers3,
           { reason: "reload" },
           {
             cwd: otherProject,

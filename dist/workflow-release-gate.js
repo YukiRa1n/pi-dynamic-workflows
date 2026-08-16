@@ -234,14 +234,20 @@ function validateWorkflowControlSurface() {
         : isRecord(action) && Array.isArray(action.enum)
             ? action.enum.filter((entry) => typeof entry === "string")
             : [];
-    for (const required of ["list", "status", "pause", "resume", "stop"]) {
+    for (const required of ["pause", "resume", "stop"]) {
         if (!actionNames.includes(required)) {
             diagnostics.push(diagnostic(WorkflowReleaseDiagnosticCode.TOOL_INPUT_MISMATCH, `workflow_control.action.${required}`, `workflow_control schema is missing action ${required}.`));
         }
     }
+    for (const forbidden of ["list", "status"]) {
+        if (actionNames.includes(forbidden)) {
+            diagnostics.push(diagnostic(WorkflowReleaseDiagnosticCode.TOOL_INPUT_MISMATCH, `workflow_control.action.${forbidden}`, `workflow_control must not expose polling action ${forbidden}; inspection belongs to the user-facing /workflows command and completions arrive through workflow-result steering.`));
+        }
+    }
     const runId = properties.runId;
-    if (!isRecord(runId) || runId.type !== "string" || (typeof runId.minLength === "number" && runId.minLength > 0)) {
-        diagnostics.push(diagnostic(WorkflowReleaseDiagnosticCode.TOOL_INPUT_MISMATCH, "workflow_control.runId", "workflow_control runId must be an optional string so list wrappers may send an empty compatibility value."));
+    const requiredProperties = Array.isArray(parameters.required) ? parameters.required : [];
+    if (!isRecord(runId) || runId.type !== "string" || runId.minLength !== 1 || !requiredProperties.includes("runId")) {
+        diagnostics.push(diagnostic(WorkflowReleaseDiagnosticCode.TOOL_INPUT_MISMATCH, "workflow_control.runId", "workflow_control runId must be a required non-empty string for pause, resume, and stop."));
     }
     return diagnostics;
 }

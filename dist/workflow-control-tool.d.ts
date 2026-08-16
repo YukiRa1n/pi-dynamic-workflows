@@ -3,8 +3,8 @@ import { type Static, Type } from "typebox";
 import { type RunStatus } from "./run-persistence.js";
 import type { WorkflowManager } from "./workflow-manager.js";
 declare const workflowControlSchema: Type.TObject<{
-    action: Type.TUnion<[Type.TLiteral<"list">, Type.TLiteral<"status">, Type.TLiteral<"pause">, Type.TLiteral<"resume">, Type.TLiteral<"stop">]>;
-    runId: Type.TOptional<Type.TString>;
+    action: Type.TUnion<[Type.TLiteral<"pause">, Type.TLiteral<"resume">, Type.TLiteral<"stop">]>;
+    runId: Type.TString;
 }>;
 export type WorkflowControlInput = Static<typeof workflowControlSchema>;
 export interface WorkflowControlToolOptions {
@@ -26,6 +26,12 @@ export interface WorkflowControlRunDetails {
         skipped: number;
     };
     activeLabels: string[];
+    /** True while a paused/aborted/failed managed execution is unwinding. */
+    settling: boolean;
+    /** Snapshot entries still reported as running during an unsettled cancellation/failure generation. */
+    inFlight: number;
+    /** Labels for the snapshot entries counted by inFlight. */
+    inFlightLabels: string[];
     tokenTotal: number;
 }
 export declare function createWorkflowControlTool(options: WorkflowControlToolOptions): ToolDefinition<typeof workflowControlSchema, Record<string, unknown>>;

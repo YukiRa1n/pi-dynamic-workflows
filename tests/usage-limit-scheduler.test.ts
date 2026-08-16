@@ -109,6 +109,7 @@ function makeRun(overrides: Partial<PersistedRunState> = {}): PersistedRunState 
     runId: "run-1",
     workflowName: "test_workflow",
     script: "export const meta = { name: 'test_workflow', description: 'd' }",
+    sessionId: "test-session",
     status: "running",
     phases: [],
     agents: [],
@@ -119,7 +120,13 @@ function makeRun(overrides: Partial<PersistedRunState> = {}): PersistedRunState 
   };
 }
 
-const TUNABLES = { maxAttempts: 3, minDelayMs: 60_000, fallbackDelayMs: 300_000, maxDelayMs: 6 * 3_600_000 };
+const TUNABLES = {
+  maxAttempts: 3,
+  minDelayMs: 60_000,
+  fallbackDelayMs: 300_000,
+  maxDelayMs: 6 * 3_600_000,
+  sessionId: "test-session",
+};
 
 // ---- parseResetHintMs ---------------------------------------------------------
 
@@ -436,6 +443,46 @@ test("cold-start re-arm uses REMAINING time, not the full base delay", async () 
   scheduler.dispose();
 });
 
+test("cold-start recovery waits for session binding and ignores foreign runs", async () => {
+  const manager = new FakeManager();
+  manager.persistence.seed(
+    makeRun({
+      runId: "session-a-run",
+      sessionId: "session-a",
+      status: "paused",
+      pauseReason: "usage_limit",
+      resetHint: "resets in 10m",
+    }),
+  );
+  manager.persistence.seed(
+    makeRun({
+      runId: "session-b-run",
+      sessionId: "session-b",
+      status: "paused",
+      pauseReason: "usage_limit",
+      resetHint: "resets in 10m",
+    }),
+  );
+  const clock = createFakeClock();
+  const { sessionId: _unused, ...unboundOptions } = TUNABLES;
+  const scheduler = new UsageLimitScheduler(manager, {
+    now: clock.now,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+    ...unboundOptions,
+  });
+
+  assert.equal(clock.pendingCount(), 0, "factory-time scheduler must not scan sessions");
+  assert.equal(manager.persistence.get("session-b-run")?.autoResumeAttempts, undefined);
+
+  scheduler.bindSession("session-a");
+  assert.equal(clock.pendingCount(), 1, "only the bound session is re-armed");
+  assert.equal(scheduler.hasArmedTimer("session-a-run"), true);
+  assert.equal(scheduler.hasArmedTimer("session-b-run"), false);
+  assert.equal(manager.persistence.get("session-b-run")?.autoResumeAttempts, undefined);
+  scheduler.dispose();
+});
+
 test("cold-start re-arm skips runs with autoResume: false", async () => {
   const manager = new FakeManager();
   manager.persistence.seed(
@@ -621,9 +668,74 @@ test("dispose() clears all armed timers and unsubscribes from further events", a
   assert.equal(clock.pendingCount(), 0);
 });
 
-test("scheduler never throws out of a manager event even when a listener's work fails", async () => {
+test("dispose() releases an in-flight auto-resume wait and clears its ownership marker", async () => {
+  const manager = new FakeManager();
+  manager.persistence.seed(makeRun({ resetHint: "resets in 10m" }));
+  const clock = createFakeClock();
+  let resumeCalls = 0;
+  let finishResume!: (value: boolean) => void;
+  manager.resumeImpl = async () => {
+    resumeCalls++;
+    return new Promise<boolean>((resolve) => {
+      finishResume = resolve;
+    });
+  };
+
+  const scheduler = new UsageLimitScheduler(manager, {
+    now: clock.now,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+    ...TUNABLES,
+  });
+  manager.emit("paused", { runId: "run-1", reason: "usage_limit", resetHint: "resets in 10m" });
+  clock.fireAll();
+  await flush();
+  assert.equal(resumeCalls, 1, "timer started one resume attempt");
+
+  scheduler.dispose();
+  assert.equal(scheduler.getAttemptCount("run-1"), undefined, "dispose clears run bookkeeping immediately");
+  finishResume(true);
+  await flush();
+  assert.equal(clock.pendingCount(), 0, "a late resume completion cannot arm another timer after dispose");
+});
+
+test("dispose() releases scheduler state even when manager.resume() never settles", async () => {
+  const manager = new FakeManager();
+  manager.persistence.seed(makeRun({ resetHint: "resets in 10m" }));
+  const clock = createFakeClock();
+  let resumeCalls = 0;
+  manager.resumeImpl = async () => {
+    resumeCalls++;
+    return new Promise<boolean>(() => {});
+  };
+
+  const scheduler = new UsageLimitScheduler(manager, {
+    now: clock.now,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+    ...TUNABLES,
+  });
+  manager.emit("paused", { runId: "run-1", reason: "usage_limit", resetHint: "resets in 10m" });
+  clock.fireAll();
+  await flush();
+  assert.equal(resumeCalls, 1, "timer started one resume attempt");
+
+  // The manager's wait represents an older execution generation and is
+  // intentionally left pending. Scheduler disposal must still synchronously
+  // release all of its own state and listeners.
+  scheduler.dispose();
+  await flush();
+  assert.equal(scheduler.getAttemptCount("run-1"), undefined);
+  assert.equal(clock.pendingCount(), 0);
+  manager.emit("paused", { runId: "run-2", reason: "usage_limit", resetHint: "resets in 10m" });
+  assert.equal(clock.pendingCount(), 0, "a never-settling resume cannot resurrect scheduler timers");
+});
+
+test("scheduler ignores an unowned manager event after session binding", async () => {
   const manager = new FakeManager();
   // No seeded run: persistence.load() returns null/undefined inside the handler.
+  // Once bound, an event without an owned persisted record is fail-closed so a
+  // foreign/session-less run cannot be mutated by this scheduler.
   const clock = createFakeClock();
   const diagnostics: string[] = [];
   const scheduler = new UsageLimitScheduler(manager, {
@@ -637,7 +749,7 @@ test("scheduler never throws out of a manager event even when a listener's work 
   assert.doesNotThrow(() => {
     manager.emit("paused", { runId: "ghost-run", reason: "usage_limit", resetHint: "resets in 10m" });
   });
-  assert.equal(clock.pendingCount(), 1, "still arms even though persistence had nothing for this run");
+  assert.equal(clock.pendingCount(), 0, "does not arm an unowned run");
   scheduler.dispose();
 });
 

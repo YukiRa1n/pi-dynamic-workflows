@@ -8,12 +8,12 @@ test("effortDirective shapes fan-out without inventing token budgets", () => {
   const ultra = effortDirective("ultra") ?? "";
 
   assert.equal(effortDirective("off"), undefined);
-  assert.match(high, /HIGH/);
-  assert.match(ultra, /ULTRA/);
-  assert.match(high, /maxAgents/);
-  assert.match(ultra, /maxAgents/);
-  assert.doesNotMatch(high, /tokenBudget/);
-  assert.doesNotMatch(ultra, /tokenBudget/);
+  assert.match(high, /effort: high/i);
+  assert.match(high, /independent parallel/i);
+  assert.match(ultra, /effort: ultra/i);
+  assert.match(ultra, /adversarial verification/i);
+  assert.doesNotMatch(high, /tokenBudget|maxAgents|concurrency/i);
+  assert.doesNotMatch(ultra, /tokenBudget|maxAgents|concurrency/i);
 });
 
 test("isSubstantive accepts real requests, rejects terse text and slash commands", () => {
@@ -25,10 +25,10 @@ test("isSubstantive accepts real requests, rejects terse text and slash commands
 
 test("buildArmedWorkflowPrompt appends the extra directive only when provided", () => {
   const base = buildArmedWorkflowPrompt("do X");
-  assert.ok(!/ULTRA/.test(base), "no directive by default");
+  assert.doesNotMatch(base, /effort: ultra/i, "no directive by default");
   assert.ok(base.startsWith("do X"));
   const ultra = buildArmedWorkflowPrompt("do X", { reason: "effort", extraDirective: effortDirective("ultra") });
-  assert.match(ultra, /ULTRA/, "ultra directive appended");
+  assert.match(ultra, /effort: ultra/i, "ultra directive appended");
   assert.ok(ultra.startsWith("do X"));
 });
 

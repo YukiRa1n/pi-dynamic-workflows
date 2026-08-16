@@ -10,10 +10,10 @@ The runtime supplies `agent`, `parallel`, `pipeline`, `createTeam`, `workflow`, 
 
 ## Topology
 
-- `parallel()` takes thunks, runs independent work, and preserves input order. Await the whole array before whole-set synthesis.
+- `parallel([() => agent(...), ...])` takes thunks, runs independent work, and preserves input order. Variadic thunks (`parallel(fn1, fn2)`) are also accepted; promises are not. Await the whole result before whole-set synthesis.
 - `pipeline()` runs stages sequentially per item while items proceed concurrently. Each stage receives `(previousValue, originalItem, index)` and forwards `null` to the next stage, so guard missing coverage first.
 - `workflow(name, childArgs?)` runs a context-supplied saved workflow. Nesting is one level and shares limits, counters, tokens, and store.
-- `createTeam(name)` creates a workflow-scoped peer team. `team.spawn([{ label, role, prompt, options? }])` runs members through the same scheduler; members receive `team_send_message`, `team_broadcast`, `team_inbox`, `team_members`, and shared task-board tools. Add tasks with `team.addTask(title, description?)`. Team mailbox/task side effects are intentionally rerun live on resume rather than replayed from the ordinary agent journal.
+- `createTeam(name)` creates a workflow-scoped peer team. `team.spawn([{ label, role, prompt, options? }])` runs members through the same scheduler; members receive targeted `team_send_message`, `team_inbox`, `team_members`, and shared task-board tools. Workflow code retains broadcast APIs when every member truly needs the same task-changing update. Add tasks with `team.addTask(title, description?)`. Team mailbox/task side effects are intentionally rerun live on resume rather than replayed from the ordinary agent journal.
 
 Example:
 
@@ -38,6 +38,6 @@ When JavaScript reads fields, pass a small plain JSON Schema. Schema noncomplian
 
 ## Routing and support
 
-Selector priority is explicit `model` > `agentType` model > `tier` > phase model > metadata model > implicit `medium` > session default. An unavailable EXPLICIT selector (`model`, `agentType` model, `tier`, or phase model) throws instead of falling back — catch it if the script needs to degrade gracefully. Only the implicit default `medium` tier an untagged agent falls into degrades to the session default when unavailable, with a one-time warning logged into the run. Use exact `model`, nonstandard `tier`, or `agentType` only when context supplies its name and purpose. Worktree isolation is best-effort. See [registry ownership](registry-ownership.md).
+Selector priority is explicit `model` > `agentType` model > `tier` > phase model > metadata model > implicit `medium` > session default. An unavailable EXPLICIT selector (`model`, `agentType` model, `tier`, or phase model) throws instead of falling back — catch it if the script needs to degrade gracefully. Only the implicit default `medium` tier an untagged agent falls into degrades to the session default when unavailable, with a one-time warning logged into the run. Use exact `model`, nonstandard `tier`, or `agentType` only when context supplies its name and purpose. Worktree creation is fail-closed; post-settlement cleanup is best-effort and remains visible when reclamation is pending. See [registry ownership](registry-ownership.md).
 
 Generated entries marked `supported` are authoring API. `console` and whole-script Markdown fences are compatibility-only. VM realm facilities are internal. Active model routes and agent types are dynamic. Use `log()` in new scripts.

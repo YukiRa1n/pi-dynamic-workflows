@@ -1,4 +1,4 @@
-/** One model-facing timing and token-budget decision for invoking the workflow tool. */
+/** Library-compatibility timing and token-budget evidence (not the Pi model surface). */
 export interface WorkflowDeliveryChoiceScenario {
     id: string;
     prompt: string;
@@ -16,7 +16,7 @@ export interface WorkflowDeliveryChoiceEvaluation {
         details: string;
     }>;
 }
-/** Focused #89 scenarios for delivery timing and opt-in token budgets. */
+/** Focused compatibility scenarios for delivery timing and opt-in token budgets. */
 export declare const WORKFLOW_DELIVERY_CHOICE_SCENARIOS: readonly WorkflowDeliveryChoiceScenario[];
 /** Score captured workflow arguments without executing the submitted workflow. */
 export declare function evaluateWorkflowDeliveryChoice(scenario: WorkflowDeliveryChoiceScenario, value: unknown): WorkflowDeliveryChoiceEvaluation;

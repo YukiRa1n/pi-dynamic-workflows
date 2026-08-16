@@ -41,6 +41,7 @@
     "guidance:accept": "tsx scripts/accept-workflow-guidance.ts",
     "comprehension": "tsx scripts/run-workflow-comprehension.ts",
     "delivery-choice": "tsx scripts/run-workflow-delivery-choice.ts",
+    "routing-choice": "tsx scripts/run-workflow-routing-choice.ts",
     "dev": "tsx src/index.ts",
     "prepublishOnly": "npm run release:check"
   },

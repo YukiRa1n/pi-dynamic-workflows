@@ -133,8 +133,7 @@ async function generateWorkflow(
   const settingsManager = SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false } });
   const skill: Skill = {
     name: "workflow-authoring",
-    description:
-      "Guidance for writing, editing, reviewing, and debugging JavaScript workflow code for pi-dynamic-workflows.",
+    description: "Write, edit, review, or debug Workflow JavaScript; not for running an existing workflow.",
     filePath: SKILL_PATH,
     baseDir: dirname(SKILL_PATH),
     sourceInfo: {

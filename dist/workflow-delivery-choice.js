@@ -1,4 +1,4 @@
-/** Focused #89 scenarios for delivery timing and opt-in token budgets. */
+/** Focused compatibility scenarios for delivery timing and opt-in token budgets. */
 export const WORKFLOW_DELIVERY_CHOICE_SCENARIOS = [
     {
         id: "background-delivery",

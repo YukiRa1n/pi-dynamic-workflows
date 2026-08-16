@@ -19,6 +19,8 @@ export interface PersistedDeliveryRecord {
     kind: DeliveryOutboxKind;
     status: DeliveryOutboxStatus;
     content?: string;
+    /** Classified reason an explicit delivery is allowed to wake the parent. */
+    alertKind?: "blocker" | "critical_finding" | "decision";
     terminal?: boolean;
     generation?: number;
     createdAt: string;
@@ -166,6 +168,43 @@ export interface PersistedRunState {
     /** Cumulative explicit-delivery admission accounting, retained after ack. */
     deliveryBudget?: DeliveryBudgetState;
 }
+export interface DurableResourceDiagnostics {
+    persistedRunCount: number;
+    persistedRunBytes: number;
+    pausedRunCount: number;
+    pausedRunBytes: number;
+    terminalRunCount: number;
+    terminalRunBytes: number;
+    /** Monotonic durable high-water observations; scans are cached by list TTL. */
+    durableHighWaterBytes?: number;
+    durableHighWaterCount?: number;
+}
+export interface PausedPruneOptions {
+    /** Explicit age fence; no records are eligible when omitted. */
+    before?: Date | string | number;
+    maxRuns?: number;
+    maxBytes?: number;
+    dryRun?: boolean;
+    /** Manager-side ownership and live-generation fences. */
+    sessionId?: string;
+    protectedRunIds?: ReadonlySet<string>;
+    skipDeliveryOutbox?: boolean;
+}
+export interface PausedPruneResult {
+    dryRun: boolean;
+    candidates: string[];
+    deleted: string[];
+    skipped: Array<{
+        runId: string;
+        reason: string;
+        bytes?: number;
+    }>;
+    candidateCount: number;
+    candidateBytes: number;
+    deletedBytes: number;
+    skippedCount: number;
+    skippedBytes: number;
+}
 export interface RunPersistence {
     /**
      * Save current run state. If expectedRevision is supplied, the write is a
@@ -191,6 +230,10 @@ export interface RunPersistence {
     releaseRunLease(lease: RunLease): void;
     /** Get runs directory path. */
     getRunsDir(): string;
+    /** Bounded diagnostic scan; never mutates records. */
+    getResourceDiagnostics(): DurableResourceDiagnostics;
+    /** Explicit, lease/CAS-fenced paused cleanup. Dry-run is the default. */
+    prunePausedRuns(options?: PausedPruneOptions): PausedPruneResult;
 }
 export interface RunLease {
     runId: string;
@@ -217,6 +260,9 @@ export type FsLayer = PersistenceFsLayer;
  * per-call directory scan bounded.
  */
 export declare const DEFAULT_MAX_TERMINAL_RUNS_ON_DISK = 300;
+/** Aggregate primary+backup byte budget for terminal run JSON. Count retention
+ * still applies; the lower of the two limits wins. */
+export declare const DEFAULT_MAX_TERMINAL_RUN_BYTES_ON_DISK: number;
 /** Maximum complete UTF-8 JSON size for one persisted run record. */
 export { MAX_DURABLE_RUN_BYTES };
 /** Validate IDs before they reach any filesystem or in-memory run boundary. */
@@ -224,8 +270,13 @@ export declare function assertSafeRunId(runId: string): void;
 export interface RunPersistenceOptions {
     /** Override DEFAULT_MAX_TERMINAL_RUNS_ON_DISK (tests; advanced tuning). */
     maxTerminalRunsOnDisk?: number;
+    /** Override aggregate terminal JSON+.bak bytes retained on disk. */
+    maxTerminalRunBytesOnDisk?: number;
     /** Override MAX_DURABLE_RUN_BYTES (tests; advanced tuning). */
     maxDurableRunBytes?: number;
+    /** Parsed-state cache high-water bounds. */
+    maxParsedCacheEntries?: number;
+    maxParsedCacheBytes?: number;
 }
 export declare function createRunPersistence(cwd: string, fsOverride?: Partial<FsLayer>, options?: RunPersistenceOptions): RunPersistence;
 /**

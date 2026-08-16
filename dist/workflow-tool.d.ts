@@ -2,8 +2,6 @@ import { type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { WorkflowManager } from "./workflow-manager.js";
 import { type WorkflowStorage } from "./workflow-saved.js";
-/** The single always-on gate that authorizes workflow use without forcing it. */
-export declare const WORKFLOW_GATE_GUIDELINE = "The `workflow` tool runs multi-agent orchestration \u2014 it fans decomposable work out across subagents, and fits tasks shaped like: repo-wide inspection, independent parallel research/checks, multi-perspective review, or fan-out/fan-in synthesis. ONLY call it when the user explicitly opts in \u2014 via the workflow trigger word, `/workflows run`, or their own words (e.g. 'run a workflow', 'fan this out', '\u5E76\u884C\u5BA1\u4E00\u904D'). For any other task \u2014 even one that would clearly benefit \u2014 do not call it; you may briefly offer it (with a rough cost) as an option instead.";
 declare const workflowToolSchema: Type.TObject<{
     script: Type.TOptional<Type.TString>;
     name: Type.TOptional<Type.TString>;
@@ -18,6 +16,7 @@ declare const workflowToolSchema: Type.TObject<{
 }>;
 export type WorkflowToolInput = {
     script?: string;
+    preset?: string;
     name?: string;
     args?: Record<string, unknown>;
     maxAgents?: number;
@@ -51,25 +50,32 @@ export interface WorkflowToolOptions {
     defaultConcurrency?: number;
     /** Default retry attempts after recoverable agent failures. */
     defaultAgentRetries?: number;
+    /**
+     * Expose edited-script resume to embedders that explicitly opt in. The Pi
+     * extension disables it so the model-facing tool can only start a fresh run.
+     */
+    allowResume?: boolean;
+    /**
+     * Expose library-level resource controls. The Pi extension leaves this off;
+     * embedders that need per-invocation policy can opt in explicitly.
+     */
+    exposeAdvancedParameters?: boolean;
+    /**
+     * Use the provider-facing start-only contract: `start_workflow` with a
+     * custom script or one of the curated built-in presets. Saved run names and
+     * lifecycle controls remain library/command APIs.
+     */
+    modelFacing?: boolean;
 }
 export declare function createWorkflowTool(options?: WorkflowToolOptions): ToolDefinition<typeof workflowToolSchema, any>;
-/**
- * The tool result returned when a workflow starts in the background. It both
- * informs the model and tells it to reassure the user: the run continues on its
- * own and the conversation will resume automatically when it finishes, so the
- * user can just wait here (or go do something else).
- */
+/** Compact acknowledgement for a detached workflow start. */
 export declare function backgroundStartedText(name: string, runId: string): string;
 /**
- * One-line hint telling the model it can iterate on a finished/running run by
- * resuming it with an edited script instead of re-running the whole workflow.
- * Unchanged agent() calls replay from the journal (cache); only edited/new ones
- * re-run. Omitted when there is no runId to reference.
+ * One-line hint for iterating on a run with cached-prefix replay.
  */
 export declare function reviseHint(runId: string | undefined): string;
 /**
- * The tool result returned when the model resumes a run with an edited script.
- * The resumed run is always background, so its result is delivered back later.
+ * Compact acknowledgement for resuming a run with an edited script.
  */
 export declare function resumedText(name: string, runId: string): string;
 /**

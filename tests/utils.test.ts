@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, it } from "node:test";
 import type { WorkflowAgentSnapshot } from "../src/display.js";
 import type { WorkflowMeta } from "../src/workflow.js";
@@ -169,6 +172,37 @@ describe("logger", () => {
     assert.ok(logs[0].includes("test info"), "should contain test info");
     assert.ok(logs[1].includes("test warn"), "should contain test warn");
     assert.ok(logs[2].includes("test error"), "should contain test error");
+  });
+
+  it("bounds direct warn/error buffering inside the logger", async () => {
+    const { createWorkflowLogger } = await loadLogger();
+    const log = createWorkflowLogger({ persist: false, maxEntries: 3, maxBytes: 10_000 });
+    for (let i = 0; i < 20; i++) log.warn(`warning-${i}`);
+    assert.equal(log.getLogs().length, 3, "logger-owned buffering cannot grow beyond its hard entry limit");
+  });
+
+  it("bounds logger buffering by UTF-8 bytes", async () => {
+    const { createWorkflowLogger } = await loadLogger();
+    const log = createWorkflowLogger({ persist: false, maxEntries: 100, maxBytes: 180 });
+    for (let i = 0; i < 20; i++) log.error(`payload-${i}-${"x".repeat(40)}`);
+    const bytes = Buffer.byteLength(log.getLogs().join(""), "utf8");
+    assert.ok(bytes <= 180, `logger buffer must remain within its byte cap; got ${bytes}`);
+  });
+
+  it("bounds persisted log-file growth at the same logger resource limit", async () => {
+    const { createWorkflowLogger } = await loadLogger();
+    const cwd = mkdtempSync(join(tmpdir(), "pi-dw-logger-bound-"));
+    try {
+      const log = createWorkflowLogger({ cwd, runId: "bounded-log", maxEntries: 100, maxBytes: 220 });
+      for (let i = 0; i < 30; i++) log.warn(`payload-${i}-${"x".repeat(50)}`);
+      const path = log.persist();
+      assert.ok(path);
+      if (!path) throw new Error("expected persisted log path");
+      const bytes = Buffer.byteLength(readFileSync(path, "utf8"), "utf8");
+      assert.ok(bytes <= 221, `persisted logger output must stay bounded; got ${bytes}`);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
   });
 
   it("getLogs returns a copy (not the internal array)", async () => {

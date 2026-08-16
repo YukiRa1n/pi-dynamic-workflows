@@ -7,11 +7,11 @@ export const WORKFLOW_COMPREHENSION_SCENARIO_IDS = COMPREHENSION_SCENARIOS.map((
 export const WORKFLOW_AUTHORING_FROZEN_FILES = [
     {
         path: "skills/workflow-authoring/SKILL.md",
-        sha256: "fb3e369c9c6849fc38ea1c2d8e3603c9ebec770ee5f06d3d155c5a2ebdb84d0e",
+        sha256: "2b699f5031b511b8952002b03c9e03d356da55d73b4860a2a8a65775a3104e2e",
     },
     {
         path: "skills/workflow-authoring/references/runtime.md",
-        sha256: "781885d793f6865158f8a097e9e9fda9a5739bd877db58757669ab8f4596bcd0",
+        sha256: "884901692d5accdbc2c705ec6677db7b4ddde2d9450b93540ce1fe9c14b6037f",
     },
     {
         path: "skills/workflow-authoring/references/helpers.md",
@@ -43,7 +43,7 @@ export const WORKFLOW_AUTHORING_FROZEN_FILES = [
     },
     {
         path: "skills/workflow-authoring/references/debugging.md",
-        sha256: "080cf85ee2d41c064935ed64491a724b24b705dc40a7010af862fa22b733b71e",
+        sha256: "67f16b531ba408da8c73bdbc9fa82b2ddab0ea0ec59304f2f1c6000a10fe0edf",
     },
     {
         path: "skills/workflow-authoring/examples/classify-and-act.js",
@@ -197,12 +197,6 @@ const FROZEN_GUIDANCE_BY_CAPABILITY = {
         {
             path: LIFECYCLE_PATH,
             requiredText: "Token and phase budgets are soft pre-call gates. Spend lands after agents finish, so concurrent work can overshoot.",
-        },
-    ],
-    "workflow.tool-input.resumeFromRunId": [
-        {
-            path: LIFECYCLE_PATH,
-            requiredText: "Resume replays only the longest unchanged prefix of journaled calls. Once one call is new, changed, or unusable, that call and all later calls execute live.",
         },
     ],
     "workflow.script.determinism": [

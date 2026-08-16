@@ -1,6 +1,6 @@
 ---
 name: workflow-patterns
-description: Argument shapes for the 5 built-in workflow patterns — deep-research, adversarial-review, code-review, multi-perspective, codebase-audit — runnable via the `workflow` tool's `name` input, without slash-command syntax. Use for requests like "research X", "fact-check/adversarially review this", "review this diff/PR", "analyze from multiple perspectives", or "audit the codebase for Y". Not for authoring a new workflow script — see workflow-authoring.
+description: Arguments for five built-in workflows; load only after the user selects workflow execution.
 metadata:
   version: "3.5.1-yuki.2"
 ---
@@ -10,23 +10,26 @@ metadata:
 pi-dynamic-workflows ships 5 curated, tested workflow patterns. Each is also a
 slash command (`/deep-research`, `/adversarial-review`, `/code-review`,
 `/multi-perspective`, `/codebase-audit`), but they are equally reachable from
-the `workflow` tool directly: call it with `name` set to the pattern name
+the `start_workflow` tool directly: call it with `preset` set to the pattern name
 below and `args` matching its shape, instead of writing an equivalent script
 from scratch. Prefer this over authoring a new script whenever the request
-fits one of these shapes — the curated version is already reviewed and tested.
+fits one of these shapes and workflow execution is already authorized — the
+curated version is reviewed and tested. Do not load this skill merely because
+an ordinary direct request mentions research, review, analysis, or audit.
 
 A project or user saved workflow of the same name always takes precedence
 over a built-in of that name — on the slash command, too.
 
-These 5 names are reachable only at the `workflow` tool's top-level `name`
-input, not via the in-script `await workflow(savedName, childArgs)` helper —
-that helper resolves saved workflows only. Calling `workflow('deep-research')`
+These 5 names are reachable only at the start-only `start_workflow` tool's top-level
+`preset` input, not via the in-script `await workflow(savedName, childArgs)` helper
+— that helper resolves saved workflows only. Calling `workflow('deep-research')`
 from inside a script fails as an unknown saved workflow; use the top-level
-`name` input instead.
+`preset` input instead. This tool starts a new run; manage an existing run with
+the explicit `/workflows status|watch|pause|resume|stop|steer` commands.
 
 ## Patterns
 
-| `name` | When to reach for it | `args` |
+| `preset` | When to reach for it | `args` |
 | --- | --- | --- |
 | `deep-research` | Research a question across the web with cross-checked sources | `{ question: string, angles?: number, minSupport?: number }` — `angles` (default 4) is the number of distinct search queries; `minSupport` (default 2) is the minimum distinct sources required for a claim to survive cross-checking |
 | `adversarial-review` | Investigate a task/claim, then cross-check each finding with skeptical reviewers | `{ task: string, reviewers?: number, threshold?: number }` |
@@ -37,13 +40,12 @@ from inside a script fails as an unknown saved workflow; use the top-level
 ## Example
 
 ```json
-{ "name": "deep-research", "args": { "question": "What are the tradeoffs of X vs Y?" } }
+{ "preset": "deep-research", "args": { "question": "What are the tradeoffs of X vs Y?" } }
 ```
 
-This is a `workflow` tool call, not a script — omit `script` entirely. The run
-starts in the background exactly like the slash-command form; `background`,
-`maxAgents`, `concurrency`, `agentRetries`, `agentTimeoutMs`, and `tokenBudget`
-all still apply.
+This is a `start_workflow` tool call, not a script — omit `script` entirely. The run
+starts in the background exactly like the slash-command form. The start tool does
+not accept per-call limits or existing-run IDs; use `/workflows` for lifecycle actions.
 
 ## Writing a new workflow instead
 

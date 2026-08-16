@@ -116,4 +116,4 @@ export declare class SharedStore {
  * Used internally by `runWorkflow` so each agent's puts are tracked in the
  * store's delta journal and can be replayed additively on resume.
  */
-export declare function createAgentStoreTools(store: SharedStore, deltaKey: string): ToolDefinition[];
+export declare function createAgentStoreTools(store: SharedStore, deltaKey: string, isAdmitted?: () => boolean): ToolDefinition[];

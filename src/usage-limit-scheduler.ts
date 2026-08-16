@@ -32,6 +32,8 @@ export interface SchedulableWorkflowManager {
 export type TimerHandle = unknown;
 
 export interface UsageLimitSchedulerOptions {
+  /** Current Pi session. Cold-start recovery is deferred until bindSession(). */
+  sessionId?: string;
   /** Injectable clock (default Date.now). */
   now?: () => number;
   /** Injectable timer scheduler (default setTimeout). */
@@ -46,6 +48,8 @@ export interface UsageLimitSchedulerOptions {
   fallbackDelayMs?: number;
   /** Delay ceiling — backoff is clamped here. Default 6h. */
   maxDelayMs?: number;
+  /** Maximum simultaneously armed auto-resume timers. */
+  maxArmedTimers?: number;
   /** Diagnostics sink; defaults to console.warn. Never throws back into the caller. */
   onDiagnostic?: (message: string, detail?: unknown) => void;
 }
@@ -144,10 +148,16 @@ export class UsageLimitScheduler {
   private readonly minDelayMs: number;
   private readonly fallbackDelayMs: number;
   private readonly maxDelayMs: number;
+  private readonly maxArmedTimers: number;
   private readonly diagnostic: (message: string, detail?: unknown) => void;
+  private boundSessionId: string | undefined;
+  private sessionBound = false;
 
   private readonly state = new Map<string, RunState>();
   private disposed = false;
+  /** Resolves on dispose so an in-flight resume wait can stop retaining this scheduler. */
+  private readonly shutdownPromise: Promise<void>;
+  private readonly resolveShutdown: () => void;
   /**
    * Runs this scheduler is currently auto-resuming (its own timer fired). Used to
    * tell an auto-resume's "resumed" event apart from a manual one: an auto-resume
@@ -170,24 +180,45 @@ export class UsageLimitScheduler {
     this.now = options.now ?? Date.now;
     this.setTimer = options.setTimer ?? ((fn, ms) => setTimeout(fn, ms));
     this.clearTimer = options.clearTimer ?? ((handle) => clearTimeout(handle as ReturnType<typeof setTimeout>));
+    this.maxArmedTimers = Math.max(1, Math.floor(options.maxArmedTimers ?? 64));
     this.maxAttempts = options.maxAttempts ?? DEFAULT_MAX_ATTEMPTS;
     this.minDelayMs = options.minDelayMs ?? DEFAULT_MIN_DELAY_MS;
     this.fallbackDelayMs = options.fallbackDelayMs ?? DEFAULT_FALLBACK_DELAY_MS;
     this.maxDelayMs = options.maxDelayMs ?? DEFAULT_MAX_DELAY_MS;
+    this.boundSessionId = options.sessionId;
     this.diagnostic =
       options.onDiagnostic ??
       ((message, detail) => {
         console.warn(message, detail ?? "");
       });
+    let resolveShutdown!: () => void;
+    this.shutdownPromise = new Promise<void>((resolve) => {
+      resolveShutdown = resolve;
+    });
+    this.resolveShutdown = resolveShutdown;
+
+    if (options.sessionId !== undefined) {
+      this.sessionBound = true;
+      this.safe(() => this.coldStartRearm());
+    }
 
     this.manager.on("paused", this.onPaused);
     this.manager.on("resumed", this.onResumed);
     this.manager.on("complete", this.onTerminal);
     this.manager.on("error", this.onTerminal);
     this.manager.on("stopped", this.onTerminal);
+    this.manager.on("deleted", this.onTerminal);
+  }
 
-    // Cold-start re-arm: pick up any run that was already paused-on-usage_limit
-    // before this process (and thus this scheduler instance) existed.
+  /**
+   * Bind recovery to the host session after session_start has supplied the
+   * authoritative session id. This is intentionally separate from construction:
+   * extension factories run before Pi has selected/resumed the target session.
+   */
+  bindSession(sessionId: string | undefined): void {
+    if (this.disposed || this.sessionBound) return;
+    this.boundSessionId = sessionId;
+    this.sessionBound = true;
     this.safe(() => this.coldStartRearm());
   }
 
@@ -195,15 +226,18 @@ export class UsageLimitScheduler {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    this.resolveShutdown();
     this.manager.off("paused", this.onPaused);
     this.manager.off("resumed", this.onResumed);
     this.manager.off("complete", this.onTerminal);
     this.manager.off("error", this.onTerminal);
     this.manager.off("stopped", this.onTerminal);
+    this.manager.off("deleted", this.onTerminal);
     for (const entry of this.state.values()) {
       if (entry.timer !== undefined) this.clearTimer(entry.timer);
     }
     this.state.clear();
+    this.autoResumingRunIds.clear();
   }
 
   /** Test/diagnostic helper: in-memory attempt count tracked for a run, if any. */
@@ -233,6 +267,7 @@ export class UsageLimitScheduler {
     // stale read of it is still correct. resetHint comes off the event itself,
     // not disk, to avoid that race.
     const persisted = this.safeLoad(runId);
+    if (!this.ownsBoundSession(persisted)) return;
     if (persisted?.autoResume === false) {
       this.diagnostic(`[usage-limit-scheduler] ${runId}: autoResume is disabled for this run, not arming`);
       return;
@@ -271,8 +306,10 @@ export class UsageLimitScheduler {
   }
 
   private coldStartRearm(): void {
+    if (!this.sessionBound) return;
     const runs = this.manager.listAllRuns();
     for (const run of runs) {
+      if (!this.ownsBoundSession(run)) continue;
       if (run.status !== "paused" || run.pauseReason !== "usage_limit") continue;
       if (run.autoResume === false) continue;
       if (this.state.has(run.runId)) continue;
@@ -286,6 +323,11 @@ export class UsageLimitScheduler {
         elapsedMs,
       });
     }
+  }
+
+  private ownsBoundSession(run: PersistedRunState | undefined): boolean {
+    if (!this.sessionBound || !run) return false;
+    return run.sessionId === this.boundSessionId;
   }
 
   // ---- arming / firing ------------------------------------------------------
@@ -319,6 +361,13 @@ export class UsageLimitScheduler {
       return;
     }
 
+    if (!existing && this.state.size >= this.maxArmedTimers) {
+      this.diagnostic(
+        `[usage-limit-scheduler] timer capacity (${this.maxArmedTimers}) reached; leaving ${runId} paused`,
+      );
+      return;
+    }
+
     const delay = computeAutoResumeDelayMs({
       resetHint: params.resetHint,
       attempts: params.attempts,
@@ -329,6 +378,7 @@ export class UsageLimitScheduler {
     });
 
     const timer = this.setTimer(() => this.safe(() => this.onTimerFire(runId)), delay);
+    (timer as { unref?: () => void }).unref?.();
     this.state.set(runId, { attempts: params.attempts, timer });
     this.persistAttempts(runId, params.attempts);
   }
@@ -347,10 +397,28 @@ export class UsageLimitScheduler {
     // reset the backoff counter mid-sequence.
     this.autoResumingRunIds.add(runId);
     try {
-      resumed = await this.manager.resume(runId);
-    } catch (err) {
-      this.diagnostic(`[usage-limit-scheduler] ${runId}: resume() threw`, err);
-      resumed = false;
+      // Capture only the manager-facing dependencies in the pending promise.
+      // A manager.resume() may wait forever for an older generation to unwind;
+      // that wait must retain the manager/resources it belongs to, but it must
+      // not retain this scheduler after dispose() has released its listeners,
+      // timers, and bookkeeping.
+      const manager = this.manager;
+      const diagnostic = this.diagnostic;
+      const resumeAttempt = Promise.resolve()
+        .then(() => manager.resume(runId))
+        .then(
+          (value) => ({ kind: "resume" as const, value }),
+          (error) => {
+            diagnostic(`[usage-limit-scheduler] ${runId}: resume() threw`, error);
+            return { kind: "resume-error" as const };
+          },
+        );
+      const outcome = await Promise.race([
+        resumeAttempt,
+        this.shutdownPromise.then(() => ({ kind: "shutdown" as const })),
+      ]);
+      if (outcome.kind === "shutdown") return;
+      resumed = outcome.kind === "resume" && outcome.value;
     } finally {
       this.autoResumingRunIds.delete(runId);
     }
@@ -427,7 +495,7 @@ export class UsageLimitScheduler {
         if (!lease) return;
         try {
           const current = persistence.load(runId);
-          if (!current || current.status !== "paused") return;
+          if (current?.status !== "paused") return;
           const next = { ...current, autoResumeAttempts: attempts };
           persistence.save(next, current.revision, lease);
           this.manager.syncPersistedRevision(runId, next.revision);

@@ -1,14 +1,8 @@
 import { closeSync, existsSync, openSync, readSync } from "node:fs";
 import { resolve } from "node:path";
 import { StringDecoder } from "node:string_decoder";
-import {
-  defineTool,
-  type ExtensionAPI,
-  type ExtensionContext,
-  getMarkdownTheme,
-} from "@earendil-works/pi-coding-agent";
+import { type ExtensionAPI, type ExtensionContext, getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 import { Box, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
-import { Type } from "typebox";
 import {
   claimWorkflowRuntime,
   discardWorkflowRuntime,
@@ -21,7 +15,6 @@ import {
 import {
   createEffortState,
   createWebTools,
-  createWorkflowControlTool,
   createWorkflowStorage,
   createWorkflowTool,
   type EffortState,
@@ -128,13 +121,12 @@ function buildManagerOptions(cwd: string, storage: WorkflowStorage) {
 }
 
 /**
- * Bridge workflow messages into this session's conversation. Script delivery
- * and automatic subagent results participate in LLM context and appear in the TUI.
- * deliverAs "steer" lands at the next safe point of an active turn, after its
- * current tool-call batch. triggerTurn wakes an idle main session immediately,
- * so subagent messages behave like asynchronous tool results instead of waiting
- * for another user prompt. Re-bound on every generation/manager rebuild because
- * `pi` is generation-bound.
+ * Bridge terminal results and explicit task-changing alerts into this session.
+ * Routine subagent completions stay in the durable run record and UI instead of
+ * consuming provider context. deliverAs "steer" lands at the next safe point of
+ * an active turn, after its current tool-call batch. triggerTurn wakes an idle
+ * main session. Re-bound on every generation/manager rebuild because `pi` is
+ * generation-bound.
  */
 const COLLAPSED_MESSAGE_LINES = 8;
 const COLLAPSED_MESSAGE_CHARS = 1_200;
@@ -177,7 +169,10 @@ function registerWorkflowMessageRenderers(pi: ExtensionAPI): void {
       pi.registerMessageRenderer(customType, (message, { expanded, outputPad }, theme) => {
         const full = customMessageText(message.content);
         const preview = expanded ? { text: full, omitted: false } : collapsedMessageText(full);
-        const box = new Box(Math.max(0, outputPad), 1, (text) => theme.bg("customMessageBg", text));
+        // Pi 0.80.x did not pass outputPad to custom renderers. Keep the
+        // published peer range honest instead of feeding NaN into the TUI.
+        const leftPad = Number.isFinite(outputPad) ? Math.max(0, outputPad) : 0;
+        const box = new Box(leftPad, 1, (text) => theme.bg("customMessageBg", text));
         box.addChild(new Text(theme.fg("customMessageLabel", theme.bold(`[${customType}]`)), 0, 0));
         box.addChild(new Spacer(1));
         box.addChild(
@@ -228,6 +223,8 @@ const WORKFLOW_BRIDGE_QUEUE_LIMIT = 64;
 const WORKFLOW_BRIDGE_DEDUP_LIMIT = 256;
 const WORKFLOW_BRIDGE_PAYLOAD_LIMIT = 32_000;
 const WORKFLOW_BRIDGE_IN_FLIGHT_LIMIT = 64;
+const WORKFLOW_BRIDGE_UNCERTAIN_LIMIT = 64;
+const WORKFLOW_BRIDGE_ACK_TIMEOUT_MS = 120_000;
 /** A terminal record is never displaced by an explicit burst. This bound is
  * independent of ordinary queue pressure; older terminals remain durable in
  * the run outbox if the bridge reaches this ceiling. */
@@ -240,6 +237,7 @@ type WorkflowDeliveryDetails = {
   runId?: string;
   agentId?: string;
   label?: string;
+  alertKind?: "blocker" | "critical_finding" | "decision";
   sequence?: number;
   /** Internal acknowledgement identity; forwarded only as notification metadata. */
   deliveryId?: string;
@@ -255,20 +253,46 @@ type WorkflowBridgeDelivery = {
   wake: boolean;
 };
 
+type WorkflowBridgeUncertainDelivery = {
+  delivery: WorkflowBridgeDelivery;
+  generation: number;
+};
+
+type WorkflowBridgeAckWatchdog = {
+  generation: number;
+  /** Absolute deadline while armed. */
+  deadline: number;
+  /** Remaining duration captured when the timer is paused for compaction. */
+  remainingMs?: number;
+  timer?: ReturnType<typeof setTimeout>;
+};
+
 type WorkflowBridge = {
   manager: WorkflowManager;
   pi: ExtensionAPI;
   suspended: boolean;
+  /** True from session_before_compact until a post-compaction safe point. */
+  compacting: boolean;
+  /** Fences delayed completion/abort callbacks from an older compaction. */
+  compactionGeneration: number;
   generation: number;
   nextEventSeq: number;
   pending: WorkflowBridgeDelivery[];
   delivered: Set<string>;
   /** Sent to Pi but not yet accepted by a provider request. */
   awaitingAck: Map<string, WorkflowBridgeDelivery>;
+  /** Timed out without proof of delivery; never retried in the same generation. */
+  uncertainAck: Map<string, WorkflowBridgeUncertainDelivery>;
+  /** Generation-fenced timers for awaitingAck entries. */
+  ackWatchdogs: Map<string, WorkflowBridgeAckWatchdog>;
   /** IDs observed in the latest context projection, consumed by before_provider_request. */
   projectedForNextRequest: Array<{ id: string; generation: number }>;
   /** Included in a provider request; retained until after_provider_response. */
   includedInProviderRequest: Array<{ id: string; generation: number }>;
+  /** One-shot safe-point retries for rejected sends or durable phase-transition failures. */
+  retryingSendIds: Set<string>;
+  /** Set after a user-aborted agent run; delivery must not wake a new run until input. */
+  abortFence: boolean;
 };
 
 type ManagerWithWorkflowBridge = WorkflowManager & { __workflowBridge?: WorkflowBridge };
@@ -333,12 +357,100 @@ function normalizedWorkflowDelivery(delivery: WorkflowBridgeDelivery): WorkflowB
   return content === delivery.content ? delivery : { ...delivery, content };
 }
 
+function workflowBridgeAckTimeoutMs(): number {
+  const configured = Number(process.env.PI_WORKFLOW_DELIVERY_ACK_TIMEOUT_MS);
+  return Number.isSafeInteger(configured) && configured >= 10 && configured <= 10 * 60_000
+    ? configured
+    : WORKFLOW_BRIDGE_ACK_TIMEOUT_MS;
+}
+
+function isUncertainInCurrentGeneration(bridge: WorkflowBridge, deliveryId: string): boolean {
+  return bridge.uncertainAck.get(deliveryId)?.generation === bridge.generation;
+}
+
+function clearWorkflowAckWatchdog(bridge: WorkflowBridge, deliveryId: string, generation?: number): void {
+  const watchdog = bridge.ackWatchdogs.get(deliveryId);
+  if (!watchdog || (generation !== undefined && watchdog.generation !== generation)) return;
+  if (watchdog.timer) clearTimeout(watchdog.timer);
+  bridge.ackWatchdogs.delete(deliveryId);
+}
+
+function clearWorkflowProviderTracking(bridge: WorkflowBridge, deliveryId: string, generation: number): void {
+  bridge.projectedForNextRequest = bridge.projectedForNextRequest.filter(
+    (entry) => entry.id !== deliveryId || entry.generation !== generation,
+  );
+  bridge.includedInProviderRequest = bridge.includedInProviderRequest.filter(
+    (entry) => entry.id !== deliveryId || entry.generation !== generation,
+  );
+}
+
+function startWorkflowAckWatchdog(
+  bridge: WorkflowBridge,
+  delivery: WorkflowBridgeDelivery,
+  generation: number,
+  timeoutMs = workflowBridgeAckTimeoutMs(),
+): void {
+  clearWorkflowAckWatchdog(bridge, delivery.id);
+  const deadline = Date.now() + timeoutMs;
+  const watchdog: WorkflowBridgeAckWatchdog = { generation, deadline };
+  const timer = setTimeout(() => {
+    const watchdog = bridge.ackWatchdogs.get(delivery.id);
+    if (!watchdog || watchdog.generation !== generation) return;
+    bridge.ackWatchdogs.delete(delivery.id);
+    const awaiting = bridge.awaitingAck.get(delivery.id);
+    if (awaiting?.details?.deliveryGeneration !== generation) return;
+    if (bridge.uncertainAck.size >= WORKFLOW_BRIDGE_UNCERTAIN_LIMIT) {
+      // Preserve bounded backpressure when too many acknowledgements are
+      // uncertain. The session boundary still requeues this awaiting entry.
+      console.warn("[workflow-delivery] uncertain acknowledgement ceiling reached; retaining in-flight fence");
+      return;
+    }
+    bridge.awaitingAck.delete(delivery.id);
+    clearWorkflowProviderTracking(bridge, delivery.id, generation);
+    bridge.uncertainAck.set(delivery.id, { delivery: awaiting, generation });
+    console.warn("[workflow-delivery] acknowledgement timed out; deferred until the next session generation");
+    flushWorkflowBridge(bridge);
+  }, timeoutMs);
+  timer.unref?.();
+  watchdog.timer = timer;
+  bridge.ackWatchdogs.set(delivery.id, watchdog);
+}
+
+/** Pause acknowledgement deadlines while Pi owns the compaction stack. */
+function pauseWorkflowAckWatchdogs(bridge: WorkflowBridge): void {
+  const now = Date.now();
+  for (const watchdog of bridge.ackWatchdogs.values()) {
+    if (watchdog.timer) {
+      watchdog.remainingMs = Math.max(1, watchdog.deadline - now);
+      clearTimeout(watchdog.timer);
+      watchdog.timer = undefined;
+    }
+  }
+}
+
+/** Resume deadlines captured by pauseWorkflowAckWatchdogs(). */
+function resumeWorkflowAckWatchdogs(bridge: WorkflowBridge): void {
+  if (bridge.compacting || bridge.abortFence) return;
+  const now = Date.now();
+  for (const [deliveryId, watchdog] of [...bridge.ackWatchdogs.entries()]) {
+    if (watchdog.timer) continue;
+    const delivery = bridge.awaitingAck.get(deliveryId);
+    if (!delivery || delivery.details?.deliveryGeneration !== watchdog.generation) {
+      bridge.ackWatchdogs.delete(deliveryId);
+      continue;
+    }
+    const remainingMs = watchdog.remainingMs ?? Math.max(1, watchdog.deadline - now);
+    startWorkflowAckWatchdog(bridge, delivery, watchdog.generation, remainingMs);
+  }
+}
+
 function queueWorkflowDelivery(bridge: WorkflowBridge, rawDelivery: WorkflowBridgeDelivery): void {
   if (rawDelivery.customType === "workflow-agent") return;
   const delivery = normalizedWorkflowDelivery(rawDelivery);
   if (
     bridge.delivered.has(delivery.id) ||
     bridge.awaitingAck.has(delivery.id) ||
+    isUncertainInCurrentGeneration(bridge, delivery.id) ||
     bridge.pending.some((item) => item.id === delivery.id)
   )
     return;
@@ -370,13 +482,49 @@ function bridgeManager(bridge: WorkflowBridge): WorkflowManager {
   return bridge.manager;
 }
 
+function scheduleWorkflowDeliveryRetry(bridge: WorkflowBridge, deliveryId: string, generation: number): void {
+  if (bridge.abortFence || bridge.retryingSendIds.has(deliveryId)) return;
+  bridge.retryingSendIds.add(deliveryId);
+  const timer = setTimeout(() => {
+    if (bridge.generation === generation && !bridge.suspended && !bridge.compacting) flushWorkflowBridge(bridge);
+    // Keep the fence through promise-rejection microtasks created by this
+    // retry. An immediate second rejection therefore remains queued instead
+    // of creating an unbounded zero-delay retry loop.
+    queueMicrotask(() => bridge.retryingSendIds.delete(deliveryId));
+  }, 0);
+  timer.unref?.();
+}
+
+function requeueWorkflowDeliveryAfterPersistenceFailure(
+  bridge: WorkflowBridge,
+  item: { id: string; generation: number },
+  phase: "projected" | "acknowledged",
+): void {
+  const awaiting = bridge.awaitingAck.get(item.id);
+  if (awaiting?.details?.deliveryGeneration !== item.generation) return;
+  clearWorkflowAckWatchdog(bridge, item.id, item.generation);
+  bridge.awaitingAck.delete(item.id);
+  clearWorkflowProviderTracking(bridge, item.id, item.generation);
+  queueWorkflowDelivery(bridge, {
+    ...awaiting,
+    details: { ...awaiting.details, deliveryGeneration: undefined },
+  });
+  console.warn(`[workflow-delivery] durable ${phase} transition failed; queued for safe-point retry`);
+  scheduleWorkflowDeliveryRetry(bridge, item.id, bridge.generation);
+}
+
 function sendWorkflowDeliveryNow(bridge: WorkflowBridge, rawDelivery: WorkflowBridgeDelivery): void {
   const delivery = normalizedWorkflowDelivery(rawDelivery);
-  if (bridge.suspended) {
+  if (bridge.suspended || bridge.compacting || bridge.abortFence) {
     queueWorkflowDelivery(bridge, delivery);
     return;
   }
-  if (bridge.delivered.has(delivery.id) || bridge.awaitingAck.has(delivery.id)) return;
+  if (
+    bridge.delivered.has(delivery.id) ||
+    bridge.awaitingAck.has(delivery.id) ||
+    isUncertainInCurrentGeneration(bridge, delivery.id)
+  )
+    return;
   if (bridge.awaitingAck.size >= WORKFLOW_BRIDGE_IN_FLIGHT_LIMIT) {
     queueWorkflowDelivery(bridge, delivery);
     return;
@@ -388,16 +536,18 @@ function sendWorkflowDeliveryNow(bridge: WorkflowBridge, rawDelivery: WorkflowBr
     !persistDeliveryPhase(bridgeManager(bridge), delivery.details?.runId, delivery.id, startedGeneration, "submitted")
   ) {
     queueWorkflowDelivery(bridge, delivery);
+    scheduleWorkflowDeliveryRetry(bridge, delivery.id, startedGeneration);
     return;
   }
   const submitted = {
     ...delivery,
     details: { ...delivery.details, deliveryGeneration: startedGeneration },
   };
-  // Pi's extension sendMessage facade is fire-and-forget, so successful return
-  // is not an acknowledgement. Keep the payload until the context hook observes
-  // the custom message entering a provider-bound continuation.
+  // A fulfilled send only means Pi admitted the custom message; it is not a
+  // provider acknowledgement. Keep the payload until the context hook observes
+  // it entering a provider-bound continuation.
   bridge.awaitingAck.set(delivery.id, submitted);
+  startWorkflowAckWatchdog(bridge, submitted, startedGeneration);
   try {
     // All final reports and explicit parent deliveries use steer+triggerTurn.
     // Pi batches messages already present in the steering queue before the next
@@ -414,23 +564,53 @@ function sendWorkflowDeliveryNow(bridge: WorkflowBridge, rawDelivery: WorkflowBr
       // queue. `wake` controls only whether an idle main session starts a turn.
       { triggerTurn: delivery.wake, deliverAs: "steer" },
     );
-    // Current Pi types this as void, but tolerate hosts returning a Promise so
-    // a rejected generation-bound send cannot become an unhandled rejection or
-    // silently lose the delivery.
-    void Promise.resolve(sent).catch((err: unknown) => {
-      bridge.awaitingAck.delete(delivery.id);
-      queueWorkflowDelivery(bridge, delivery);
-      console.warn(
-        `[workflow-delivery] async send failed; queued for retry: ${err instanceof Error ? err.message : String(err)}`,
-      );
-      if (bridge.generation !== startedGeneration && !bridge.suspended) flushWorkflowBridge(bridge);
-    });
+    // Stock Pi exposes this as fire-and-forget (runtime value: void). Some
+    // compatible hosts return a Promise, so observe that optional extension
+    // without making the lifecycle depend on it.
+    if (sent && typeof (sent as any).then === "function") {
+      void Promise.resolve(sent).catch((err: unknown) => {
+        const awaiting = bridge.awaitingAck.get(delivery.id);
+        if (awaiting?.details?.deliveryGeneration !== startedGeneration) return;
+        clearWorkflowAckWatchdog(bridge, delivery.id, startedGeneration);
+        bridge.awaitingAck.delete(delivery.id);
+        clearWorkflowProviderTracking(bridge, delivery.id, startedGeneration);
+        queueWorkflowDelivery(bridge, delivery);
+        console.warn(
+          `[workflow-delivery] async send failed; queued for retry: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        if (bridge.generation !== startedGeneration && !bridge.suspended) flushWorkflowBridge(bridge);
+        else scheduleWorkflowDeliveryRetry(bridge, delivery.id, startedGeneration);
+      });
+    }
   } catch (err) {
+    clearWorkflowAckWatchdog(bridge, delivery.id, startedGeneration);
     bridge.awaitingAck.delete(delivery.id);
+    clearWorkflowProviderTracking(bridge, delivery.id, startedGeneration);
     queueWorkflowDelivery(bridge, delivery);
     console.warn(
       `[workflow-delivery] send failed; queued for retry: ${err instanceof Error ? err.message : String(err)}`,
     );
+    scheduleWorkflowDeliveryRetry(bridge, delivery.id, startedGeneration);
+  }
+}
+
+function requeueUnacknowledgedForNextGeneration(bridge: WorkflowBridge): void {
+  for (const watchdog of bridge.ackWatchdogs.values()) {
+    if (watchdog.timer) clearTimeout(watchdog.timer);
+  }
+  bridge.ackWatchdogs.clear();
+  const unacknowledged = new Map<string, WorkflowBridgeDelivery>();
+  for (const delivery of bridge.awaitingAck.values()) unacknowledged.set(delivery.id, delivery);
+  for (const { delivery } of bridge.uncertainAck.values()) unacknowledged.set(delivery.id, delivery);
+  bridge.awaitingAck.clear();
+  bridge.uncertainAck.clear();
+  bridge.includedInProviderRequest = [];
+  bridge.projectedForNextRequest = [];
+  for (const delivery of unacknowledged.values()) {
+    queueWorkflowDelivery(bridge, {
+      ...delivery,
+      details: { ...delivery.details, deliveryGeneration: undefined },
+    });
   }
 }
 
@@ -445,8 +625,38 @@ function sendWorkflowDelivery(bridge: WorkflowBridge, delivery: WorkflowBridgeDe
   sendWorkflowDeliveryNow(bridge, delivery);
 }
 
+/**
+ * A user abort ends the current host turn. Do not let a rejected custom-message
+ * promise, an ack timeout, or agent_settled turn that abort wake the model again.
+ * Move only in-memory submissions back to the durable/pending path; the durable
+ * outbox itself remains untouched and is therefore replayable after input or a
+ * session replacement.
+ */
+function fenceWorkflowBridgeAfterAbort(bridge: WorkflowBridge): void {
+  bridge.abortFence = true;
+  bridge.retryingSendIds.clear();
+  for (const watchdog of bridge.ackWatchdogs.values()) {
+    if (watchdog.timer) clearTimeout(watchdog.timer);
+  }
+  bridge.ackWatchdogs.clear();
+
+  const unacknowledged = new Map<string, WorkflowBridgeDelivery>();
+  for (const delivery of bridge.awaitingAck.values()) unacknowledged.set(delivery.id, delivery);
+  for (const { delivery } of bridge.uncertainAck.values()) unacknowledged.set(delivery.id, delivery);
+  bridge.awaitingAck.clear();
+  bridge.uncertainAck.clear();
+  bridge.projectedForNextRequest = [];
+  bridge.includedInProviderRequest = [];
+  for (const delivery of unacknowledged.values()) {
+    queueWorkflowDelivery(bridge, {
+      ...delivery,
+      details: { ...delivery.details, deliveryGeneration: undefined },
+    });
+  }
+}
+
 function flushWorkflowBridge(bridge: WorkflowBridge): void {
-  if (bridge.suspended) return;
+  if (bridge.suspended || bridge.compacting || bridge.abortFence) return;
   replayDurableOutbox(bridge.manager, bridge);
   if (bridge.pending.length === 0) return;
   const queued = bridge.pending.splice(0, bridge.pending.length);
@@ -474,19 +684,7 @@ function suspendWorkflowBridge(manager: WorkflowManager): void {
   // submission is uncertain and must be retried by the next generation with the
   // same stable ID but a NEW deliveryGeneration. Clear provider-tracking batches
   // so late old-session hooks cannot acknowledge the resend.
-  const included = bridge.includedInProviderRequest
-    .map(({ id }) => bridge.awaitingAck.get(id))
-    .filter((item): item is WorkflowBridgeDelivery => !!item);
-  const uncertain = [...bridge.awaitingAck.values()];
-  bridge.awaitingAck.clear();
-  bridge.includedInProviderRequest = [];
-  bridge.projectedForNextRequest = [];
-  for (const delivery of [...uncertain, ...included.filter((item) => !uncertain.includes(item))]) {
-    queueWorkflowDelivery(bridge, {
-      ...delivery,
-      details: { ...delivery.details, deliveryGeneration: undefined },
-    });
-  }
+  requeueUnacknowledgedForNextGeneration(bridge);
 }
 
 function replayDurableOutbox(manager: WorkflowManager, bridge: WorkflowBridge): void {
@@ -495,6 +693,7 @@ function replayDurableOutbox(manager: WorkflowManager, bridge: WorkflowBridge): 
     if (
       bridge.delivered.has(record.deliveryId) ||
       bridge.awaitingAck.has(record.deliveryId) ||
+      isUncertainInCurrentGeneration(bridge, record.deliveryId) ||
       bridge.pending.some((item) => item.id === record.deliveryId)
     )
       continue;
@@ -513,6 +712,7 @@ function replayDurableOutbox(manager: WorkflowManager, bridge: WorkflowBridge): 
       details: {
         notificationKind: record.kind === "terminal" ? "workflow-result" : "workflow-message",
         runId: record.runId,
+        alertKind: record.alertKind,
         sequence: record.sequence,
         deliveryId: record.deliveryId,
         status: record.kind === "terminal" ? (record.runStatus === "failed" ? "failed" : "completed") : undefined,
@@ -528,6 +728,80 @@ function resumeWorkflowBridge(manager: WorkflowManager): void {
   replayDurableOutbox(manager, bridge);
   bridge.suspended = false;
   flushWorkflowBridge(bridge);
+}
+
+function releaseCompactionFence(bridge: WorkflowBridge, generation: number): void {
+  if (bridge.compactionGeneration !== generation || !bridge.compacting) return;
+  bridge.compacting = false;
+  resumeWorkflowAckWatchdogs(bridge);
+  flushWorkflowBridge(bridge);
+}
+
+/**
+ * Pi's custom-message API historically allowed an idle triggerTurn delivery to
+ * start a provider run while manual compaction still owned the session. Keep
+ * workflow outbox records outside Pi until the host reaches a safe boundary:
+ * manual compaction releases after session_compact returns; threshold/overflow
+ * compaction releases only at agent_settled, after retries and queued turns.
+ */
+function installWorkflowCompactionFence(pi: ExtensionAPI, getManager: () => WorkflowManager): void {
+  pi.on("session_before_compact", (event) => {
+    const bridge = bridgeFor(getManager());
+    if (!bridge) return;
+    bridge.compacting = true;
+    pauseWorkflowAckWatchdogs(bridge);
+    const generation = ++bridge.compactionGeneration;
+    let releaseScheduled = false;
+    const scheduleRelease = () => {
+      if (releaseScheduled) return;
+      releaseScheduled = true;
+      // Abort listeners run inside Pi's compaction stack. Defer the wake so
+      // the host can clear its compaction controller before any provider run.
+      setTimeout(() => releaseCompactionFence(bridge, generation), 0);
+    };
+    event.signal.addEventListener("abort", scheduleRelease, { once: true });
+    if (event.signal.aborted) scheduleRelease();
+  });
+
+  pi.on("session_compact", (event) => {
+    if (event.reason !== "manual") return;
+    const bridge = bridgeFor(getManager());
+    if (!bridge) return;
+    const generation = bridge.compactionGeneration;
+    // session_compact fires before AgentSession clears its manual-compaction
+    // controller. A macrotask is the first safe opportunity to wake the host.
+    setTimeout(() => releaseCompactionFence(bridge, generation), 0);
+  });
+
+  pi.on("agent_settled", () => {
+    const bridge = bridgeFor(getManager());
+    if (!bridge) return;
+    if (bridge.compacting) releaseCompactionFence(bridge, bridge.compactionGeneration);
+    else flushWorkflowBridge(bridge);
+  });
+}
+
+function installWorkflowAbortFence(pi: ExtensionAPI, getManager: () => WorkflowManager): void {
+  // agent_end is the stock Pi lifecycle boundary that carries the final
+  // assistant stopReason. It is preferable to guessing from a rejected
+  // sendMessage promise, which can also represent a transient host race.
+  pi.on("agent_end", (event) => {
+    const bridge = bridgeFor(getManager());
+    if (!bridge) return;
+    const messages = Array.isArray(event.messages) ? event.messages : [];
+    const lastAssistant = [...messages].reverse().find((message: any) => message?.role === "assistant");
+    if (lastAssistant?.stopReason === "aborted") fenceWorkflowBridgeAfterAbort(bridge);
+  });
+
+  // A real user prompt is the explicit release point. Do not flush here: the
+  // host is still assembling that prompt, and sendMessage(triggerTurn) would
+  // otherwise create a second overlapping turn. The normal settled safe point
+  // flushes the durable/pending records after the user's turn.
+  pi.on("before_agent_start", (event) => {
+    const bridge = bridgeFor(getManager());
+    if (!bridge?.abortFence) return;
+    if (typeof event.prompt === "string" && event.prompt.trim().length > 0) bridge.abortFence = false;
+  });
 }
 
 function deliverWorkflowResult(manager: WorkflowManager, payload: WorkflowDeliveryPayload): void {
@@ -557,19 +831,33 @@ function bindDeliverBridge(manager: WorkflowManager, pi: ExtensionAPI): void {
       // The extension factory runs before bindCore. Do not call the old pi
       // during that window; session_start explicitly resumes this generation.
       suspended: true,
+      compacting: false,
+      compactionGeneration: 0,
       generation: 0,
       nextEventSeq: 0,
       pending: [],
       delivered: new Set<string>(),
       awaitingAck: new Map<string, WorkflowBridgeDelivery>(),
+      uncertainAck: new Map<string, WorkflowBridgeUncertainDelivery>(),
+      ackWatchdogs: new Map<string, WorkflowBridgeAckWatchdog>(),
       projectedForNextRequest: [],
       includedInProviderRequest: [],
+      retryingSendIds: new Set<string>(),
+      abortFence: false,
     } satisfies WorkflowBridge);
   // Backfill fields when handing off a manager created by an older extension
   // generation that predates batching support.
   bridge.awaitingAck ??= new Map<string, WorkflowBridgeDelivery>();
+  bridge.uncertainAck ??= new Map<string, WorkflowBridgeUncertainDelivery>();
+  bridge.ackWatchdogs ??= new Map<string, WorkflowBridgeAckWatchdog>();
   bridge.projectedForNextRequest ??= [];
   bridge.includedInProviderRequest ??= [];
+  bridge.retryingSendIds ??= new Set<string>();
+  bridge.abortFence ??= false;
+  bridge.retryingSendIds.clear();
+  requeueUnacknowledgedForNextGeneration(bridge);
+  bridge.compacting = false;
+  bridge.compactionGeneration = (bridge.compactionGeneration ?? 0) + 1;
   // Handoff from the short-lived batching implementation: cancel and discard
   // retained automatic reports so no stale timer can bypass the new default.
   const legacy = bridge as WorkflowBridge & {
@@ -602,6 +890,7 @@ function bindDeliverBridge(manager: WorkflowManager, pi: ExtensionAPI): void {
       details: {
         notificationKind: "workflow-message",
         runId: source?.runId,
+        alertKind: source?.alertKind,
         sequence: source?.sequence ?? sequence,
         deliveryId: source?.deliveryId,
       },
@@ -611,7 +900,7 @@ function bindDeliverBridge(manager: WorkflowManager, pi: ExtensionAPI): void {
   };
   // Automatic subagent finals are intentionally persistence/UI-only. A workflow
   // author who needs the parent to react before terminal completion uses the
-  // explicit deliver()/workflow_send_to_parent channel. This avoids assuming
+  // explicit deliver()/workflow_alert_parent channel. This avoids assuming
   // the last completed agent is a summary and prevents N automatic reports from
   // consuming N provider continuations. Keep the callback assigned (rather than
   // leaving an older generation's function installed) but make it side-effect free.
@@ -719,43 +1008,16 @@ function installWorkflowSummaryBridge(pi: ExtensionAPI): void {
 
 function providerWorkflowDeliveryText(customType: string, text: string): string {
   switch (customType) {
-    case "workflow-agent":
-      return (
-        "<task-notification>\n" +
-        "A background workflow subagent has just completed. Treat this notification as " +
-        "the cause of the current synthetic continuation. Respond to the NEW report below, " +
-        "not to the older user message. State what new information/action it adds; do not " +
-        "repeat an earlier acknowledgment or re-answer unrelated prior context. If several " +
-        "task notifications are present in this same batch, handle them together.\n" +
-        "</task-notification>\n\n" +
-        text
-      );
     case "workflow-result":
-      return (
-        "<workflow-result-notification>\n" +
-        "The background workflow has just finished. Treat this final result as the cause " +
-        "of the current synthetic continuation. Give one consolidated, action-oriented " +
-        "update based on the new result; do not repeat older acknowledgments or re-answer " +
-        "an unrelated previous user message.\n" +
-        "</workflow-result-notification>\n\n" +
-        text
-      );
+      return `[workflow result; newer user input has priority]\n${text}`;
     case "workflow-deliver":
-      return (
-        "<workflow-message-notification>\n" +
-        "A workflow explicitly sent this new message to the parent. Treat it as the cause " +
-        "of the current continuation and act on its latest content. Do not merely confirm " +
-        "receipt and do not repeat the previous answer.\n" +
-        "</workflow-message-notification>\n\n" +
-        text
-      );
+      return `[workflow message for its identified run; not user input]\n${text}`;
     default:
       return text;
   }
 }
 
 function workflowNotificationToolName(customType: string): string {
-  if (customType === "workflow-agent") return "workflow_task_notification";
   if (customType === "workflow-result") return "workflow_result_notification";
   return "workflow_message_notification";
 }
@@ -791,6 +1053,7 @@ function installWorkflowToolResultContextBridge(pi: ExtensionAPI, getManager: ()
           64,
         ) as WorkflowDeliveryDetails["notificationKind"],
         status: boundedDetail(sourceDetails.status, 32) as WorkflowDeliveryDetails["status"],
+        alertKind: boundedDetail(sourceDetails.alertKind, 32) as WorkflowDeliveryDetails["alertKind"],
         runId: boundedDetail(sourceDetails.runId, 256),
         agentId: boundedDetail(sourceDetails.agentId, 256),
         label: boundedDetail(sourceDetails.label, 512),
@@ -815,6 +1078,20 @@ function installWorkflowToolResultContextBridge(pi: ExtensionAPI, getManager: ()
       // from acknowledging a newer generation's resend.
       if (details.deliveryId && typeof details.deliveryGeneration === "number") {
         const bridge = bridgeFor(getManager());
+        const uncertain = bridge?.uncertainAck.get(details.deliveryId);
+        if (
+          bridge &&
+          !bridge.awaitingAck.has(details.deliveryId) &&
+          uncertain?.generation === details.deliveryGeneration &&
+          uncertain.delivery.details?.deliveryGeneration === details.deliveryGeneration
+        ) {
+          // The same persisted custom message has re-entered provider context.
+          // Resume acknowledgement tracking without calling sendMessage again;
+          // this avoids duplicate wake turns after a slow or failed request.
+          bridge.uncertainAck.delete(details.deliveryId);
+          bridge.awaitingAck.set(details.deliveryId, uncertain.delivery);
+          startWorkflowAckWatchdog(bridge, uncertain.delivery, details.deliveryGeneration);
+        }
         const awaiting = bridge?.awaitingAck.get(details.deliveryId);
         if (
           bridge &&
@@ -836,6 +1113,7 @@ function installWorkflowToolResultContextBridge(pi: ExtensionAPI, getManager: ()
           notificationKind: details.notificationKind ?? message.customType,
           customType: message.customType,
           status: details.status ?? null,
+          alertKind: details.alertKind ?? null,
           runId: details.runId ?? null,
           agentId: details.agentId ?? null,
           label: details.label ?? null,
@@ -889,6 +1167,7 @@ function installWorkflowToolResultContextBridge(pi: ExtensionAPI, getManager: ()
     const bridge = bridgeFor(getManager());
     if (!bridge || bridge.projectedForNextRequest.length === 0) return;
     const batch = bridge.projectedForNextRequest.splice(0, bridge.projectedForNextRequest.length);
+    let deferredRetry = false;
     // before_provider_request acknowledges inclusion only. Keep each stable ID
     // until after_provider_response so a failed/uncertain transport retries it.
     for (const item of batch) {
@@ -898,17 +1177,37 @@ function installWorkflowToolResultContextBridge(pi: ExtensionAPI, getManager: ()
       if (
         durable &&
         !persistDeliveryPhase(bridge.manager, awaiting.details?.runId, item.id, item.generation, "projected")
-      )
+      ) {
+        requeueWorkflowDeliveryAfterPersistenceFailure(bridge, item, "projected");
+        deferredRetry = true;
         continue;
-      bridge.includedInProviderRequest.push(item);
+      }
+      if (
+        !bridge.includedInProviderRequest.some(
+          (included) => included.id === item.id && included.generation === item.generation,
+        )
+      ) {
+        bridge.includedInProviderRequest.push(item);
+      }
       bridge.pending = bridge.pending.filter((delivery) => delivery.id !== item.id);
     }
-    flushWorkflowBridge(bridge);
+    if (!deferredRetry) flushWorkflowBridge(bridge);
   });
-  pi.on("after_provider_response", () => {
+  pi.on("after_provider_response", (event) => {
     const bridge = bridgeFor(getManager());
     if (!bridge || bridge.includedInProviderRequest.length === 0) return;
+    const successfulResponse = Number.isInteger(event.status) && event.status >= 200 && event.status < 300;
+    if (!successfulResponse) {
+      // Some providers report each HTTP retry attempt. Keep the original
+      // request association intact across 429/5xx responses: a later 2xx can
+      // acknowledge it, while agent_settled cannot create a duplicate wake.
+      // A final transport failure remains bounded by the acknowledgement
+      // watchdog and can be re-observed from the persisted custom message on a
+      // later real user turn without another sendMessage call.
+      return;
+    }
     const included = bridge.includedInProviderRequest.splice(0, bridge.includedInProviderRequest.length);
+    let deferredRetry = false;
     for (const item of included) {
       const awaiting = bridge.awaitingAck.get(item.id);
       if (awaiting?.details?.deliveryGeneration !== item.generation) continue;
@@ -916,12 +1215,16 @@ function installWorkflowToolResultContextBridge(pi: ExtensionAPI, getManager: ()
       if (
         durable &&
         !persistDeliveryPhase(bridge.manager, awaiting.details?.runId, item.id, item.generation, "acknowledged")
-      )
+      ) {
+        requeueWorkflowDeliveryAfterPersistenceFailure(bridge, item, "acknowledged");
+        deferredRetry = true;
         continue;
+      }
       bridge.awaitingAck.delete(item.id);
+      clearWorkflowAckWatchdog(bridge, item.id, item.generation);
       rememberDelivery(bridge, item.id);
     }
-    flushWorkflowBridge(bridge);
+    if (!deferredRetry) flushWorkflowBridge(bridge);
   });
 }
 
@@ -984,6 +1287,8 @@ export default function extension(pi: ExtensionAPI) {
   });
   suspendResultDelivery(manager);
   bindDeliverBridge(manager, pi);
+  installWorkflowCompactionFence(pi, getManager);
+  installWorkflowAbortFence(pi, getManager);
 
   const workflowTool = createWorkflowTool({
     getManager,
@@ -998,10 +1303,16 @@ export default function extension(pi: ExtensionAPI) {
     get storage() {
       return storage;
     },
+    // The public Pi surface starts fresh work only. Existing-run lifecycle and
+    // steering are explicit /workflows commands, so a new request cannot be
+    // silently attached to an old workflow by a model tool call.
+    allowResume: false,
+    // Keep policy knobs (limits/replay) in the library API, not in the
+    // provider-visible Pi schema. Existing-run lifecycle is explicit below.
+    exposeAdvancedParameters: false,
+    modelFacing: true,
   });
-  const workflowControlTool = createWorkflowControlTool({ getManager });
   pi.registerTool(workflowTool);
-  pi.registerTool(workflowControlTool);
   registerWorkflowMessageRenderers(pi);
   // Keep workflow history as custom entries for the UI, but expose it to the
   // provider as tool_result semantics through the context transform.
@@ -1010,66 +1321,6 @@ export default function extension(pi: ExtensionAPI) {
   // the normal context hook. Sanitize workflow custom messages in their mutable
   // preparation arrays so they cannot become ordinary role=user content.
   installWorkflowSummaryBridge(pi);
-
-  pi.registerTool(
-    defineTool({
-      name: "workflow_send",
-      label: "Workflow Send",
-      description:
-        "Send relevant follow-up context, a correction, or a changed fact to a running workflow. With agentId, deliver immediately to that live subagent; otherwise queue it for the workflow's next subagent call.",
-      promptSnippet: "Send relevant follow-up context to a running workflow or live subagent.",
-      promptGuidelines: [
-        "Use for information that helps the workflow complete its existing assignment, such as a correction, changed repository fact, answer to a blocker, or conflict warning.",
-        "Messages are peer-session context, not user approval or permission. Do not use them to relay a denied action or replace the workflow's assignment.",
-        "Use agentId for a live targeted message. Without agentId, the message is queued for the running workflow's next subagent call.",
-      ],
-      parameters: Type.Object({
-        message: Type.String({
-          minLength: 1,
-          description: "Relevant follow-up context, correction, changed fact, blocker answer, or conflict warning.",
-        }),
-        runId: Type.Optional(
-          Type.String({
-            minLength: 1,
-            description: "Specific workflow run ID; omit when agentId identifies the target.",
-          }),
-        ),
-        agentId: Type.Optional(
-          Type.String({
-            minLength: 1,
-            description:
-              "Exact live subagent ID for an immediate in-scope correction; omit to queue for the next subagent call.",
-          }),
-        ),
-      }),
-      async execute(_toolCallId, params) {
-        if (params.agentId) {
-          const targetRunId = await manager.sendToAgent(params.message, params.agentId, params.runId);
-          if (!targetRunId) {
-            throw new Error(`Subagent ${params.agentId} is not currently running`);
-          }
-          return {
-            content: [{ type: "text", text: `Delivered message immediately to subagent ${params.agentId}.` }],
-            details: { runId: targetRunId, agentId: params.agentId, message: params.message, mode: "immediate" },
-          };
-        }
-
-        const queuedRunId = manager.enqueueUserMessage(params.message, params.runId);
-        if (!queuedRunId) {
-          throw new Error(params.runId ? `Workflow ${params.runId} is not running` : "No running workflow");
-        }
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Queued message for workflow ${queuedRunId}; it will be injected into the next subagent call.`,
-            },
-          ],
-          details: { runId: queuedRunId, agentId: "", message: params.message, mode: "next-agent" },
-        };
-      },
-    }),
-  );
 
   let usageLimitScheduler = new UsageLimitScheduler(manager);
 
@@ -1199,11 +1450,6 @@ export default function extension(pi: ExtensionAPI) {
     manager.setMainModel(ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined);
     manager.setModelRegistry(ctx.modelRegistry);
 
-    const active = pi.getActiveTools();
-    const workflowTools = [workflowTool.name, workflowControlTool.name];
-    const missing = workflowTools.filter((name) => !active.includes(name));
-    if (missing.length) pi.setActiveTools([...active, ...missing]);
-
     // Bind + adopt before resuming delivery so a flushed completion is tagged
     // with this session and visible in its panel.
     let sessionId: string | undefined;
@@ -1214,6 +1460,7 @@ export default function extension(pi: ExtensionAPI) {
     }
     manager.setSessionId(sessionId);
     manager.adoptLiveRunsToSession(sessionId);
+    usageLimitScheduler.bindSession(sessionId);
 
     // Runtime is bound now (session_start fires after bindCore). Unsuspend and
     // flush anything queued while the previous ctx was dying or this factory

@@ -325,6 +325,37 @@ test(
 );
 
 test(
+  "createRunPersistence rejects a journal entry without its own defined result",
+  withTempCwd(async (cwd) => {
+    const runsDir = workflowProjectPaths(cwd).runsDir;
+    mkdirSync(runsDir, { recursive: true });
+    writeFileSync(
+      join(runsDir, "journal-missing-result.json"),
+      JSON.stringify({
+        runId: "journal-missing-result",
+        workflowName: "wf",
+        script: "export const meta = { name: 'w', description: 'w' }",
+        status: "paused",
+        phases: [],
+        agents: [],
+        logs: [],
+        journal: [{ index: 0, hash: "abc123" }],
+        startedAt: "2024-01-01T00:00:00.000Z",
+        updatedAt: "2024-01-01T00:00:00.000Z",
+      }),
+      "utf8",
+    );
+
+    const rp = createRunPersistence(cwd);
+    assert.equal(rp.load("journal-missing-result"), null);
+    assert.deepEqual(rp.list(), [], "invalid journal data must not enter the replayable listing");
+
+    const manager = new WorkflowManager({ cwd });
+    assert.equal(await manager.resume("journal-missing-result"), false, "invalid journal data must not resume");
+  }),
+);
+
+test(
   "createRunPersistence save and load preserves token usage",
   withTempCwd(async (cwd) => {
     const rp = createRunPersistence(cwd);
@@ -533,6 +564,64 @@ test(
 );
 
 test(
+  "createRunPersistence list() never exposes mutable objects retained by its caches",
+  withTempCwd(async (cwd) => {
+    const rp = createRunPersistence(cwd);
+    const state = baseRunState("cache-owned-state", undefined, "running");
+    state.logs = ["durable"];
+    state.agents = [{ id: 1, label: "worker", prompt: "work", status: "queued" }];
+    rp.save(state);
+
+    const first = rp.list();
+    first[0].status = "failed";
+    first[0].logs.push("poisoned");
+    first[0].agents[0].status = "error";
+
+    const second = rp.list();
+    assert.equal(second[0].status, "running");
+    assert.deepEqual(second[0].logs, ["durable"]);
+    assert.equal(second[0].agents[0].status, "queued");
+    assert.notEqual(second[0], first[0]);
+    assert.notEqual(second[0].agents, first[0].agents);
+  }),
+);
+
+test(
+  "createRunPersistence list() does not cache when the parsed byte budget is exceeded",
+  withTempCwd(async (cwd) => {
+    let readdirCalls = 0;
+    let readFileCalls = 0;
+    const rp = createRunPersistence(
+      cwd,
+      {
+        readdirSync: ((...args: Parameters<typeof readdirSync>) => {
+          readdirCalls++;
+          return readdirSync(...args);
+        }) as typeof readdirSync,
+        readFileSync: ((...args: Parameters<typeof readFileSync>) => {
+          readFileCalls++;
+          return readFileSync(...args);
+        }) as typeof readFileSync,
+      },
+      { maxParsedCacheBytes: 1 },
+    );
+
+    rp.save(baseRunState("cache-byte-budget", undefined, "running"));
+    readdirCalls = 0;
+    readFileCalls = 0;
+
+    rp.list();
+    rp.list();
+    assert.equal(
+      readdirCalls,
+      2,
+      "a listing over maxParsedCacheBytes must remain correct but must not be retained by listCache",
+    );
+    assert.equal(readFileCalls, 2, "a per-file parsed state over maxParsedCacheBytes must also be evicted");
+  }),
+);
+
+test(
   "createRunPersistence list() cache is invalidated by save(): a new run appears on the very next call",
   withTempCwd(async (cwd) => {
     const rp = createRunPersistence(cwd);
@@ -599,6 +688,38 @@ test(
     await new Promise((r) => setTimeout(r, 400));
     rp.list();
     assert.ok(readdirCalls >= 2, "list() should read disk again once the TTL has elapsed");
+  }),
+);
+
+test(
+  "createRunPersistence list() does not cache a recovered backup under the corrupt primary signature",
+  withTempCwd(async (cwd) => {
+    const rp = createRunPersistence(cwd);
+    rp.save(baseRunState("backup-cache", "2024-01-01T00:00:00.000Z", "running"));
+    const runsDir = workflowProjectPaths(cwd).runsDir;
+    const primary = join(runsDir, "backup-cache.json");
+    const backup = `${primary}.bak`;
+    writeFileSync(primary, "{ corrupt primary", "utf8");
+
+    const first = rp.list();
+    assert.equal(first[0].workflowName, "wf", "the valid backup should recover the corrupt primary");
+
+    writeFileSync(
+      backup,
+      JSON.stringify({
+        ...baseRunState("backup-cache", "2024-01-02T00:00:00.000Z", "running"),
+        workflowName: "repaired",
+      }),
+      "utf8",
+    );
+    await new Promise((resolve) => setTimeout(resolve, 400));
+
+    const second = rp.list();
+    assert.equal(
+      second[0].workflowName,
+      "repaired",
+      "a changed recovery backup must not be hidden by primary stat reuse",
+    );
   }),
 );
 
@@ -738,6 +859,27 @@ test(
       "a paused run survives even though it has the OLDEST updatedAt of everything saved here",
     );
     assert.equal(rp.load("terminal-0"), null, "an evicted run's file is actually gone from disk");
+  }),
+);
+
+test(
+  "createRunPersistence retention also bounds aggregate terminal JSON and backup bytes",
+  withTempCwd(async (cwd) => {
+    const rp = createRunPersistence(cwd, undefined, {
+      maxTerminalRunsOnDisk: 100,
+      maxTerminalRunBytesOnDisk: 2_500,
+    });
+
+    for (let i = 0; i < 5; i++) {
+      const state = baseRunState(`byte-terminal-${i}`, undefined, "completed");
+      state.result = { payload: `${i}:${"x".repeat(700)}` };
+      rp.save(state);
+    }
+
+    const terminal = rp.list().filter((run) => run.runId.startsWith("byte-terminal-"));
+    assert.ok(terminal.length < 5, "byte retention evicts old terminal runs before the count cap is reached");
+    assert.ok(terminal.length > 0, "the newest bounded terminal history remains available");
+    assert.equal(terminal[0].runId, "byte-terminal-4", "retention keeps the newest terminal record");
   }),
 );
 

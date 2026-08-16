@@ -779,16 +779,17 @@ describe("backgroundStartedText", () => {
     assert.ok(text.includes("background"), "should say background");
   });
 
-  it("tells user they can wait or do other things", async () => {
+  it("mentions automatic result delivery", async () => {
     const { backgroundStartedText } = await loadTool();
     const text = backgroundStartedText("audit", "r-1");
-    assert.ok(text.includes("wait here") || text.includes("other things"), "should mention options");
+    assert.ok(text.includes("Result returns automatically"), "should mention automatic delivery");
+    assert.ok(!text.includes("do not poll"), "polling guidance is runtime-owned");
   });
 
-  it("mentions /workflows status command for tracking", async () => {
+  it("keeps the acknowledgement compact", async () => {
     const { backgroundStartedText } = await loadTool();
     const text = backgroundStartedText("audit", "r-1");
-    assert.ok(text.includes("/workflows"), "should mention /workflows");
+    assert.ok(text.length < 160, "background acknowledgement should stay compact");
   });
 });
 

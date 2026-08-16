@@ -48,6 +48,63 @@ return await checkpoint('Proceed?', { kind: 'confirm' })`;
   assert.equal(asked, "Proceed?");
 });
 
+test("checkpoint(): rejects an undefined confirm reply before journaling", async () => {
+  const journal: JournalEntry[] = [];
+  const script = `export const meta = { name: 'c', description: 'checkpoint' }
+return await checkpoint('Proceed?', { kind: 'confirm' })`;
+  await assert.rejects(
+    () =>
+      runWorkflow(script, {
+        agent: noopAgent,
+        persistLogs: false,
+        confirm: async () => undefined,
+        onAgentJournal: (entry) => journal.push(entry),
+      }),
+    /defined value|undefined.*journaled/i,
+  );
+  assert.equal(journal.length, 0, "an undefined reply must never enter the journal");
+});
+
+test("checkpoint(): rejects an undefined replay result instead of returning it", async () => {
+  const script = `export const meta = { name: 'c', description: 'checkpoint' }
+return await checkpoint('Proceed?', {})`;
+  const journal = new Map<string, JournalEntry>();
+  await runWorkflow(script, {
+    agent: noopAgent,
+    persistLogs: false,
+    runId: "checkpoint-undefined-replay-run",
+    onAgentJournal: (entry) => journal.set(`${entry.runId}:${entry.index}`, entry),
+  });
+  const entry = journal.get("checkpoint-undefined-replay-run:0");
+  assert.ok(entry);
+  entry.result = undefined;
+
+  await assert.rejects(
+    () =>
+      runWorkflow(script, {
+        agent: noopAgent,
+        persistLogs: false,
+        runId: "checkpoint-undefined-replay-run",
+        resumeJournal: journal,
+        confirm: async () => "unexpected-live",
+      }),
+    /defined value|undefined.*replayed/i,
+  );
+});
+
+test("checkpoint(): an explicitly undefined headless default uses the documented true fallback", async () => {
+  const journal: JournalEntry[] = [];
+  const script = `export const meta = { name: 'c', description: 'checkpoint' }
+return await checkpoint('Proceed?', { default: undefined })`;
+  const res = await runWorkflow<boolean>(script, {
+    agent: noopAgent,
+    persistLogs: false,
+    onAgentJournal: (entry) => journal.push(entry),
+  });
+  assert.equal(res.result, true);
+  assert.equal(journal[0]?.result, true);
+});
+
 test("checkpoint(): replays the journaled reply on resume (no re-prompt)", async () => {
   const script = `export const meta = { name: 'c', description: 'checkpoint' }
 const r = await checkpoint('Approve?', {})
@@ -171,4 +228,60 @@ return { r }`;
   });
   assert.equal(confirmCalledOnResume, false, "identical options must still cache-hit — no re-prompt");
   assert.equal(second.result.r, "human-said-yes", "the journaled reply replays unchanged");
+});
+
+test("checkpoint(): nested frame identity invalidates an old reply while preserving identical replay", async () => {
+  const parent = `export const meta = { name: 'nested-checkpoint-parent', description: 'nested checkpoint' }
+return await workflow('child', { key: 'stable' })`;
+  const child = (
+    marker: string,
+  ) => `export const meta = { name: 'nested-checkpoint-child', description: 'nested checkpoint child' }
+const marker = ${JSON.stringify(marker)}
+const answer = await checkpoint('Approve nested change?', { kind: 'input' })
+await agent('nested-checkpoint-agent')
+return { answer, marker }`;
+
+  let activeChild = child("v1");
+  const journal = new Map<string, JournalEntry>();
+  const first = await runWorkflow<{ answer: string; marker: string }>(parent, {
+    agent: noopAgent,
+    confirm: async () => "old-answer",
+    loadSavedWorkflow: () => activeChild,
+    persistLogs: false,
+    runId: "nested-checkpoint-context-run",
+    onAgentJournal: (entry) => journal.set(`${entry.runId}:${entry.index}`, entry),
+  });
+  assert.equal(first.result.answer, "old-answer");
+
+  let sameIdentityConfirmCalls = 0;
+  const sameIdentity = await runWorkflow<{ answer: string; marker: string }>(parent, {
+    agent: noopAgent,
+    confirm: async () => {
+      sameIdentityConfirmCalls++;
+      return "unexpected-live";
+    },
+    loadSavedWorkflow: () => activeChild,
+    persistLogs: false,
+    runId: "nested-checkpoint-context-run",
+    resumeJournal: journal,
+  });
+  assert.equal(sameIdentityConfirmCalls, 0, "an unchanged nested frame still replays its checkpoint");
+  assert.equal(sameIdentity.result.answer, "old-answer");
+
+  activeChild = child("v2");
+  let changedIdentityConfirmCalls = 0;
+  const changed = await runWorkflow<{ answer: string; marker: string }>(parent, {
+    agent: noopAgent,
+    confirm: async () => {
+      changedIdentityConfirmCalls++;
+      return "new-answer";
+    },
+    loadSavedWorkflow: () => activeChild,
+    persistLogs: false,
+    runId: "nested-checkpoint-context-run",
+    resumeJournal: journal,
+  });
+  assert.equal(changedIdentityConfirmCalls, 1, "an edited nested script must not replay its old checkpoint reply");
+  assert.equal(changed.result.answer, "new-answer");
+  assert.equal(changed.result.marker, "v2");
 });

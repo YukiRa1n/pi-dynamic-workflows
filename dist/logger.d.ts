@@ -17,5 +17,9 @@ export interface WorkflowLoggerOptions {
     persist?: boolean;
     /** Callback for each log entry. */
     onLog?: (message: string) => void;
+    /** Optional stricter in-memory entry bound for tests/embedded consumers. */
+    maxEntries?: number;
+    /** Optional stricter in-memory UTF-8 byte bound for tests/embedded consumers. */
+    maxBytes?: number;
 }
 export declare function createWorkflowLogger(options?: WorkflowLoggerOptions): WorkflowLogger;

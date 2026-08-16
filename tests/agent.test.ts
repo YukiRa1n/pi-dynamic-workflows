@@ -1,14 +1,16 @@
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 import { createFauxCore, fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
-import { ModelRegistry, ModelRuntime } from "@earendil-works/pi-coding-agent";
+import { ModelRegistry, ModelRuntime, type ResourceDiagnostic, type Skill } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import type { AgentRunOptions, AgentUsage } from "../src/agent.js";
 import {
   DEFAULT_EXCLUDED_SUBAGENT_TOOLS,
+  filterBundledWorkflowSkills,
   listAvailableModelSpecs,
   resolveAgentModelSpec,
   subagentExcludedTools,
@@ -18,6 +20,7 @@ import {
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
 import { resolveModelSpecWithThinking } from "../src/model-spec.js";
 import type { ModelTierConfig } from "../src/model-tier-config.js";
+import { createWebTools } from "../src/web-tools.js";
 import { runWorkflow } from "../src/workflow.js";
 import { withFakeHome, withFakeHomeAsync } from "./helpers/fake-home.js";
 
@@ -545,6 +548,149 @@ test("WorkflowAgent.run() still completes with a normal object schema (no regres
   }
 });
 
+test("WorkflowAgent.run() releases same-prefix followers when the first assistant response starts", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-dw-cache-start-home-"));
+  const cwd = mkdtempSync(join(tmpdir(), "pi-dw-cache-start-cwd-"));
+  const core = createFauxCore({
+    provider: "fauxtest-cache-start",
+    models: [{ id: "faux-model", name: "Faux Model", contextWindow: 128000, maxTokens: 4096 }],
+    tokensPerSecond: 100,
+    tokenSize: { min: 1, max: 1 },
+  });
+  try {
+    await withFakeHomeAsync(home, async () => {
+      const runtime = await ModelRuntime.create({ authPath: join(home, "auth.json"), modelsPath: null });
+      runtime.registerProvider("fauxtest-cache-start", {
+        name: "Faux Cache Start",
+        baseUrl: "http://127.0.0.1:9/faux",
+        apiKey: "faux-dummy-key-not-used",
+        api: core.api,
+        streamSimple: core.streamSimple as never,
+        models: core.models.map((model) => ({
+          id: model.id,
+          name: model.name ?? model.id,
+          reasoning: false,
+          input: ["text"] as ("text" | "image")[],
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+          contextWindow: model.contextWindow,
+          maxTokens: model.maxTokens,
+        })),
+      });
+      const registry = new ModelRegistry(runtime);
+      core.setResponses([
+        fauxAssistantMessage("x".repeat(160), { stopReason: "stop" }),
+        fauxAssistantMessage("follower", { stopReason: "stop" }),
+      ]);
+
+      let ownerClaimed = false;
+      let warmed = false;
+      const waiting: Array<(owner: boolean) => void> = [];
+      let resolveOwner!: () => void;
+      const ownerReady = new Promise<void>((resolve) => {
+        resolveOwner = resolve;
+      });
+      const gate = {
+        wait: async () => {
+          if (warmed) return false;
+          if (!ownerClaimed) {
+            ownerClaimed = true;
+            resolveOwner();
+            return true;
+          }
+          return new Promise<boolean>((resolve) => waiting.push(resolve));
+        },
+        warm: () => {
+          warmed = true;
+          while (waiting.length) waiting.shift()?.(false);
+        },
+        release: () => {
+          ownerClaimed = false;
+          waiting.shift()?.(true);
+        },
+      };
+
+      const agent = new WorkflowAgent({ cwd, modelRegistry: registry });
+      let ownerSettled = false;
+      const owner = agent
+        .run("owner", { model: "fauxtest-cache-start/faux-model", cacheWarmGate: gate })
+        .finally(() => {
+          ownerSettled = true;
+        });
+      await ownerReady;
+
+      let resolveFollowerStarted!: () => void;
+      const followerStarted = new Promise<void>((resolve) => {
+        resolveFollowerStarted = resolve;
+      });
+      const follower = agent.run("follower", {
+        model: "fauxtest-cache-start/faux-model",
+        cacheWarmGate: gate,
+        onFirstAssistantMessage: resolveFollowerStarted,
+      });
+
+      await Promise.race([
+        followerStarted,
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error("follower stayed blocked until owner completion")), 1_000),
+        ),
+      ]);
+      assert.equal(ownerSettled, false, "the owner is still streaming when the follower starts");
+      assert.equal(core.state.callCount, 2);
+      await Promise.all([owner, follower]);
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("WorkflowAgent.run() exposes only the effective replacement toolset to the provider", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-dw-tool-policy-home-"));
+  const cwd = mkdtempSync(join(tmpdir(), "pi-dw-tool-policy-cwd-"));
+  const core = createFauxCore({
+    provider: "fauxtest-tool-policy",
+    models: [{ id: "faux-model", name: "Faux Model", contextWindow: 128000, maxTokens: 4096 }],
+  });
+  try {
+    await withFakeHomeAsync(home, async () => {
+      const runtime = await ModelRuntime.create({ authPath: join(home, "auth.json"), modelsPath: null });
+      runtime.registerProvider("fauxtest-tool-policy", {
+        name: "Faux Tool Policy",
+        baseUrl: "http://127.0.0.1:9/faux",
+        apiKey: "faux-dummy-key-not-used",
+        api: core.api,
+        streamSimple: core.streamSimple as never,
+        models: core.models.map((model) => ({
+          id: model.id,
+          name: model.name ?? model.id,
+          reasoning: false,
+          input: ["text"] as ("text" | "image")[],
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+          contextWindow: model.contextWindow,
+          maxTokens: model.maxTokens,
+        })),
+      });
+      const registry = new ModelRegistry(runtime);
+      let providerTools: string[] = [];
+      core.setResponses([
+        (context) => {
+          providerTools = (context.tools ?? []).map((tool) => tool.name);
+          return fauxAssistantMessage("ok", { stopReason: "stop" });
+        },
+      ]);
+
+      const agent = new WorkflowAgent({ cwd, modelRegistry: registry, tools: createWebTools() });
+      await agent.run("research", { model: "fauxtest-tool-policy/faux-model" });
+
+      assert.deepEqual(providerTools, ["web_search", "web_fetch"]);
+      assert.ok(!providerTools.some((name) => ["read", "bash", "edit", "write"].includes(name)));
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 test("WorkflowAgent constructor accepts all option shapes without throwing", () => {
   const optionSets = [
     undefined,
@@ -574,18 +720,63 @@ test("DEFAULT_EXCLUDED_SUBAGENT_TOOLS denies the recursive orchestration tools (
   // could start independent nested workflows that bypass the parent run's caps.
   // This is the always-on denylist folded into every subagent session; the guard
   // is a regression fence so it can't be silently narrowed.
-  assert.deepEqual(DEFAULT_EXCLUDED_SUBAGENT_TOOLS, ["workflow", "workflow_control"]);
+  assert.deepEqual(DEFAULT_EXCLUDED_SUBAGENT_TOOLS, [
+    "start_workflow",
+    "workflow",
+    "workflow_control",
+    "workflow_steer",
+  ]);
 });
 
 test("subagentExcludedTools always includes the defaults, plus caller/session names (#107)", () => {
   // This is what run() passes to createAgentSession as excludeTools. Fencing the
   // merge here catches a spread-order regression that drops the defaults — which
   // a deepEqual on the constant alone would miss.
-  assert.deepEqual(subagentExcludedTools(), ["workflow", "workflow_control"]);
-  assert.deepEqual(subagentExcludedTools(["pi-subagents"]), ["workflow", "workflow_control", "pi-subagents"]);
+  assert.deepEqual(subagentExcludedTools(), ["start_workflow", "workflow", "workflow_control", "workflow_steer"]);
+  assert.deepEqual(subagentExcludedTools(["pi-subagents"]), [
+    "start_workflow",
+    "workflow",
+    "workflow_control",
+    "workflow_steer",
+    "pi-subagents",
+  ]);
   const merged = subagentExcludedTools(["extra"], ["session-denied"]);
-  assert.ok(merged.includes("workflow") && merged.includes("workflow_control"), "defaults are never dropped");
+  assert.ok(
+    merged.includes("start_workflow") && merged.includes("workflow") && merged.includes("workflow_control"),
+    "defaults are never dropped",
+  );
+  assert.ok(merged.includes("workflow_steer"), "main-session steering is never exposed to subagents");
   assert.ok(merged.includes("session-denied") && merged.includes("extra"), "both caller lists are folded in");
+});
+
+test("subagent skill filtering removes only this package's workflow skills", () => {
+  const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+  const tempRoot = mkdtempSync(join(tmpdir(), "pi-dynamic-workflows-skill-filter-"));
+  const makeSkill = (baseDir: string, name: string): Skill => ({
+    name,
+    description: "test skill",
+    filePath: join(baseDir, "SKILL.md"),
+    baseDir,
+    sourceInfo: {} as Skill["sourceInfo"],
+    disableModelInvocation: false,
+  });
+  try {
+    const bundledAuthoring = makeSkill(join(packageRoot, "skills", "workflow-authoring"), "workflow-authoring");
+    const bundledPatterns = makeSkill(join(packageRoot, "skills", "workflow-patterns"), "workflow-patterns");
+    const projectSameName = makeSkill(join(tempRoot, "project", "skills", "workflow-authoring"), "workflow-authoring");
+    const userOtherSkill = makeSkill(join(tempRoot, "user", "skills", "unrelated"), "unrelated");
+
+    const diagnostics = [] as ResourceDiagnostic[];
+    const filtered = filterBundledWorkflowSkills({
+      skills: [bundledAuthoring, projectSameName, bundledPatterns, userOtherSkill],
+      diagnostics,
+    });
+
+    assert.deepEqual(filtered.skills, [projectSameName, userOtherSkill]);
+    assert.strictEqual(filtered.diagnostics, diagnostics, "skill filtering must not discard loader diagnostics");
+  } finally {
+    rmSync(tempRoot, { recursive: true, force: true });
+  }
 });
 
 test("the subagent resource loader is built once per run and shared across subagents (#109)", () => {
@@ -757,9 +948,8 @@ test("buildPrompt injects structured output contract when schema is used", () =>
   const agent = new WorkflowAgent({ cwd: "/tmp" });
   const built: string = (agent as unknown as WorkflowAgentPrivates).buildPrompt("return result", { label: "t" }, true);
   assert.ok(built.includes("structured_output"), "should mention structured_output");
-  assert.ok(built.includes("Final output contract:"), "should include contract header");
-  assert.ok(built.includes("Do not emit a prose final answer"), "should discourage prose");
-  assert.ok(built.includes("call structured_output exactly once"), "should enforce single call");
+  assert.match(built, /Return the final result by calling structured_output/);
+  assert.ok(Buffer.byteLength(built, "utf8") < 100, "structured contract stays compact");
 });
 
 test("buildPrompt works without base instructions", () => {
@@ -789,7 +979,7 @@ test("buildPrompt includes both instructions when both base and per-call are set
   assert.ok(built.indexOf("Focus on security.") < built.indexOf("Task label: reviewer"), "per-call before label");
   assert.ok(built.indexOf("Task label: reviewer") < built.indexOf("check this file"), "label before prompt");
   assert.ok(
-    built.indexOf("check this file") < built.indexOf("Final output contract:"),
+    built.indexOf("check this file") < built.indexOf("Return the final result by calling structured_output."),
     "prompt before structured contract",
   );
 });

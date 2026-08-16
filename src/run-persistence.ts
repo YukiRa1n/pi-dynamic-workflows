@@ -32,6 +32,8 @@ export interface PersistedDeliveryRecord {
   kind: DeliveryOutboxKind;
   status: DeliveryOutboxStatus;
   content?: string;
+  /** Classified reason an explicit delivery is allowed to wake the parent. */
+  alertKind?: "blocker" | "critical_finding" | "decision";
   terminal?: boolean;
   generation?: number;
   createdAt: string;
@@ -183,6 +185,42 @@ export interface PersistedRunState {
   deliveryBudget?: DeliveryBudgetState;
 }
 
+export interface DurableResourceDiagnostics {
+  persistedRunCount: number;
+  persistedRunBytes: number;
+  pausedRunCount: number;
+  pausedRunBytes: number;
+  terminalRunCount: number;
+  terminalRunBytes: number;
+  /** Monotonic durable high-water observations; scans are cached by list TTL. */
+  durableHighWaterBytes?: number;
+  durableHighWaterCount?: number;
+}
+
+export interface PausedPruneOptions {
+  /** Explicit age fence; no records are eligible when omitted. */
+  before?: Date | string | number;
+  maxRuns?: number;
+  maxBytes?: number;
+  dryRun?: boolean;
+  /** Manager-side ownership and live-generation fences. */
+  sessionId?: string;
+  protectedRunIds?: ReadonlySet<string>;
+  skipDeliveryOutbox?: boolean;
+}
+
+export interface PausedPruneResult {
+  dryRun: boolean;
+  candidates: string[];
+  deleted: string[];
+  skipped: Array<{ runId: string; reason: string; bytes?: number }>;
+  candidateCount: number;
+  candidateBytes: number;
+  deletedBytes: number;
+  skippedCount: number;
+  skippedBytes: number;
+}
+
 export interface RunPersistence {
   /**
    * Save current run state. If expectedRevision is supplied, the write is a
@@ -208,6 +246,10 @@ export interface RunPersistence {
   releaseRunLease(lease: RunLease): void;
   /** Get runs directory path. */
   getRunsDir(): string;
+  /** Bounded diagnostic scan; never mutates records. */
+  getResourceDiagnostics(): DurableResourceDiagnostics;
+  /** Explicit, lease/CAS-fenced paused cleanup. Dry-run is the default. */
+  prunePausedRuns(options?: PausedPruneOptions): PausedPruneResult;
 }
 
 export interface RunLease {
@@ -251,11 +293,20 @@ export type FsLayer = PersistenceFsLayer;
  * per-call directory scan bounded.
  */
 export const DEFAULT_MAX_TERMINAL_RUNS_ON_DISK = 300;
+/** Aggregate primary+backup byte budget for terminal run JSON. Count retention
+ * still applies; the lower of the two limits wins. */
+export const DEFAULT_MAX_TERMINAL_RUN_BYTES_ON_DISK = 512 * 1024 * 1024;
 /** Maximum complete UTF-8 JSON size for one persisted run record. */
 export { MAX_DURABLE_RUN_BYTES };
 
 function boundedPositive(value: number | undefined, fallback: number): number {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : fallback;
+}
+
+function boundedPruneLimit(value: number | undefined, label: string): number {
+  if (value === undefined) return Number.MAX_SAFE_INTEGER;
+  if (!Number.isSafeInteger(value) || value < 0) throw new RangeError(`${label} must be a finite non-negative integer`);
+  return value;
 }
 
 const TERMINAL_RUN_STATUSES: ReadonlySet<RunStatus> = new Set(["completed", "failed", "aborted"]);
@@ -282,8 +333,13 @@ export function assertSafeRunId(runId: string): void {
 export interface RunPersistenceOptions {
   /** Override DEFAULT_MAX_TERMINAL_RUNS_ON_DISK (tests; advanced tuning). */
   maxTerminalRunsOnDisk?: number;
+  /** Override aggregate terminal JSON+.bak bytes retained on disk. */
+  maxTerminalRunBytesOnDisk?: number;
   /** Override MAX_DURABLE_RUN_BYTES (tests; advanced tuning). */
   maxDurableRunBytes?: number;
+  /** Parsed-state cache high-water bounds. */
+  maxParsedCacheEntries?: number;
+  maxParsedCacheBytes?: number;
 }
 
 /**
@@ -314,7 +370,13 @@ export function createRunPersistence(
   const _unlinkSync = fs.unlinkSync;
   const _writeFileSync = fs.writeFileSync;
   const maxTerminalRunsOnDisk = boundedPositive(options?.maxTerminalRunsOnDisk, DEFAULT_MAX_TERMINAL_RUNS_ON_DISK);
+  const maxTerminalRunBytesOnDisk = boundedPositive(
+    options?.maxTerminalRunBytesOnDisk,
+    DEFAULT_MAX_TERMINAL_RUN_BYTES_ON_DISK,
+  );
   const maxDurableRunBytes = boundedPositive(options?.maxDurableRunBytes, MAX_DURABLE_RUN_BYTES);
+  const maxParsedCacheEntries = boundedPositive(options?.maxParsedCacheEntries, 256);
+  const maxParsedCacheBytes = boundedPositive(options?.maxParsedCacheBytes, 64 * 1024 * 1024);
 
   const paths = workflowProjectPaths(cwd);
   const runsDir = paths.runsDir;
@@ -395,6 +457,7 @@ export function createRunPersistence(
       for (const entry of state.journal) {
         if (!isRecord(entry) || !Number.isSafeInteger(entry.index) || entry.index < 0 || !isText(entry.hash, 1_000))
           return null;
+        if (!Object.hasOwn(entry, "result") || entry.result === undefined) return null;
         if (entry.runId !== undefined && !isText(entry.runId, 300)) return null;
         if (entry.model !== undefined && !isText(entry.model, 1_000)) return null;
         if (entry.storeDelta !== undefined && !isRecord(entry.storeDelta)) return null;
@@ -446,6 +509,11 @@ export function createRunPersistence(
           return null;
         if (delivery.content !== undefined && !isText(delivery.content, 1_000_000)) return null;
         if (
+          delivery.alertKind !== undefined &&
+          !new Set(["blocker", "critical_finding", "decision"]).has(delivery.alertKind as string)
+        )
+          return null;
+        if (
           delivery.generation !== undefined &&
           (!Number.isSafeInteger(delivery.generation) || delivery.generation < 0)
         )
@@ -457,20 +525,25 @@ export function createRunPersistence(
 
   // Try semantic validation on both primary and backup. A parseable but
   // structurally invalid primary must not mask a valid backup record.
-  const readStateAt = (path: string, expectedRunId?: string): PersistedRunState | null => {
+  const readStateWithSourceAt = (
+    path: string,
+    expectedRunId?: string,
+  ): { state: PersistedRunState; sourcePath: string } | null => {
     for (const candidate of [path, `${path}.bak`]) {
       try {
         const stat = _statSync(candidate);
         if (Number.isFinite(stat.size) && stat.size > maxDurableRunBytes) continue;
         const parsed = JSON.parse(_readFileSync(candidate, "utf-8")) as unknown;
         const valid = validateState(parsed, expectedRunId);
-        if (valid) return valid;
+        if (valid) return { state: valid, sourcePath: candidate };
       } catch {
         // Continue to the backup candidate.
       }
     }
     return null;
   };
+  const readStateAt = (path: string, expectedRunId?: string): PersistedRunState | null =>
+    readStateWithSourceAt(path, expectedRunId)?.state ?? null;
 
   const pidIsAlive = (pid: number): boolean => {
     if (!Number.isInteger(pid) || pid <= 0) return false;
@@ -525,9 +598,12 @@ export function createRunPersistence(
   // elapses, same as before this cache existed on the next un-cached call.
   let listCache: PersistedRunState[] | undefined;
   let listCacheAt = 0;
+  let durableHighWaterBytes = 0;
+  let durableHighWaterCount = 0;
   const invalidateListCache = () => {
     listCache = undefined;
   };
+  const cloneRunStates = (states: PersistedRunState[]): PersistedRunState[] => structuredClone(states);
 
   // Per-file mtime+size+ino cache, keyed by absolute path: even once the
   // TTL-level listCache above expires (the active panel polls roughly every
@@ -550,7 +626,26 @@ export function createRunPersistence(
   // (mtimeMs, size) alone — serving stale, previously-cached content
   // forever until something ELSE about the file changes. The inode always
   // changes on such a rename, so adding it closes that hole for free.
-  const fileStateCache = new Map<string, { mtimeMs: number; size: number; ino: number; state: PersistedRunState }>();
+  const fileStateCache = new Map<
+    string,
+    { mtimeMs: number; size: number; ino: number; state: PersistedRunState; weight: number }
+  >();
+  let fileStateCacheBytes = 0;
+  const removeFileStateCache = (path: string): void => {
+    const entry = fileStateCache.get(path);
+    if (!entry) return;
+    fileStateCache.delete(path);
+    fileStateCacheBytes = Math.max(0, fileStateCacheBytes - entry.weight);
+  };
+  const trimFileStateCache = () => {
+    while (fileStateCache.size > maxParsedCacheEntries || fileStateCacheBytes > maxParsedCacheBytes) {
+      const first = fileStateCache.keys().next().value as string | undefined;
+      if (!first) break;
+      const entry = fileStateCache.get(first);
+      fileStateCache.delete(first);
+      fileStateCacheBytes = Math.max(0, fileStateCacheBytes - (entry?.weight ?? 0));
+    }
+  };
 
   const lockOwnerIsStale = (lock: LockFile): boolean =>
     !pidIsAlive(lock.pid) ||
@@ -661,8 +756,11 @@ export function createRunPersistence(
     }
   };
 
-  const computeList = (): PersistedRunState[] => {
-    const byRunId = new Map<string, PersistedRunState>();
+  const computeList = (): { states: PersistedRunState[]; bytes: number } => {
+    const byRunId = new Map<string, { state: PersistedRunState; bytes: number }>();
+    const addState = (state: PersistedRunState, bytes: number): void => {
+      if (!byRunId.has(state.runId)) byRunId.set(state.runId, { state, bytes: Math.max(0, bytes) });
+    };
     const seenPaths = new Set<string>();
     for (const dir of [runsDir, legacyRunsDir]) {
       for (const file of listJsonFilesSafe(fs, dir)) {
@@ -683,21 +781,52 @@ export function createRunPersistence(
           // ino is what actually rules out a false "unchanged" match on a
           // coarse-mtime filesystem (see the field doc comment above).
           if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size && cached.ino === stat.ino) {
-            if (!byRunId.has(cached.state.runId)) byRunId.set(cached.state.runId, cached.state);
+            addState(cached.state, cached.size);
             continue;
           }
-          const state = readStateAt(path, fileRunId);
-          if (!state) continue;
-          fileStateCache.set(path, { mtimeMs: stat.mtimeMs, size: stat.size, ino: stat.ino, state });
-          if (!byRunId.has(state.runId)) byRunId.set(state.runId, state);
+          const loaded = readStateWithSourceAt(path, fileRunId);
+          if (!loaded) continue;
+          const { state } = loaded;
+          // The signature above belongs to the primary. If recovery used the
+          // backup, retaining that state under the primary's unchanged stat
+          // would hide a later backup repair indefinitely. Degraded records
+          // are intentionally re-read after the short list TTL.
+          if (loaded.sourcePath === path) {
+            // Keep the true on-disk weight. Capping an oversized file at the
+            // configured budget would let a single large parsed state survive
+            // trimFileStateCache() and silently defeat the byte bound.
+            const weight = Math.max(0, stat.size);
+            const previous = fileStateCache.get(path);
+            if (previous) fileStateCacheBytes = Math.max(0, fileStateCacheBytes - previous.weight);
+            fileStateCache.set(path, { mtimeMs: stat.mtimeMs, size: stat.size, ino: stat.ino, state, weight });
+            fileStateCacheBytes += weight;
+            trimFileStateCache();
+          } else removeFileStateCache(path);
+          let sourceBytes = stat.size;
+          if (loaded.sourcePath !== path) {
+            try {
+              sourceBytes = _statSync(loaded.sourcePath).size;
+            } catch {
+              // Keep the primary size if a recovered backup disappears while
+              // its listing entry is being assembled.
+            }
+          }
+          addState(state, sourceBytes);
         } catch {
           // LP-004: the primary is corrupt/truncated, but a valid .bak from the
           // previous save may still recover the run — load() already does this,
           // so list()/startup recovery/retention must agree with it.
           try {
-            const state = readStateAt(path, fileRunId);
-            if (state && !byRunId.has(state.runId)) {
-              byRunId.set(state.runId, state);
+            const recovered = readStateWithSourceAt(path, fileRunId);
+            if (recovered) {
+              let sourceBytes = 0;
+              try {
+                sourceBytes = _statSync(recovered.sourcePath).size;
+              } catch {
+                // A raced recovery is still returned for this listing, but it
+                // must not contribute an unbounded cache estimate.
+              }
+              addState(recovered.state, sourceBytes);
               // The stat/read failure path has no reliable file signature;
               // retain the recovered value for this listing only.
               continue;
@@ -705,16 +834,24 @@ export function createRunPersistence(
           } catch {
             // fall through to prune below
           }
-          fileStateCache.delete(path);
+          removeFileStateCache(path);
         }
       }
     }
     // Prune cache entries for files that no longer exist (deleted runs) so
     // this map's size tracks what's actually on disk, not lifetime history.
     for (const path of fileStateCache.keys()) {
-      if (!seenPaths.has(path)) fileStateCache.delete(path);
+      if (!seenPaths.has(path)) {
+        removeFileStateCache(path);
+      }
     }
-    return [...byRunId.values()].sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
+    const entries = [...byRunId.values()].sort(
+      (a, b) => new Date(b.state.updatedAt).getTime() - new Date(a.state.updatedAt).getTime(),
+    );
+    return {
+      states: entries.map((entry) => entry.state),
+      bytes: entries.reduce((total, entry) => total + entry.bytes, 0),
+    };
   };
 
   // Bound the number of terminal (completed/failed/aborted) runs kept on
@@ -724,11 +861,28 @@ export function createRunPersistence(
   // before the cap is even considered.
   const enforceRetention = () => {
     const terminal = computeList()
-      .filter((r) => TERMINAL_RUN_STATUSES.has(r.status))
+      .states.filter((r) => TERMINAL_RUN_STATUSES.has(r.status))
       .sort((a, b) => new Date(a.updatedAt).getTime() - new Date(b.updatedAt).getTime());
-    const excess = terminal.length - maxTerminalRunsOnDisk;
-    if (excess <= 0) return;
-    for (const run of terminal.slice(0, excess)) {
+    const retainedBytes = new Map<string, number>();
+    let totalBytes = 0;
+    for (const run of terminal) {
+      let bytes = 0;
+      for (const path of candidateRunPaths(run.runId)) {
+        for (const candidate of [path, `${path}.bak`]) {
+          try {
+            bytes += _statSync(candidate).size;
+          } catch {
+            // Missing/raced sidecars contribute zero; lease fencing below still
+            // decides whether the logical record is safe to delete.
+          }
+        }
+      }
+      retainedBytes.set(run.runId, bytes);
+      totalBytes += bytes;
+    }
+    let excess = Math.max(0, terminal.length - maxTerminalRunsOnDisk);
+    for (const run of terminal) {
+      if (excess <= 0 && totalBytes <= maxTerminalRunBytesOnDisk) break;
       // RETENTION-TOCTOU: existence-checking a lock and unlinking a record are
       // not a lease. Acquire the candidate's lease, re-read it, and delete only
       // if the same terminal revision is still present. A live/unreadable lock
@@ -742,6 +896,8 @@ export function createRunPersistence(
         if (!fresh || !TERMINAL_RUN_STATUSES.has(fresh.status) || fresh.revision !== run.revision) continue;
         if (deleteRun(run.runId, fresh.revision, lease)) {
           lease = null; // delete() consumes the lock when it succeeds
+          if (excess > 0) excess--;
+          totalBytes = Math.max(0, totalBytes - (retainedBytes.get(run.runId) ?? 0));
         }
       } catch {
         // Retention is best-effort; never let one raced/corrupt candidate abort save.
@@ -759,7 +915,7 @@ export function createRunPersistence(
       // Best-effort cleanup of the sidecar files alongside the primary.
       for (const sidecar of [`${path}.bak`, `${path}.tmp`, join(dir, `${runId}.log`)]) {
         unlinkIfExistsSafe(fs, sidecar);
-        fileStateCache.delete(sidecar);
+        removeFileStateCache(sidecar);
       }
       const lock = lockPath(dir, runId);
       // Never unlink a lock that no longer carries the lease used for this
@@ -767,7 +923,7 @@ export function createRunPersistence(
       // and publication cleanup.
       if (!lease || readLockAt(lock, runId, path)?.token === lease.token) {
         unlinkIfExistsSafe(fs, lock);
-        fileStateCache.delete(lock);
+        removeFileStateCache(lock);
       }
       // Atomic writers use unique `<run>.json.<token>.tmp` names. Remove only
       // this run's abandoned temporaries; never sweep unrelated records.
@@ -776,16 +932,139 @@ export function createRunPersistence(
           if (file.startsWith(`${runId}.json.`) && file.endsWith(".tmp")) {
             const tmp = join(dir, file);
             unlinkIfExistsSafe(fs, tmp);
-            fileStateCache.delete(tmp);
+            removeFileStateCache(tmp);
           }
         }
       } catch {
         // Retention/deletion remains best-effort if the directory disappears.
       }
       if (unlinkIfExistsSafe(fs, path)) deleted = true;
-      fileStateCache.delete(path);
+      removeFileStateCache(path);
     }
     return deleted;
+  };
+
+  const durableBytes = (runId: string): number => {
+    let bytes = 0;
+    for (const path of candidateRunPaths(runId)) {
+      const dir = path === primaryRunPath(runId) ? runsDir : legacyRunsDir;
+      for (const candidate of [path, `${path}.bak`, join(dir, `${runId}.log`)]) {
+        try {
+          bytes += _statSync(candidate).size;
+        } catch {
+          /* raced/missing */
+        }
+      }
+    }
+    return bytes;
+  };
+
+  const getResourceDiagnostics = (): DurableResourceDiagnostics => {
+    const runs = computeList().states;
+    let persistedRunBytes = 0;
+    let pausedRunBytes = 0;
+    let terminalRunBytes = 0;
+    for (const run of runs) {
+      const bytes = durableBytes(run.runId);
+      persistedRunBytes += bytes;
+      if (run.status === "paused") pausedRunBytes += bytes;
+      if (TERMINAL_RUN_STATUSES.has(run.status)) terminalRunBytes += bytes;
+    }
+    durableHighWaterBytes = Math.max(durableHighWaterBytes, persistedRunBytes);
+    durableHighWaterCount = Math.max(durableHighWaterCount, runs.length);
+    return {
+      persistedRunCount: runs.length,
+      persistedRunBytes,
+      pausedRunCount: runs.filter((run) => run.status === "paused").length,
+      pausedRunBytes,
+      terminalRunCount: runs.filter((run) => TERMINAL_RUN_STATUSES.has(run.status)).length,
+      terminalRunBytes,
+      durableHighWaterBytes,
+      durableHighWaterCount,
+    };
+  };
+
+  const prunePausedRuns = (options: PausedPruneOptions = {}): PausedPruneResult => {
+    const dryRun = options.dryRun !== false;
+    const cutoff = options.before === undefined ? undefined : new Date(options.before).getTime();
+    if (options.before !== undefined && !Number.isFinite(cutoff))
+      throw new RangeError("before must be a finite valid date");
+    const maxRuns = boundedPruneLimit(options.maxRuns, "maxRuns");
+    const maxBytes = boundedPruneLimit(options.maxBytes, "maxBytes");
+    const candidates: string[] = [];
+    const candidateSizes = new Map<string, number>();
+    const skipped: Array<{ runId: string; reason: string; bytes?: number }> = [];
+    let bytes = 0;
+    let deletedBytes = 0;
+    let skippedBytes = 0;
+    for (const run of computeList()
+      .states.filter((item) => item.status === "paused")
+      .sort((a, b) => a.updatedAt.localeCompare(b.updatedAt))) {
+      const size = durableBytes(run.runId);
+      const outbox = run.deliveryOutbox ?? [];
+      let reason: string | undefined;
+      if (options.sessionId !== undefined && run.sessionId !== options.sessionId)
+        reason = "different session/project owner";
+      else if (options.protectedRunIds?.has(run.runId)) reason = "live generation";
+      else if (options.skipDeliveryOutbox !== false && outbox.length > 0) reason = "delivery outbox pending";
+      else if (cutoff === undefined) reason = "explicit before fence required";
+      else if (new Date(run.updatedAt).getTime() >= cutoff) continue;
+      else if (candidates.length >= maxRuns) reason = "maxRuns reached";
+      else if (bytes + size > maxBytes) reason = "maxBytes reached";
+      if (reason) {
+        skipped.push({ runId: run.runId, reason, bytes: size });
+        skippedBytes += size;
+        continue;
+      }
+      candidates.push(run.runId);
+      candidateSizes.set(run.runId, size);
+      bytes += size;
+    }
+    const deleted: string[] = [];
+    if (!dryRun) {
+      for (const runId of candidates) {
+        const lease = acquireRunLease(runId);
+        if (!lease) {
+          skipped.push({ runId, reason: "lease unavailable" });
+          continue;
+        }
+        try {
+          const fresh = readStateAt(primaryRunPath(runId), runId) ?? readStateAt(legacyRunPath(runId), runId);
+          const freshBytes = durableBytes(runId);
+          if (
+            fresh?.status !== "paused" ||
+            (options.sessionId !== undefined && fresh.sessionId !== options.sessionId) ||
+            options.protectedRunIds?.has(runId) ||
+            (options.skipDeliveryOutbox !== false && (fresh.deliveryOutbox ?? []).length > 0) ||
+            (cutoff !== undefined && new Date(fresh.updatedAt).getTime() >= cutoff)
+          ) {
+            skipped.push({
+              runId,
+              reason: "record changed, owned by another session, live, or delivery pending",
+              bytes: freshBytes,
+            });
+            continue;
+          }
+          if (deleteRun(runId, fresh.revision, lease)) {
+            deleted.push(runId);
+            deletedBytes += candidateSizes.get(runId) ?? freshBytes;
+          } else skipped.push({ runId, reason: "revision changed", bytes: freshBytes });
+        } finally {
+          releaseRunLease(lease);
+        }
+      }
+    }
+    return {
+      dryRun,
+      candidates,
+      deleted,
+      skipped,
+      candidateCount: candidates.length,
+      candidateBytes: bytes,
+      deletedBytes,
+      skippedCount: skipped.length,
+      skippedBytes,
+    };
   };
 
   return {
@@ -846,16 +1125,22 @@ export function createRunPersistence(
 
     list(): PersistedRunState[] {
       const now = Date.now();
-      // Return a fresh array on every call (a cheap ref-copy) so a caller that
-      // sorts/reverses/mutates the result in place can't corrupt the cache — the
-      // pre-cache code re-parsed into a new array each call, preserve that.
+      // Never expose the parsed objects retained by listCache/fileStateCache.
+      // A shallow array copy still lets callers poison status, logs, agents, or
+      // other nested state indefinitely while the on-disk signature is stable.
       if (listCache && now - listCacheAt < LIST_CACHE_TTL_MS) {
-        return [...listCache];
+        return cloneRunStates(listCache);
       }
-      const result = computeList();
-      listCache = result;
+      const computed = computeList();
+      const result = computed.states;
+      // Do not retain a process-lifetime copy of an arbitrarily large paused
+      // fleet or a parsed state set that exceeds the configured byte budget.
+      // The byte estimate uses native durable JSON file sizes, matching
+      // fileStateCache's accounting without serializing the whole result a
+      // second time just to decide whether it is cacheable.
+      listCache = result.length <= maxParsedCacheEntries && computed.bytes <= maxParsedCacheBytes ? result : undefined;
       listCacheAt = now;
-      return [...result];
+      return cloneRunStates(result);
     },
 
     delete(runId: string, expectedRevision?: number, lease?: RunLease): boolean {
@@ -873,6 +1158,9 @@ export function createRunPersistence(
     getRunsDir(): string {
       return runsDir;
     },
+
+    getResourceDiagnostics,
+    prunePausedRuns,
   };
 }
 

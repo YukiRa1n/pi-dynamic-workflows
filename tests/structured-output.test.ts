@@ -77,20 +77,15 @@ test("createStructuredOutputTool returns details with captured params", async ()
   assert.deepEqual(result.details, { x: 42 });
 });
 
-test("createStructuredOutputTool has promptSnippet and promptGuidelines", () => {
+test("createStructuredOutputTool keeps provider guidance in its name and description", () => {
   const capture = { called: false, value: undefined };
   const tool = createStructuredOutputTool({
     schema: Type.Object({ result: Type.String() }),
     capture,
   });
-  assert.ok(tool.promptSnippet, "promptSnippet should be truthy");
-  assert.ok(Array.isArray(tool.promptGuidelines), "tool.promptGuidelines should be an array");
-  assert.ok(tool.promptGuidelines.length > 0, "tool.promptGuidelines should not be empty");
-  // Should mention the tool name in guidelines
-  assert.ok(
-    tool.promptGuidelines.some((g: string) => g.includes("structured_output")),
-    "should contain structured_output",
-  );
+  assert.equal(tool.description, "Return the final structured result.");
+  assert.equal(tool.promptSnippet, undefined);
+  assert.equal(tool.promptGuidelines, undefined);
 });
 
 test("createStructuredOutputTool uses parameters from schema", () => {

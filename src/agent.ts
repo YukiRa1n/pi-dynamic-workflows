@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { unlinkSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { realpathSync, unlinkSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { AssistantMessage, Model, TextContent } from "@earendil-works/pi-ai";
 import {
   type CreateAgentSessionOptions,
@@ -10,8 +11,10 @@ import {
   getAgentDir,
   ModelRegistry,
   ModelRuntime,
+  type ResourceDiagnostic,
   SessionManager,
   SettingsManager,
+  type Skill,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import type { Static, TSchema } from "typebox";
@@ -158,9 +161,7 @@ export async function resolveStructuredOutput<T>(
   }
   for (let attempt = 0; attempt < maxRetries && !capture.called; attempt++) {
     if (options.signal?.aborted) throw new Error("Subagent was aborted");
-    await session.prompt(
-      "You did not call the structured_output tool. Call structured_output now as your only action, with the required fields filled in. Do not write a prose answer.",
-    );
+    await session.prompt("Call structured_output with the final result.");
   }
   if (capture.called) return capture.value as T;
 
@@ -539,15 +540,14 @@ export type AgentRunResult<TSchemaDef extends TSchema | undefined> = TSchemaDef 
   : string;
 
 /**
- * Orchestration tools ALWAYS denied to workflow subagents. The `workflow` and
- * `workflow_control` tools are registered globally by the extension, so — unless
- * excluded — a subagent's session sees them and can start its own independent
- * background workflows. Those nested runs recursively fan out and are NOT bounded
- * by the parent run's maxAgents / concurrency / progress / accounting, and can
- * drain a shared provider quota and pile up paused runs (#107). Callers may deny
- * additional tool names via WorkflowAgentOptions.excludeTools.
+ * Orchestration tools always denied to workflow subagents. The stock extension
+ * exposes only `start_workflow`, but embedders may also register the library,
+ * lifecycle, or steering tools. Nested background runs would escape the parent's
+ * limits and accounting,
+ * so all known orchestration names remain fail-closed here. Callers may deny
+ * additional names via WorkflowAgentOptions.excludeTools.
  */
-export const DEFAULT_EXCLUDED_SUBAGENT_TOOLS = ["workflow", "workflow_control"];
+export const DEFAULT_EXCLUDED_SUBAGENT_TOOLS = ["start_workflow", "workflow", "workflow_control", "workflow_steer"];
 
 /**
  * The full subagent tool denylist: the always-on defaults plus any names the
@@ -558,6 +558,48 @@ export const DEFAULT_EXCLUDED_SUBAGENT_TOOLS = ["workflow", "workflow_control"];
  */
 export function subagentExcludedTools(extra?: string[], sessionExclude?: string[]): string[] {
   return [...DEFAULT_EXCLUDED_SUBAGENT_TOOLS, ...(sessionExclude ?? []), ...(extra ?? [])];
+}
+
+/**
+ * Resolve a skill path the same way on Windows and POSIX, following package
+ * symlinks when possible. The fallback keeps this filter safe while a package
+ * is being assembled and the target path does not exist yet.
+ */
+function canonicalSkillPath(path: string): string {
+  const resolved = resolve(path);
+  let canonical = resolved;
+  try {
+    canonical = realpathSync(resolved);
+  } catch {
+    // Keep the lexical path for missing paths; the loader only supplies real
+    // skill files, but this makes the predicate safe for synthetic callers.
+  }
+  return process.platform === "win32" ? canonical.toLowerCase() : canonical;
+}
+
+/**
+ * The package's workflow skills are useful to the host, where the `workflow`
+ * tool exists, but misleading in subagents whose extensions are deliberately
+ * disabled. Match the package-owned paths rather than skill names so a user's
+ * or project's same-named skill is never removed.
+ */
+const WORKFLOW_PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const SUBAGENT_HIDDEN_WORKFLOW_SKILL_FILES = new Set(
+  ["workflow-authoring", "workflow-patterns"].map((name) =>
+    canonicalSkillPath(join(WORKFLOW_PACKAGE_ROOT, "skills", name, "SKILL.md")),
+  ),
+);
+
+export function filterBundledWorkflowSkills(base: { skills: Skill[]; diagnostics: ResourceDiagnostic[] }): {
+  skills: Skill[];
+  diagnostics: ResourceDiagnostic[];
+} {
+  return {
+    ...base,
+    skills: base.skills.filter(
+      (skill) => !SUBAGENT_HIDDEN_WORKFLOW_SKILL_FILES.has(canonicalSkillPath(skill.filePath)),
+    ),
+  };
 }
 
 export class WorkflowAgent {
@@ -616,11 +658,14 @@ export class WorkflowAgent {
    * run the cleanup — the dominant #109 leak, and one our own extension
    * (UsageLimitScheduler) can trigger.
    *
-   * `noExtensions: true` skips loading host extensions; skills, prompts, and
-   * AGENTS.md context still load. The subagent keeps the tools this workflow
-   * hands it via `customTools` (coding tools + any toolset like web-research) —
-   * those are unaffected. What it loses is HOST EXTENSION-REGISTERED tools (MCP
-   * bridges, browser tools, anything a host extension added via ctx.registerTool):
+   * `noExtensions: true` skips loading host extensions; user/project skills,
+   * prompts, and AGENTS.md context still load. The two package-owned workflow
+   * guidance skills are filtered by `skillsOverride` below because they describe
+   * a host-only workflow tool surface. The subagent keeps the tools this
+   * workflow hands it via `customTools` (coding tools + any toolset like
+   * web-research) — those are unaffected. What it loses is HOST
+   * EXTENSION-REGISTERED tools (MCP bridges, browser tools, anything a host
+   * extension added via ctx.registerTool):
    * pre-change a subagent session inherited those from the full host extension
    * set, now it does not, so an agentType `tools` allowlist naming one matches
    * nothing. This is a deliberate trade-off — it also structurally kills recursive
@@ -638,6 +683,7 @@ export class WorkflowAgent {
           agentDir,
           settingsManager: SettingsManager.create(this.cwd, agentDir),
           noExtensions: true,
+          skillsOverride: filterBundledWorkflowSkills,
         });
         await loader.reload();
         return loader;
@@ -880,6 +926,11 @@ export class WorkflowAgent {
       // Per-call model/thinking wins over any sessionOptions defaults.
       ...(resolvedModel ? { model: resolvedModel } : {}),
       ...(resolvedThinkingLevel ? { thinkingLevel: resolvedThinkingLevel } : {}),
+      // Pi enables read/bash/edit/write by default when no active-name
+      // allowlist is supplied, even if customTools is a complete replacement
+      // toolset (for example web-research). Pin the provider-visible surface to
+      // the policy-filtered definitions assembled above.
+      tools: [...new Set(customTools.map((tool) => tool.name))],
       // Deny recursive-orchestration tools in the subagent (#107). Placed after
       // the sessionOptions spread so it always applies; folds in any denylist
       // the caller set on sessionOptions rather than dropping it.
@@ -901,6 +952,7 @@ export class WorkflowAgent {
     let removeCacheWarmListener: (() => void) | undefined;
     let firstAssistantMessageSeen = false;
     let cacheWarmOwner = false;
+    let cacheWarmSettled = false;
     let promptCompleted = false;
     let lastHistoryEmit = 0;
     const emitHistory = () => options.onHistory?.(compactAgentHistory(session.messages));
@@ -928,12 +980,17 @@ export class WorkflowAgent {
       if (options.onHistory) {
         removeHistoryListener = session.subscribe(() => maybeEmitHistory());
       }
-      if (options.onFirstAssistantMessage) {
+      if (options.onFirstAssistantMessage || options.cacheWarmGate) {
         removeCacheWarmListener = session.subscribe((event) => {
           if (firstAssistantMessageSeen || event.type !== "message_start" || event.message.role !== "assistant") return;
           firstAssistantMessageSeen = true;
-          // Diagnostic hook only. The cache gate itself is warmed after the
-          // prompt completes below; observer failure must not corrupt a turn.
+          // Anthropic makes an automatic prompt-cache entry available as soon
+          // as the first response begins. Release same-prefix followers here,
+          // not after the owner finishes generating its potentially long answer.
+          if (cacheWarmOwner && options.cacheWarmGate) {
+            cacheWarmSettled = true;
+            options.cacheWarmGate.warm();
+          }
           try {
             options.onFirstAssistantMessage?.();
           } catch {
@@ -995,11 +1052,11 @@ export class WorkflowAgent {
       removeAbortListener?.();
       removeHistoryListener?.();
       removeCacheWarmListener?.();
-      // A message_start alone does not prove the provider completed a cacheable
-      // request: streaming can start and then fail. Warm only after the first
-      // prompt fully completes; otherwise promote one waiting sibling to owner.
-      if (cacheWarmOwner) {
-        if (promptCompleted) options.cacheWarmGate?.warm();
+      // A provider/SDK that omits message_start still gets a safe completion
+      // fallback. Failure before any response promotes exactly one follower.
+      if (cacheWarmOwner && !cacheWarmSettled) {
+        cacheWarmSettled = true;
+        if (promptCompleted || firstAssistantMessageSeen) options.cacheWarmGate?.warm();
         else options.cacheWarmGate?.release();
       }
       try {
@@ -1034,15 +1091,7 @@ export class WorkflowAgent {
     ].filter(Boolean);
 
     if (structured) {
-      parts.push(
-        [
-          "Final output contract:",
-          "- Your final action MUST be a structured_output tool call.",
-          "- The structured_output arguments are the return value of this subagent.",
-          "- Do not emit a prose final answer instead of structured_output.",
-          "- If you need to inspect files or run commands first, do so, then call structured_output exactly once.",
-        ].join("\n"),
-      );
+      parts.push("Return the final result by calling structured_output.");
     }
 
     return parts.join("\n\n");

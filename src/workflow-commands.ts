@@ -15,7 +15,7 @@ import {
 import { type EffortState, effortDirective } from "./effort-command.js";
 import type { PersistedRunState } from "./run-persistence.js";
 import { registerSavedWorkflow } from "./saved-commands.js";
-import { buildForcedWorkflowPrompt, WORKFLOW_TOOL_NAME } from "./workflow-editor.js";
+import { buildForcedWorkflowPrompt } from "./workflow-editor.js";
 import type { WorkflowManager } from "./workflow-manager.js";
 import type { WorkflowStorage } from "./workflow-saved.js";
 import { openWorkflowNavigator } from "./workflow-ui.js";
@@ -30,7 +30,7 @@ const STATUS_ICON: Record<string, string> = {
 };
 
 const USAGE =
-  "Usage: /workflows [list] | run <prompt> | status <id> | watch <id> | stop <id> | pause <id> | resume <id> | rm <id> | save <name> [runId]";
+  "Usage: /workflows [list] | run <prompt> | status <id> | watch <id> | stop <id> | pause <id> | resume <id> | steer <id> [same_task_correction|blocker_answer|changed_fact] <message> | rm <id> | save <name> [runId]";
 
 const RUN_USAGE = "Usage: /workflows run <prompt> — force a dynamic workflow from the prompt";
 
@@ -60,7 +60,13 @@ function oneLineProgress(snapshot: WorkflowSnapshot): string {
  * run was active and is now being watched, false otherwise. Listeners clean up on
  * completion so nothing leaks.
  */
-function watchRun(manager: WorkflowManager, pi: ExtensionAPI, ctx: ExtensionCommandContext, id: string): boolean {
+function watchRun(
+  manager: WorkflowManager,
+  pi: ExtensionAPI,
+  ctx: ExtensionCommandContext,
+  id: string,
+  onDispose?: () => void,
+): (() => void) | false {
   const active = manager.getRun(id);
   if (active?.status !== "running") return false;
 
@@ -74,15 +80,20 @@ function watchRun(manager: WorkflowManager, pi: ExtensionAPI, ctx: ExtensionComm
   };
   let settled = false;
   const progressEvents = ["agentStart", "agentEnd", "phase", "log"];
-  const finalEvents = ["complete", "error", "stopped", "paused"];
-  const finish = (e: { runId?: string }) => {
-    if (e && e.runId !== id) return;
+  const finalEvents = ["complete", "error", "stopped", "paused", "deleted"];
+  const dispose = () => {
     if (settled) return;
     settled = true;
     for (const ev of progressEvents) manager.off(ev, onEvent);
     for (const ev of finalEvents) manager.off(ev, finish);
     ctx.ui.setStatus(key, undefined);
+    onDispose?.();
+  };
+  const finish = (e: { runId?: string }) => {
+    if (e && e.runId !== id) return;
+    if (settled) return;
     const run = manager.getRun(id);
+    dispose();
     if (run) {
       void pi.sendMessage({
         customType: "workflows",
@@ -94,7 +105,7 @@ function watchRun(manager: WorkflowManager, pi: ExtensionAPI, ctx: ExtensionComm
   for (const ev of progressEvents) manager.on(ev, onEvent);
   for (const ev of finalEvents) manager.on(ev, finish);
   update();
-  return true;
+  return dispose;
 }
 
 function renderPersistedStatus(run: PersistedRunState): string {
@@ -145,9 +156,16 @@ export function registerWorkflowCommands(
     // getCommands may be unavailable in some hosts; fall through and try to register.
   }
 
+  const registerEvent = (pi as ExtensionAPI & { on?: (event: string, handler: () => void) => void }).on;
+  const watcherCleanups = new Map<string, () => void>();
+  registerEvent?.call(pi, "session_shutdown", () => {
+    for (const cleanup of [...watcherCleanups.values()]) cleanup();
+    watcherCleanups.clear();
+  });
+
   pi.registerCommand("workflows", {
     description:
-      "Manage workflow runs — no args (opens navigator) | run <prompt> | status/stop/pause/resume <id> | rm <id> | save <name> [runId]",
+      "Manage workflow runs — no args (opens navigator) | run <prompt> | status/stop/pause/resume/steer | rm | save",
     async handler(args: string, ctx: ExtensionCommandContext) {
       const manager = getManager();
       const parts = args.trim().split(/\s+/).filter(Boolean);
@@ -164,15 +182,6 @@ export function registerWorkflowCommands(
           if (!prompt) {
             ctx.ui.notify(RUN_USAGE, "warning");
             return;
-          }
-
-          // Best-effort: ensure the workflow tool is active (session_start usually has).
-          // Add-only so this does not interfere with the keyword hook's save/restore state.
-          try {
-            const active = pi.getActiveTools?.() ?? [];
-            if (!active.includes(WORKFLOW_TOOL_NAME)) pi.setActiveTools?.([...active, WORKFLOW_TOOL_NAME]);
-          } catch {
-            // ignore — the forced directive is the real forcing primitive
           }
 
           const effort = opts.effort;
@@ -234,7 +243,14 @@ export function registerWorkflowCommands(
           }
           // A running run streams live progress to the status bar and prints the
           // final snapshot when it finishes — no need to re-run the command.
-          if (watchRun(manager, pi, ctx, id)) {
+          watcherCleanups.get(id)?.();
+          let cleanup: (() => void) | undefined;
+          const opened = watchRun(manager, pi, ctx, id, () => {
+            if (cleanup && watcherCleanups.get(id) === cleanup) watcherCleanups.delete(id);
+          });
+          if (opened) {
+            cleanup = opened;
+            watcherCleanups.set(id, cleanup);
             ctx.ui.notify(`Watching ${id} — live progress in the status bar; result prints when it finishes.`, "info");
             return;
           }
@@ -268,6 +284,42 @@ export function registerWorkflowCommands(
           if (!id) return ctx.ui.notify(USAGE, "warning");
           const ok = await manager.resume(id);
           ctx.ui.notify(ok ? `Resumed ${id}` : `Resume not available for ${id} yet`, ok ? "info" : "warning");
+          return;
+        }
+        case "steer": {
+          const match = args
+            .trim()
+            .match(/^steer\s+(\S+)\s+(?:(same_task_correction|blocker_answer|changed_fact)\s+)?([\s\S]+)$/iu);
+          if (!match) {
+            ctx.ui.notify(
+              "Usage: /workflows steer <id> [same_task_correction|blocker_answer|changed_fact] <message>",
+              "warning",
+            );
+            return;
+          }
+          const [, runId, requestedKind, rawMessage] = match;
+          const message = rawMessage.trim();
+          if (!message || message.length > 8_000) {
+            ctx.ui.notify("Steering message must contain 1-8000 characters.", "warning");
+            return;
+          }
+          const kind = (requestedKind ?? "same_task_correction") as
+            | "same_task_correction"
+            | "blocker_answer"
+            | "changed_fact";
+          let queued: string | undefined;
+          try {
+            queued = manager.enqueueUserMessage(message, runId, kind);
+          } catch {
+            ctx.ui.notify(`Invalid workflow run ID "${runId}"`, "error");
+            return;
+          }
+          ctx.ui.notify(
+            queued
+              ? `Queued ${kind} for ${queued}; it will be applied at the next child-call safe point.`
+              : `Cannot steer ${runId} (the run is not active or its queue is full).`,
+            queued ? "info" : "warning",
+          );
           return;
         }
         case "rm": {

@@ -1,5 +1,6 @@
 import { readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, relative } from "node:path";
+import { buildArmedWorkflowPrompt, buildForcedWorkflowPrompt } from "./workflow-editor.js";
 import { createWorkflowTool } from "./workflow-tool.js";
 /** Package-relative generated context-measurement artifact. */
 export const WORKFLOW_CONTEXT_MEASUREMENT_PATH = "docs/workflow-context-surfaces.json";
@@ -135,9 +136,10 @@ function median(values) {
 }
 /** Measures permanent, discovery, corpus, and canonical on-demand workflow context surfaces. */
 export function measureWorkflowContextSurfaces(root = ROOT) {
-    const tool = createWorkflowTool();
+    const tool = createWorkflowTool({ allowResume: false, exposeAdvancedParameters: false, modelFacing: true });
+    const alwaysOnTools = [tool];
     const permanentWorkflowPrompt = [
-        `- workflow: ${tool.promptSnippet}`,
+        ...(tool.promptSnippet ? [`- workflow: ${tool.promptSnippet}`] : []),
         ...(tool.promptGuidelines ?? []).map((guideline) => `- ${guideline}`),
     ].join("\n");
     const providerVisibleWorkflowToolDefinition = JSON.stringify({
@@ -145,6 +147,16 @@ export function measureWorkflowContextSurfaces(root = ROOT) {
         description: tool.description,
         parameters: tool.parameters,
     });
+    const alwaysOnToolSurfaces = alwaysOnTools.map((alwaysOnTool) => ({
+        name: alwaysOnTool.name,
+        serialization: "UTF-8 bytes of JSON.stringify({ name, description, parameters })",
+        bytes: bytes(JSON.stringify({
+            name: alwaysOnTool.name,
+            description: alwaysOnTool.description,
+            parameters: alwaysOnTool.parameters,
+        })),
+    }));
+    const alwaysOnToolBytes = alwaysOnToolSurfaces.reduce((sum, surface) => sum + surface.bytes, 0);
     const skillRoots = registeredSkillRoots(root);
     const skillDiscoverySurfaces = skillRoots.map((skillRoot) => ({
         root: skillRoot,
@@ -161,18 +173,41 @@ export function measureWorkflowContextSurfaces(root = ROOT) {
     }));
     const promptBytes = bytes(permanentWorkflowPrompt);
     const toolBytes = bytes(providerVisibleWorkflowToolDefinition);
+    const armedRewriteBytes = bytes(buildArmedWorkflowPrompt(""));
+    const forcedRewriteBytes = bytes(buildForcedWorkflowPrompt(""));
     return {
-        formatVersion: 3,
+        formatVersion: 7,
         encoding: "utf8",
-        sources: ["src/workflow-tool.ts", "skills/workflow-authoring", "package.json#pi.skills"],
+        sources: ["src/workflow-tool.ts", "src/workflow-editor.ts", "skills/workflow-authoring", "package.json#pi.skills"],
         surfaces: {
             permanentWorkflowPrompt: {
-                serialization: "UTF-8 bytes of LF-joined Pi prompt lines",
+                serialization: "UTF-8 bytes of LF-joined stable Pi prompt lines contributed by workflow",
                 bytes: promptBytes,
             },
             providerVisibleWorkflowToolDefinition: {
-                serialization: "UTF-8 bytes of JSON.stringify({ name, description, parameters })",
+                serialization: "UTF-8 bytes of the stable JSON.stringify({ name, description, parameters }) workflow definition",
                 bytes: toolBytes,
+            },
+            providerVisibleAlwaysOnToolDefinitions: {
+                serialization: "sum of stable provider-visible workflow tool definitions on ordinary turns",
+                bytes: alwaysOnToolBytes,
+                tools: alwaysOnToolSurfaces,
+            },
+            armedWorkflowPromptRewrite: {
+                serialization: "UTF-8 bytes added by buildArmedWorkflowPrompt to an empty user message",
+                bytes: armedRewriteBytes,
+            },
+            forcedWorkflowPromptRewrite: {
+                serialization: "UTF-8 bytes added by buildForcedWorkflowPrompt to an empty user message",
+                bytes: forcedRewriteBytes,
+            },
+            stableWorkflowOwnedContext: {
+                serialization: "sum of the stable Pi prompt and provider workflow definition",
+                bytes: promptBytes + toolBytes,
+            },
+            explicitWorkflowRequestOwnedContext: {
+                serialization: "stable workflow-owned context plus the explicit-request suffix",
+                bytes: promptBytes + toolBytes + armedRewriteBytes,
             },
             registeredSkillsDiscovery: {
                 serialization: "sum of UTF-8 bytes of normalized Pi skill XML (name + description + location) across every root in package.json's pi.skills",
@@ -180,8 +215,8 @@ export function measureWorkflowContextSurfaces(root = ROOT) {
                 skills: skillDiscoverySurfaces,
             },
             ordinaryWorkflowOwnedAlwaysOn: {
-                serialization: "sum of permanent prompt, provider-visible tool definition, and every registered skill's discovery bytes",
-                bytes: promptBytes + toolBytes + registeredSkillsDiscoveryBytes,
+                serialization: "sum of the stable workflow definition and every registered skill discovery entry",
+                bytes: alwaysOnToolBytes + registeredSkillsDiscoveryBytes,
             },
             workflowAuthoringSkillCorpus: {
                 serialization: "sum of UTF-8 bytes for every file under skills/workflow-authoring",

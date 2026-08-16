@@ -8,7 +8,7 @@ import { BUILTIN_WORKFLOW_NAMES } from "../src/builtin-workflows.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
 import { WorkflowManager } from "../src/workflow-manager.js";
 import { createWorkflowStorage } from "../src/workflow-saved.js";
-import { backgroundStartedText, createWorkflowTool, WORKFLOW_GATE_GUIDELINE } from "../src/workflow-tool.js";
+import { backgroundStartedText, createWorkflowTool } from "../src/workflow-tool.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
 
 /** Minimal fake ModelRegistry, matching the shape used by workflow manager tests. */
@@ -33,14 +33,13 @@ function parameterDescription(tool: ReturnType<typeof createWorkflowTool>, name:
 
 // ─── backgroundStartedText ─────────────────────────────────────────────────────
 
-test("backgroundStartedText tells the user it auto-continues and they can wait", () => {
+test("backgroundStartedText is a compact automatic-delivery acknowledgement", () => {
   const text = backgroundStartedText("audit", "abc-123");
   assert.match(text, /audit/);
   assert.match(text, /abc-123/);
-  assert.match(text, /wait here/i);
-  assert.match(text, /continues automatically|resume the conversation/i);
-  assert.match(text, /other things/i);
-  assert.match(text, /\/workflows status abc-123/);
+  assert.match(text, /started in background/i);
+  assert.match(text, /result returns automatically/i);
+  assert.doesNotMatch(text, /end this turn|do not poll|keep chatting|\/workflows/i);
 });
 
 // ─── createWorkflowTool ────────────────────────────────────────────────────────
@@ -51,12 +50,13 @@ test("createWorkflowTool has correct name and label", () => {
   assert.equal(tool.label, "Workflow");
 });
 
-test("createWorkflowTool description states its delegation capability", () => {
+test("createWorkflowTool description stays focused on background execution", () => {
   const description = createWorkflowTool().description;
 
-  assert.match(description, /JavaScript workflow.*delegates work to subagents/i);
-  assert.match(description, /agent\(\).*optionally composing calls.*parallel\(\).*pipeline\(\)/i);
-  assert.doesNotMatch(description, /deterministic|required raw JavaScript|export const meta/i);
+  assert.equal(
+    description,
+    "Start a new background workflow for an explicitly requested multi-agent task. Provide a saved name or JavaScript using agent(), parallel(), and pipeline(); results return automatically. Existing runs use /workflows.",
+  );
 });
 
 test("createWorkflowTool has parameters defined", () => {
@@ -75,73 +75,26 @@ test("createWorkflowTool has renderCall and renderResult", () => {
   assert.equal(typeof tool.renderResult, "function");
 });
 
-test("createWorkflowTool promptSnippet describes delegation and optional composition", () => {
-  const snippet = createWorkflowTool().promptSnippet;
-
-  assert.match(snippet, /delegate substantive .* work to subagents/i);
-  assert.match(snippet, /optionally composing agent calls/i);
-  assert.match(snippet, /parallel\(\)/);
-  assert.match(snippet, /pipeline\(\)/);
-  assert.match(snippet, /createTeam\(\)|or both/i);
-  assert.doesNotMatch(snippet, /required script header|export const meta/i);
+test("createWorkflowTool omits a duplicate Available tools snippet", () => {
+  assert.equal(createWorkflowTool().promptSnippet, undefined);
 });
 
-test("createWorkflowTool keeps permanent guidance to the single upstream gate", () => {
-  const guidance = createWorkflowTool().promptGuidelines;
-
-  assert.deepEqual(guidance, [WORKFLOW_GATE_GUIDELINE]);
-  assert.match(guidance[0], /ONLY call it when the user explicitly opts in/i);
-  assert.match(guidance[0], /you may briefly offer it \(with a rough cost\)/i);
-  assert.doesNotMatch(guidance[0], /export const meta|parallel\(\) requires functions/i);
-});
-
-test("createWorkflowTool permanent guidance omits conditional catalogs and recipes", () => {
-  const all = createWorkflowTool().promptGuidelines.join(" ");
-
-  assert.doesNotMatch(all, /Available agentTypes:/i);
-  assert.doesNotMatch(all, /currently available models/i);
-  assert.doesNotMatch(all, /verify\(|judgePanel\(|loopUntilDry\(|completenessCheck\(/i);
-  assert.doesNotMatch(all, /tokenBudget|agentTimeoutMs|agentRetries/i);
+test("createWorkflowTool keeps provider guidance in the schema and description", () => {
+  const tool = createWorkflowTool({ allowResume: false });
+  assert.equal(tool.promptGuidelines, undefined);
+  assert.equal(tool.promptSnippet, undefined);
+  assert.match(tool.description, /start a new background workflow/i);
 });
 
 test("createWorkflowTool keeps script syntax in the parameter schema", () => {
   const tool = createWorkflowTool();
   const description = parameterDescription(tool, "script");
 
-  assert.match(description, /raw JavaScript workflow script.*no Markdown fences/i);
-  assert.match(description, /First statement: export const meta = \{ name:.*description:.*\}\. Add phases:/i);
-  assert.doesNotMatch(
-    description,
-    /First statement: export const meta = \{ name: '[^']+', description: '[^']+', phases:/i,
-  );
-  assert.match(description, /phases.*only when.*named phases.*declare only phases it will use/i);
-  assert.match(description, /multiple phases.*phase\('Exact Title'\).*agent options/i);
-  assert.match(description, /await workflow\(savedName, childArgs\).*saved workflow inline/i);
-  assert.match(description, /nesting.*one level.*parent run's concurrency, agent, and token limits/i);
-  assert.match(
-    description,
-    /Optional quality helpers include verify\(\), judgePanel\(\), loopUntilDry\(\), and completenessCheck\(\)/i,
-  );
-  assert.match(description, /Optional control helpers include retry\(\) and gate\(\)/i);
-  assert.match(description, /budget exposes total, spent\(\), and remaining\(\)/i);
-  assert.match(description, /phase\('Name', \{ budget: N \}\).*phase token limit/i);
-  assert.match(description, /optional `agentType` option.*named user or project definition/i);
-  assert.match(description, /bind tools, a model, and role instructions/i);
-  assert.match(description, /name and purpose.*provided in context/i);
-  assert.match(description, /bound model overrides `tier`.*explicit `model` overrides both/i);
-  assert.match(description, /plain JavaScript only.*imports.*require\(\).*filesystem modules/i);
-  assert.match(description, /Date\.now\(\).*Math\.random\(\).*new Date\(\).*unavailable/i);
-  assert.match(description, /args, cwd, process\.cwd\(\), and budget/i);
-  assert.match(description, /must call agent\(\) at least once/i);
-  assert.match(description, /parallel\(\) requires functions, not promises.*results in input order/i);
-  assert.match(description, /pipeline\(items, \.\.\.stages\).*stages sequentially.*items proceed concurrently/i);
-  assert.match(description, /each stage receives.*previousValue.*originalItem.*index/i);
+  assert.match(description, /JavaScript workflow/i);
+  assert.match(description, /agent\(/i);
+  assert.ok(Buffer.byteLength(description, "utf8") < 150, "syntax summary stays compact");
 
-  const guidance = tool.promptGuidelines.join(" ");
-  assert.doesNotMatch(guidance, /Markdown fences|First statement: export const meta/i);
-  assert.doesNotMatch(guidance, /Date\.now\(\)|Math\.random\(\)|new Date\(\)/i);
-  assert.doesNotMatch(guidance, /parallel\(\) requires functions, not promises|results in input order/i);
-  assert.doesNotMatch(guidance, /each stage receives.*previousValue.*originalItem.*index/i);
+  assert.equal(tool.promptGuidelines, undefined, "script mechanics stay out of a permanent prompt block");
 });
 
 test("createWorkflowTool declares `args` as an explicitly typed object, not a typeless Type.Any() schema", () => {
@@ -180,33 +133,27 @@ test("createWorkflowTool is background-only and exposes no foreground toggle", (
   );
 });
 
-test("createWorkflowTool schema describes the configured or unbounded timeout", () => {
+test("createWorkflowTool schema keeps the per-agent timeout opt-in", () => {
   const tool = createWorkflowTool();
   const description = parameterDescription(tool, "agentTimeoutMs");
 
-  assert.match(description, /Omit to use configured `defaultAgentTimeoutMs`/i);
-  assert.match(description, /without one.*no hard timeout/i);
-  assert.match(description, /only when the user asks/i);
+  assert.equal(description, "Per-call timeout (ms).");
 });
 
-test("createWorkflowTool schema uses the agreed token-budget wording exactly", () => {
+test("createWorkflowTool schema forbids inferred token budgets", () => {
   const tool = createWorkflowTool();
   const description = parameterDescription(tool, "tokenBudget");
 
-  assert.equal(
-    description,
-    "Optional user-requested soft spend gate, not a planning target. Do not set `tokenBudget` unless the user explicitly supplies a cap or asks you to choose one; never infer or invent one from task size. If omitted, the configured `defaultTokenBudget` applies; without one, the run is unlimited. Reaching the gate blocks later `agent()` calls; concurrent in-flight work can overshoot.",
-  );
+  assert.equal(description, "User-requested soft cap; omit otherwise.");
+  assert.doesNotMatch(description, /never|do not/i);
 });
 
 test("createWorkflowTool schema exposes resource controls and large-fan-out authority", () => {
   const tool = createWorkflowTool();
 
-  assert.match(parameterDescription(tool, "concurrency"), /Maximum concurrent agents/i);
-  assert.match(parameterDescription(tool, "agentRetries"), /Retry attempts/i);
-  assert.match(parameterDescription(tool, "maxAgents"), /1000.*safety ceiling, not a target/i);
-  assert.match(parameterDescription(tool, "maxAgents"), /lower limit.*dynamic or exploratory fan-out/i);
-  assert.match(parameterDescription(tool, "maxAgents"), /large fan-outs.*explicit user intent/i);
+  assert.equal(parameterDescription(tool, "concurrency"), "Maximum concurrent calls.");
+  assert.equal(parameterDescription(tool, "agentRetries"), "Retries per agent() call.");
+  assert.equal(parameterDescription(tool, "maxAgents"), "Maximum agent() calls.");
 });
 
 test("createWorkflowTool invalid args throws descriptive error", () => {
@@ -232,10 +179,10 @@ test("createWorkflowTool does not add configured model IDs to permanent guidance
   manager.setModelRegistry(fakeRegistry([{ provider: "router", id: "private-model" }]));
   const tool = createWorkflowTool({ cwd: "/tmp", manager });
 
-  assert.doesNotMatch(tool.promptGuidelines.join(" "), /router\/private-model/);
+  assert.doesNotMatch(JSON.stringify(tool), /router\/private-model/);
 
   manager.setModelRegistry(fakeRegistry([{ provider: "router", id: "later-private-model" }]));
-  assert.doesNotMatch(tool.promptGuidelines.join(" "), /router\/later-private-model/);
+  assert.doesNotMatch(JSON.stringify(tool), /router\/later-private-model/);
 });
 
 // ─── prepareArguments / normalizeWorkflowScript ─────────────────────────────────
@@ -331,7 +278,7 @@ function withToolTempCwd(fn: (cwd: string) => Promise<void>) {
 }
 
 test("workflowToolSchema exposes resumeFromRunId, script, and name as optional at the schema level", () => {
-  const tool = createWorkflowTool();
+  const tool = createWorkflowTool({ allowResume: true });
   const schema = tool.parameters as { properties: Record<string, unknown>; required?: string[] };
   assert.ok(schema.properties.resumeFromRunId, "resumeFromRunId should be a schema property");
   assert.ok(schema.properties.name, "name should be a schema property");
@@ -343,11 +290,67 @@ test("workflowToolSchema exposes resumeFromRunId, script, and name as optional a
   assert.ok(!(schema.required ?? []).includes("resumeFromRunId"), "resumeFromRunId is optional");
 });
 
+test("extension-facing workflow schema is start-only", () => {
+  const tool = createWorkflowTool({ allowResume: false, exposeAdvancedParameters: false, modelFacing: true });
+  const schema = tool.parameters as { properties: Record<string, unknown>; required?: string[] };
+
+  assert.equal(tool.name, "start_workflow");
+  assert.equal(schema.properties.resumeFromRunId, undefined, "extension surface must not advertise resume");
+  for (const field of [
+    "maxAgents",
+    "concurrency",
+    "agentRetries",
+    "agentTimeoutMs",
+    "workflowTimeoutMs",
+    "tokenBudget",
+  ]) {
+    assert.equal(schema.properties[field], undefined, `extension surface must not advertise ${field}`);
+  }
+  assert.ok(schema.properties.preset, "extension surface should expose curated presets, not arbitrary names");
+  assert.equal(schema.properties.name, undefined, "extension surface must not accept arbitrary saved/run names");
+  assert.equal((tool.parameters as Record<string, unknown>).additionalProperties, false);
+  assert.equal(tool.promptGuidelines, undefined);
+  assert.match(tool.description, /existing runs use \/workflows/i);
+  const prepared = tool.prepareArguments?.({ script: "await agent('inspect', { label: 'inspect' })" }) as {
+    script: string;
+  };
+  assert.match(prepared.script, /^export const meta =/);
+  assert.throws(
+    () => tool.prepareArguments?.({ script: resumeToolScript, resumeFromRunId: "run-1" }),
+    /unsupported field|starts a new run.*workflows/i,
+  );
+  assert.throws(
+    () => tool.prepareArguments?.({ script: resumeToolScript, workflowTimeoutMs: 1 }),
+    /unsupported field/i,
+  );
+  assert.throws(() => tool.prepareArguments?.({ preset: "run-old-a" }), /preset.*one of/i);
+});
+
+test(
+  "extension-facing start keeps the main model turn alive for a normal acknowledgement",
+  withToolTempCwd(async (cwd) => {
+    const manager = new WorkflowManager({ cwd, agent: toolFakeAgent() });
+    const tool = createWorkflowTool({
+      cwd,
+      manager,
+      allowResume: false,
+      exposeAdvancedParameters: false,
+      modelFacing: true,
+    });
+
+    const result = await tool.execute("model-start", { script: resumeToolScript }, undefined, undefined, undefined);
+    assert.notEqual(result.terminate, true, "start_workflow must not terminate the main model turn");
+    const details = result.details as { runId?: string; background?: boolean };
+    assert.ok(details.runId);
+    assert.equal(details.background, true);
+  }),
+);
+
 test(
   "workflow tool: resumeFromRunId pointing at a nonexistent run errors and creates no new run",
   withToolTempCwd(async (cwd) => {
     const manager = new WorkflowManager({ cwd, agent: toolFakeAgent() });
-    const tool = createWorkflowTool({ cwd, manager });
+    const tool = createWorkflowTool({ cwd, manager, allowResume: true });
     await assert.rejects(
       () =>
         tool.execute(
@@ -367,7 +370,7 @@ test(
   "workflow tool: resumeFromRunId pointing at a completed run errors clearly",
   withToolTempCwd(async (cwd) => {
     const manager = new WorkflowManager({ cwd, agent: toolFakeAgent() });
-    const tool = createWorkflowTool({ cwd, manager });
+    const tool = createWorkflowTool({ cwd, manager, allowResume: true });
     // Create + complete a run.
     const { runId, promise } = manager.startInBackground(resumeToolScript);
     await promise;
@@ -385,7 +388,7 @@ test(
     const da = deferredToolAgent();
     const manager = new WorkflowManager({ cwd, agent: da.runner });
     manager.on("error", () => {});
-    const tool = createWorkflowTool({ cwd, manager });
+    const tool = createWorkflowTool({ cwd, manager, allowResume: true });
     const { runId, promise } = manager.startInBackground(resumeToolScript);
     await new Promise((r) => setTimeout(r, 20));
     assert.equal(manager.getRun(runId)?.status, "running");
@@ -402,16 +405,18 @@ test(
   "workflow tool: omitting resumeFromRunId preserves new-run background behavior",
   withToolTempCwd(async (cwd) => {
     const manager = new WorkflowManager({ cwd, agent: toolFakeAgent() });
-    const tool = createWorkflowTool({ cwd, manager });
+    const tool = createWorkflowTool({ cwd, manager, allowResume: true });
     const res = await tool.execute("t4", { script: resumeToolScript }, undefined, undefined, undefined);
     const details = res.details as { runId?: string; background?: boolean; resumedFrom?: string };
     assert.ok(details.runId, "a new run id should be returned");
     assert.equal(details.background, true);
     assert.equal(details.resumedFrom, undefined, "a fresh run is not a resume");
+    assert.equal(res.terminate, true, "starting a detached run terminates the current model turn");
     assert.equal(manager.listRuns().length, 1, "exactly one new run created");
-    // The returned text advertises the revise/iterate path.
+    // The compact result ends the turn and leaves revision guidance on demand.
     const text = res.content?.[0]?.type === "text" ? res.content[0].text : "";
-    assert.match(text, /resumeFromRunId/, "background text tells the model how to iterate");
+    assert.match(text, /result returns automatically/i);
+    assert.doesNotMatch(text, /resumeFromRunId/, "background acknowledgement stays lean");
   }),
 );
 
@@ -437,7 +442,7 @@ test(
     });
     manager.on("paused", () => {});
     manager.on("error", () => {});
-    const tool = createWorkflowTool({ cwd, manager });
+    const tool = createWorkflowTool({ cwd, manager, allowResume: true });
 
     const v1 = `export const meta = { name: 'iter', description: 'two' }
 const a = await agent('FIRST', { label: 'first' })
@@ -457,8 +462,9 @@ return { a, b }`;
     const details = res.details as { runId?: string; resumedFrom?: string };
     assert.equal(details.runId, runId, "resumed run keeps the same run id");
     assert.equal(details.resumedFrom, runId);
+    assert.equal(res.terminate, true, "resuming a detached run terminates the current model turn");
     const text = res.content?.[0]?.type === "text" ? res.content[0].text : "";
-    assert.match(text, new RegExp(`resumed from run ${runId}`), "text names the resumed run");
+    assert.ok(text.includes(`resumed (run ${runId})`), "text names the resumed run");
 
     await new Promise((r) => setTimeout(r, 80));
     const finalRun = manager.getRun(runId);
@@ -487,7 +493,7 @@ test(
   withToolTempCwd(async (cwd) => {
     const manager = new WorkflowManager({ cwd, agent: toolFakeAgent("ok") });
     manager.on("error", () => {});
-    const tool = createWorkflowTool({ cwd, manager });
+    const tool = createWorkflowTool({ cwd, manager, allowResume: true });
 
     for (const name of BUILTIN_WORKFLOW_NAMES) {
       const res = await tool.execute(
@@ -559,6 +565,35 @@ test(
 );
 
 test(
+  "model-facing workflow preset cannot be shadowed by a saved workflow",
+  withToolTempCwd(async (cwd) => {
+    const storage = createWorkflowStorage(cwd);
+    storage.save({
+      name: "deep-research",
+      description: "saved shadow",
+      script: "export const meta = { name: 'shadow', description: 'shadow' }\nreturn 1",
+    });
+    const manager = new WorkflowManager({ cwd, agent: toolFakeAgent("ok") });
+    manager.on("error", () => {});
+    const tool = createWorkflowTool({ cwd, manager, storage, modelFacing: true, exposeAdvancedParameters: false });
+
+    const res = await tool.execute(
+      "preset-shadow-fence",
+      { preset: "deep-research", args: { question: "what is pi?" } },
+      undefined,
+      undefined,
+      undefined,
+    );
+    const runId = (res.details as { runId?: string }).runId;
+    assert.ok(runId);
+    const managed = manager.getRun(runId);
+    assert.equal(managed?.snapshot.name, "deep_research");
+    assert.equal(managed?.toolset, "web-research");
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }),
+);
+
+test(
   "workflow tool: an unknown `name` throws a clear error naming the built-ins",
   withToolTempCwd(async (cwd) => {
     const manager = new WorkflowManager({ cwd, agent: toolFakeAgent("ok") });
@@ -586,7 +621,7 @@ test(
   "workflow tool: `name` cannot be combined with `resumeFromRunId`",
   withToolTempCwd(async (cwd) => {
     const manager = new WorkflowManager({ cwd, agent: toolFakeAgent("ok") });
-    const tool = createWorkflowTool({ cwd, manager });
+    const tool = createWorkflowTool({ cwd, manager, allowResume: true });
     await assert.rejects(
       () =>
         tool.execute(

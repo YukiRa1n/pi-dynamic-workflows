@@ -1,4 +1,4 @@
-import { type CreateAgentSessionOptions, ModelRegistry, ModelRuntime, type ToolDefinition } from "@earendil-works/pi-coding-agent";
+import { type CreateAgentSessionOptions, ModelRegistry, ModelRuntime, type ResourceDiagnostic, type Skill, type ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { Static, TSchema } from "typebox";
 import { type AgentHistoryEntry } from "./agent-history.js";
 import { type ModelTierConfig, type RankableModel } from "./model-tier-config.js";
@@ -286,13 +286,12 @@ export interface AgentRunOptions<TSchemaDef extends TSchema | undefined = undefi
 }
 export type AgentRunResult<TSchemaDef extends TSchema | undefined> = TSchemaDef extends TSchema ? Static<TSchemaDef> : string;
 /**
- * Orchestration tools ALWAYS denied to workflow subagents. The `workflow` and
- * `workflow_control` tools are registered globally by the extension, so — unless
- * excluded — a subagent's session sees them and can start its own independent
- * background workflows. Those nested runs recursively fan out and are NOT bounded
- * by the parent run's maxAgents / concurrency / progress / accounting, and can
- * drain a shared provider quota and pile up paused runs (#107). Callers may deny
- * additional tool names via WorkflowAgentOptions.excludeTools.
+ * Orchestration tools always denied to workflow subagents. The stock extension
+ * exposes only `start_workflow`, but embedders may also register the library,
+ * lifecycle, or steering tools. Nested background runs would escape the parent's
+ * limits and accounting,
+ * so all known orchestration names remain fail-closed here. Callers may deny
+ * additional names via WorkflowAgentOptions.excludeTools.
  */
 export declare const DEFAULT_EXCLUDED_SUBAGENT_TOOLS: string[];
 /**
@@ -303,6 +302,13 @@ export declare const DEFAULT_EXCLUDED_SUBAGENT_TOOLS: string[];
  * that only asserts the constant. The SDK dedupes, so overlap is harmless.
  */
 export declare function subagentExcludedTools(extra?: string[], sessionExclude?: string[]): string[];
+export declare function filterBundledWorkflowSkills(base: {
+    skills: Skill[];
+    diagnostics: ResourceDiagnostic[];
+}): {
+    skills: Skill[];
+    diagnostics: ResourceDiagnostic[];
+};
 export declare class WorkflowAgent {
     private readonly cwd;
     private readonly baseTools;
@@ -348,11 +354,14 @@ export declare class WorkflowAgent {
      * run the cleanup — the dominant #109 leak, and one our own extension
      * (UsageLimitScheduler) can trigger.
      *
-     * `noExtensions: true` skips loading host extensions; skills, prompts, and
-     * AGENTS.md context still load. The subagent keeps the tools this workflow
-     * hands it via `customTools` (coding tools + any toolset like web-research) —
-     * those are unaffected. What it loses is HOST EXTENSION-REGISTERED tools (MCP
-     * bridges, browser tools, anything a host extension added via ctx.registerTool):
+     * `noExtensions: true` skips loading host extensions; user/project skills,
+     * prompts, and AGENTS.md context still load. The two package-owned workflow
+     * guidance skills are filtered by `skillsOverride` below because they describe
+     * a host-only workflow tool surface. The subagent keeps the tools this
+     * workflow hands it via `customTools` (coding tools + any toolset like
+     * web-research) — those are unaffected. What it loses is HOST
+     * EXTENSION-REGISTERED tools (MCP bridges, browser tools, anything a host
+     * extension added via ctx.registerTool):
      * pre-change a subagent session inherited those from the full host extension
      * set, now it does not, so an agentType `tools` allowlist naming one matches
      * nothing. This is a deliberate trade-off — it also structurally kills recursive

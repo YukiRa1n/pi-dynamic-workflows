@@ -28,6 +28,8 @@ function harness(
   const notified: Array<{ message: string; type?: string }> = [];
   const calls: string[] = [];
   const activeTools = [...initialTools];
+  let setActiveToolsCalls = 0;
+  const eventHandlers = new Map<string, Array<(...args: any[]) => void>>();
   let handler: Handler | undefined;
 
   const pi: Partial<ExtensionAPI> = {
@@ -43,7 +45,13 @@ function harness(
       }),
     getActiveTools: () => [...activeTools],
     setActiveTools: (toolNames: string[]) => {
+      setActiveToolsCalls++;
       activeTools.splice(0, activeTools.length, ...toolNames);
+    },
+    on: (event: string, eventHandler: (...args: any[]) => void) => {
+      const handlers = eventHandlers.get(event) ?? [];
+      handlers.push(eventHandler);
+      eventHandlers.set(event, handlers);
     },
   };
 
@@ -76,7 +84,21 @@ function harness(
     if (!handler) throw new Error("command not registered");
     return handler(args, ctx);
   };
-  return { run, printed, sent, notified, calls, activeTools };
+  const emit = (event: string, ...args: any[]) => {
+    for (const eventHandler of eventHandlers.get(event) ?? []) eventHandler(...args);
+  };
+  return {
+    run,
+    emit,
+    printed,
+    sent,
+    notified,
+    calls,
+    activeTools,
+    get setActiveToolsCalls() {
+      return setActiveToolsCalls;
+    },
+  };
 }
 
 test("/workflows list shows empty hint when no runs", async () => {
@@ -104,17 +126,22 @@ test("/workflows run without prompt warns usage", async () => {
 });
 
 test("/workflows run <prompt> sends a forced workflow follow-up turn", async () => {
-  const h = harness();
+  const h = harness({}, {}, ["bash", "read"]);
   await h.run("run audit auth boundaries");
   assert.equal(h.sent.length, 1);
   assert.equal(h.sent[0].customType, "workflow-run");
   // #P5: /workflows run is an explicit command → forcing directive (no question-escape).
   assert.equal(h.sent[0].content, buildForcedWorkflowPrompt("audit auth boundaries"));
   assert.doesNotMatch(h.sent[0].content ?? "", /answer it directly and stay/i, "no question-answer escape");
-  assert.match(h.sent[0].content ?? "", /Call the `workflow` tool now/i, "forces the tool call");
+  assert.match(
+    h.sent[0].content ?? "",
+    /\[Workflow command: call `start_workflow` for this request\.\]/i,
+    "forces the tool call",
+  );
   assert.equal(h.sent[0].options?.triggerTurn, true);
   assert.equal(h.sent[0].options?.deliverAs, "followUp");
-  assert.deepEqual(h.activeTools, [WORKFLOW_TOOL_NAME], "does not duplicate an already-active workflow tool");
+  assert.deepEqual(h.activeTools, ["bash", "read"]);
+  assert.equal(h.setActiveToolsCalls, 0);
 });
 
 test("/workflows run <prompt> notifies error when sendMessage rejects and does not bubble", async () => {
@@ -129,11 +156,37 @@ test("/workflows run <prompt> notifies error when sendMessage rejects and does n
   );
 });
 
-test("/workflows run adds the workflow tool when absent and does not depend on the keyword trigger", async () => {
-  const h = harness({}, {}, ["bash", "read"]);
-  await h.run("run summarize the auth module");
-  assert.deepEqual(h.activeTools, ["bash", "read", WORKFLOW_TOOL_NAME]);
-  assert.equal(h.sent[0].content, buildForcedWorkflowPrompt("summarize the auth module"));
+test("/workflows run restores tools immediately when follow-up delivery fails", async () => {
+  const h = harness({}, {}, ["bash", "read"], async () => {
+    throw new Error("send failed");
+  });
+  await h.run("run audit auth");
+  assert.deepEqual(h.activeTools, ["bash", "read"]);
+  assert.equal(h.setActiveToolsCalls, 0);
+});
+
+test("/workflows steer queues a message for an active run's next safe point", async () => {
+  const queued: Array<{ message: string; runId: string; kind: string }> = [];
+  const h = harness({
+    enqueueUserMessage: (message: string, runId: string, kind: string) => {
+      if (runId !== "run-live") return undefined;
+      queued.push({ message, runId, kind });
+      return runId;
+    },
+  });
+
+  await h.run("steer run-live blocker_answer The auth endpoint moved to src/auth.ts");
+
+  assert.deepEqual(queued, [
+    {
+      message: "The auth endpoint moved to src/auth.ts",
+      runId: "run-live",
+      kind: "blocker_answer",
+    },
+  ]);
+  assert.equal(h.notified.at(-1)?.type, "info");
+  assert.match(h.notified.at(-1)?.message ?? "", /next child-call safe point/i);
+  assert.equal(h.setActiveToolsCalls, 0);
 });
 
 test("/workflows run carries standing effort directives", async () => {
@@ -231,6 +284,100 @@ test("/workflows status watches a running run: live status bar + prints on compl
   manager.emit("complete", { runId: "run-1" });
   assert.equal(printed.length, 1, "prints final snapshot on completion");
   assert.ok(statusLine.includes(undefined), "clears the status line");
+});
+
+test("/workflows status watcher treats deletion as terminal and removes its listeners", async () => {
+  const snapshot = {
+    name: "demo",
+    phases: [],
+    logs: [],
+    agents: [{ id: 1, label: "a", status: "running", prompt: "x" }],
+    agentCount: 1,
+    runningCount: 1,
+    doneCount: 0,
+    errorCount: 0,
+  };
+  const manager: any = new EventEmitter();
+  let present = true;
+  manager.getRun = (id: string) =>
+    present && id === "run-deleted" ? { runId: id, status: "running", snapshot } : undefined;
+  manager.getSnapshot = () => null;
+  manager.listRuns = () => [];
+
+  const statusLine: Array<string | undefined> = [];
+  const printed: string[] = [];
+  let handler: ((a: string, c: any) => Promise<void>) | undefined;
+  const pi: any = {
+    getCommands: () => [],
+    registerCommand: (_n: string, o: any) => {
+      handler = o.handler;
+    },
+    sendMessage: async (m: any) => printed.push(m.content),
+  };
+  registerWorkflowCommands(pi as unknown as ExtensionAPI, manager as unknown as WorkflowManager);
+  const ctx = { ui: { notify: () => {}, setStatus: (_k: string, t?: string) => statusLine.push(t) } };
+
+  assert.ok(handler);
+  await handler("watch run-deleted", ctx);
+  assert.ok(statusLine.some((value) => typeof value === "string"));
+
+  present = false;
+  manager.emit("deleted", { runId: "run-deleted" });
+  assert.ok(statusLine.includes(undefined), "deletion must clear the status bar");
+  assert.equal(printed.length, 0, "deletion must not print a stale final snapshot");
+
+  // The finish handler must have detached itself; a later terminal event is
+  // harmless and cannot print a second notification.
+  manager.emit("complete", { runId: "run-deleted" });
+  assert.equal(printed.length, 0);
+  assert.equal(statusLine.filter((value) => value === undefined).length, 1);
+});
+
+test("/workflows status watcher releases old session UI and manager listeners on shutdown", async () => {
+  const snapshot = {
+    name: "demo",
+    phases: [],
+    logs: [],
+    agents: [{ id: 1, label: "a", status: "running", prompt: "x" }],
+    agentCount: 1,
+    runningCount: 1,
+    doneCount: 0,
+    errorCount: 0,
+  };
+  const manager: any = new EventEmitter();
+  manager.getRun = (id: string) => (id === "run-shutdown" ? { runId: id, status: "running", snapshot } : undefined);
+  manager.getSnapshot = () => null;
+  manager.listRuns = () => [];
+
+  const lifecycle = new Map<string, Array<(...args: any[]) => void>>();
+  const statusLine: Array<string | undefined> = [];
+  const printed: string[] = [];
+  let handler: ((a: string, c: any) => Promise<void>) | undefined;
+  const pi: any = {
+    getCommands: () => [],
+    registerCommand: (_n: string, o: any) => {
+      handler = o.handler;
+    },
+    on: (event: string, callback: (...args: any[]) => void) => {
+      const callbacks = lifecycle.get(event) ?? [];
+      callbacks.push(callback);
+      lifecycle.set(event, callbacks);
+    },
+    sendMessage: async (m: any) => printed.push(m.content),
+  };
+  registerWorkflowCommands(pi as unknown as ExtensionAPI, manager as unknown as WorkflowManager);
+  const ctx = { ui: { notify: () => {}, setStatus: (_k: string, text?: string) => statusLine.push(text) } };
+
+  assert.ok(handler);
+  await handler("status run-shutdown", ctx);
+  assert.ok(manager.listenerCount("agentStart") > 0);
+  for (const callback of lifecycle.get("session_shutdown") ?? []) callback({ reason: "reload" });
+  assert.equal(manager.listenerCount("agentStart"), 0);
+  assert.equal(manager.listenerCount("complete"), 0);
+  assert.ok(statusLine.includes(undefined));
+
+  manager.emit("complete", { runId: "run-shutdown" });
+  assert.equal(printed.length, 0, "the old session must not receive a late workflow status message");
 });
 
 // ═══════════════════════════════════════════════════════════════════════════

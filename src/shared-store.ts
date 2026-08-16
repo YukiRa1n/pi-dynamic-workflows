@@ -328,18 +328,24 @@ function positiveLimit(value: number | undefined, fallback: number): number {
  * Used internally by `runWorkflow` so each agent's puts are tracked in the
  * store's delta journal and can be replayed additively on resume.
  */
-export function createAgentStoreTools(store: SharedStore, deltaKey: string): ToolDefinition[] {
+export function createAgentStoreTools(
+  store: SharedStore,
+  deltaKey: string,
+  isAdmitted?: () => boolean,
+): ToolDefinition[] {
+  const assertAdmitted = () => {
+    if (isAdmitted && !isAdmitted()) throw new Error("workflow attempt is no longer admitted");
+  };
   const storePut = defineTool({
     name: "store_put",
     label: "Store Put",
-    description:
-      "Write a value to the shared run store. Any other agent in this workflow run can read it with store_get. Overwrites any existing value for the key. Note: when two parallel agents write the same key, the last write wins — no merge is performed.",
-    promptSnippet: "Write a value to the shared store",
+    description: "Write a JSON value by key.",
     parameters: Type.Object({
-      key: Type.String({ description: "The key to store the value under." }),
-      value: Type.Any({ description: "The value to store (any JSON-serializable value)." }),
+      key: Type.String({ description: "Store key." }),
+      value: Type.Any({ description: "JSON value." }),
     }),
     async execute(_id: string, params: { key: string; value: unknown }) {
+      assertAdmitted();
       store.trackPut(params.key, params.value, deltaKey);
       return {
         content: [{ type: "text", text: `Stored value under key "${params.key}".` }],
@@ -351,13 +357,12 @@ export function createAgentStoreTools(store: SharedStore, deltaKey: string): Too
   const storeGet = defineTool({
     name: "store_get",
     label: "Store Get",
-    description:
-      "Read a value from the shared run store previously written by store_put. Returns the stored value, or null when the key does not exist.",
-    promptSnippet: "Read a value from the shared store",
+    description: "Read a JSON value by key; null if absent.",
     parameters: Type.Object({
-      key: Type.String({ description: "The key to read." }),
+      key: Type.String({ description: "Store key." }),
     }),
     async execute(_id: string, params: { key: string }) {
+      assertAdmitted();
       // Reads are fenced too: a timed-out attempt must not observe a retry's
       // state and continue acting on it after its own delta window retired.
       store.assertDeltaLive(deltaKey);

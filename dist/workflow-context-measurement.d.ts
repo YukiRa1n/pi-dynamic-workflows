@@ -28,14 +28,31 @@ interface ByteSurface {
 export interface SkillDiscoverySurface extends ByteSurface {
     root: string;
 }
+export interface ToolDefinitionSurface extends ByteSurface {
+    name: string;
+}
 /** Versioned byte measurements for always-on, discovery, corpus, and representative authoring surfaces. */
 export interface WorkflowContextMeasurement {
-    formatVersion: 3;
+    formatVersion: 7;
     encoding: "utf8";
-    sources: ["src/workflow-tool.ts", "skills/workflow-authoring", "package.json#pi.skills"];
+    sources: ["src/workflow-tool.ts", "src/workflow-editor.ts", "skills/workflow-authoring", "package.json#pi.skills"];
     surfaces: {
+        /** Stable Pi system-prompt contribution from the workflow tool. */
         permanentWorkflowPrompt: ByteSurface;
+        /** Stable provider definition for the single start-only workflow tool. */
         providerVisibleWorkflowToolDefinition: ByteSurface;
+        /** Workflow definitions present on every ordinary turn. */
+        providerVisibleAlwaysOnToolDefinitions: ByteSurface & {
+            tools: ToolDefinitionSurface[];
+        };
+        /** Package-owned suffix appended by heuristic workflow arming. */
+        armedWorkflowPromptRewrite: ByteSurface;
+        /** Package-owned suffix appended by the explicit /workflows run command. */
+        forcedWorkflowPromptRewrite: ByteSurface;
+        /** Stable system-prompt and provider-tool bytes owned by the package. */
+        stableWorkflowOwnedContext: ByteSurface;
+        /** Stable bytes plus the suffix for one explicit workflow request. */
+        explicitWorkflowRequestOwnedContext: ByteSurface;
         /**
          * Every skill this package registers (package.json's `pi.skills` — read
          * from disk, not hardcoded here) contributes an always-on discovery entry

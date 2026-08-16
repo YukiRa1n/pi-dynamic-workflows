@@ -17,7 +17,7 @@ export interface OptionDescriptor {
 }
 /** Reusable option group referenced by capability descriptors. */
 export interface OptionShape {
-    id: "agent-options" | "checkpoint-options" | "phase-options" | "verify-options" | "judge-panel-options" | "loop-until-dry-options" | "retry-options" | "gate-options";
+    id: "agent-options" | "checkpoint-options" | "phase-options" | "verify-options" | "judge-panel-options" | "loop-until-dry-options" | "retry-options" | "gate-options" | "classified-delivery";
     options: readonly OptionDescriptor[];
 }
 /** Authoritative declaration of one workflow capability and its evidence. */

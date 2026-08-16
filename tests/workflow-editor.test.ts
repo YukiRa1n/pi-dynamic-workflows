@@ -158,14 +158,82 @@ describe("hasTrigger", () => {
   });
 });
 
+describe("hasWorkflowRequestTrigger", () => {
+  it("arms explicit workflow requests, including compact CJK phrasing", async () => {
+    const { hasWorkflowRequestTrigger } = await load();
+    for (const text of [
+      "run a workflow to audit the repository",
+      "workflow: review the lifecycle",
+      "workflow audit the resource manager",
+      "用workflow审查生命周期",
+      "请用 workflow 并行检查内存泄漏",
+    ]) {
+      assert.equal(hasWorkflowRequestTrigger(text), true, `${text} should arm`);
+    }
+  });
+
+  it("does not arm ordinary discussion or debugging of the workflow feature", async () => {
+    const { hasWorkflowRequestTrigger } = await load();
+    for (const text of [
+      "the workflow tool is slow",
+      "why does workflow use so much prompt context?",
+      "Discuss workflows as a normal topic.",
+      "解释一下 workflow 是什么",
+      "修复 workflow 插件的 bug",
+    ]) {
+      assert.equal(hasWorkflowRequestTrigger(text), false, `${text} should stay direct`);
+    }
+  });
+
+  it("treats an exact custom trigger word as the user's configured opt-in", async () => {
+    const { hasWorkflowRequestTrigger } = await load();
+    assert.equal(hasWorkflowRequestTrigger("pi-workflow inspect this", "pi-workflow"), true);
+    assert.equal(hasWorkflowRequestTrigger("inspect this directly", "pi-workflow"), false);
+  });
+});
+
+describe("hasExplicitWorkflowSteerRequest", () => {
+  it("requires both a generated run ID and explicit same-run continuation language", async () => {
+    const { hasExplicitWorkflowSteerRequest } = await load();
+    assert.equal(
+      hasExplicitWorkflowSteerRequest("continue workflow run audit-m1abc234-de5f67 with this correction"),
+      true,
+    );
+    assert.equal(hasExplicitWorkflowSteerRequest("修正工作流 audit-m1abc234-de5f67：路径应为 src/auth.ts"), true);
+    assert.equal(hasExplicitWorkflowSteerRequest("build a new workflow for the auth module"), false);
+    assert.equal(hasExplicitWorkflowSteerRequest("continue the old workflow"), false);
+    assert.equal(hasExplicitWorkflowSteerRequest("what does workflow_steer do?"), false);
+  });
+});
+
+describe("hasExplicitWorkflowControlRequest", () => {
+  it("recognizes explicit lifecycle requests without activating on status or ordinary work", async () => {
+    const { hasExplicitWorkflowControlRequest } = await load();
+    for (const text of [
+      "pause workflow run audit-m1abc234-de5f67",
+      "resume the workflow",
+      "stop run audit-m1abc234-de5f67",
+      "取消工作流 audit-m1abc234-de5f67",
+    ]) {
+      assert.equal(hasExplicitWorkflowControlRequest(text), true, `${text} should expose lifecycle control`);
+    }
+    for (const text of [
+      "show workflow status",
+      "continue workflow run audit-m1abc234-de5f67 with this correction",
+      "implement a new auth requirement",
+      "what does workflow_control do?",
+    ]) {
+      assert.equal(hasExplicitWorkflowControlRequest(text), false, `${text} should not expose lifecycle control`);
+    }
+  });
+});
+
 // Regression corpus (#88): the lexical arm must not fire on identifiers, paths,
 // URLs, or hyphen/camelCase compounds that merely embed the letters "workflow".
 // Two layers matter, so we test both (as the redesign intends):
 //  (1) hasTrigger — the LEXICAL arm. It fires ONLY on the bounded standalone word.
-//  (2) the armed DIRECTIVE — for the one case that legitimately IS the bare word in
-//      a sentence ("the workflow tool is slow"), the lexical arm does fire, but the
-//      banner LEADS with "if it's just talk about the tool, answer directly", so the
-//      model is not pushed into a workflow. That layered behavior is the whole point.
+//  (2) the provider-facing arm — only an explicit workflow request receives the
+//      short marker. Discussion and debugging stay unchanged.
 describe("trigger regression corpus (#88 boundaries)", () => {
   const NON_ARMING = [
     "https://github.com/x/pi-dynamic-workflows", // URL: preceded by "-", inside a path
@@ -196,16 +264,15 @@ describe("trigger regression corpus (#88 boundaries)", () => {
     }
   });
 
-  it("natural English 'the workflow tool is slow' arms lexically but the banner routes it to a direct answer", async () => {
-    const { hasTrigger, buildArmedWorkflowPrompt } = await load();
-    // Honest: the bare word IS a standalone token here, so the lexical arm fires.
+  it("keeps ordinary workflow discussion unchanged even though it is lexically bounded", async () => {
+    const { hasTrigger, hasWorkflowRequestTrigger, buildArmedWorkflowPrompt } = await load();
+    // The bare word is a standalone token, but it is not a workflow request.
     assert.equal(hasTrigger("the workflow tool is slow"), true);
-    // But the armed banner leads with the decision boundary, so a "talk about the
-    // tool" turn is answered directly rather than forced into a workflow.
-    const armed = buildArmedWorkflowPrompt("the workflow tool is slow", { reason: "keyword" });
-    assert.match(armed, /answer it directly and stay/i);
-    assert.match(armed, /arming authorizes the tool, it does not force it/i);
-    assert.ok(!/\bMUST\b/.test(armed));
+    assert.equal(hasWorkflowRequestTrigger("the workflow tool is slow"), false);
+    assert.equal(
+      buildArmedWorkflowPrompt("the workflow tool is slow"),
+      "the workflow tool is slow\n\n[Workflow requested.]",
+    );
   });
 });
 
@@ -256,52 +323,19 @@ describe("buildArmedWorkflowPrompt", () => {
     assert.ok(result.startsWith("hello world"), "should start with hello world");
   });
 
-  it("arms (authorizes) rather than forces — no MUST/ONLY/'Do NOT answer' language", async () => {
+  it("uses one compact explicit-request marker", async () => {
     const { buildArmedWorkflowPrompt } = await load();
     const result = buildArmedWorkflowPrompt("test");
-    assert.ok(result.includes("workflows mode armed"), "should announce armed mode");
-    assert.ok(result.includes("`workflow` tool"), "should still name the workflow tool");
-    assert.ok(!/\bMUST\b/.test(result), "must not force with MUST");
-    assert.ok(!/ONLY acceptable/i.test(result), "must not force with 'ONLY acceptable'");
-    assert.ok(!/Do NOT (instead|answer)/i.test(result), "must not forbid answering directly");
-    assert.ok(
-      result.includes("answer it directly") || result.includes("does not force"),
-      "should permit answering a question directly",
-    );
+    assert.equal(result, "test\n\n[Workflow requested.]");
+    assert.ok(Buffer.byteLength(result.slice("test".length), "utf8") < 64, "per-turn marker stays lean");
   });
 
-  it("leads with the decision boundary, not with 'call the tool' (#P3)", async () => {
-    const { buildArmedWorkflowPrompt } = await load();
-    const result = buildArmedWorkflowPrompt("test");
-    const bannerStart = result.indexOf("[workflows mode armed");
-    assert.ok(bannerStart >= 0, "should have the armed banner");
-    const decideIdx = result.indexOf("Decide first");
-    const callToolIdx = result.indexOf("calling the `workflow` tool");
-    assert.ok(decideIdx >= 0, "should state the decision boundary");
-    assert.ok(callToolIdx >= 0, "should still tell it how to call the tool");
-    assert.ok(decideIdx < callToolIdx, "the decision boundary must come BEFORE the call-the-tool instruction");
-  });
-
-  it("carries the #89 background/deliver-back reassurance (no idle-at-prompt worry)", async () => {
-    const { buildArmedWorkflowPrompt } = await load();
-    const result = buildArmedWorkflowPrompt("test");
-    assert.match(result, /runs in the background/i);
-    assert.match(result, /delivered back into the conversation automatically/i);
-    assert.match(result, /that's expected, not a stall/i);
-    assert.doesNotMatch(result, /background:false|result inline/i);
-  });
-
-  it("states the truthful opt-in reason per path (keyword vs effort) (#P3)", async () => {
+  it("does not narrate trigger or effort state", async () => {
     const { buildArmedWorkflowPrompt } = await load();
     const keyword = buildArmedWorkflowPrompt("test", { reason: "keyword" });
-    assert.match(keyword, /you typed the workflow trigger word/i);
-    assert.doesNotMatch(keyword, /standing effort mode/i);
-
     const effort = buildArmedWorkflowPrompt("test", { reason: "effort" });
-    assert.match(effort, /standing effort mode armed this turn/i);
-    assert.match(effort, /you did not explicitly ask for a workflow/i);
-    // The effort path must NOT falsely claim the user typed the trigger word.
-    assert.doesNotMatch(effort, /you typed the workflow trigger word/i);
+    assert.equal(keyword, effort);
+    assert.doesNotMatch(effort, /standing effort|typed the workflow|answer directly/i);
   });
 
   it("defaults the reason to keyword when none is given", async () => {
@@ -325,39 +359,21 @@ describe("buildArmedWorkflowPrompt", () => {
     assert.ok(withExtra.includes("SENTINEL-DIRECTIVE"));
   });
 
-  it("is a multi-line string", async () => {
+  it("is a compact multi-line string", async () => {
     const { buildArmedWorkflowPrompt } = await load();
     const result = buildArmedWorkflowPrompt("test");
     assert.ok(result.includes("\n"), "should contain \n");
-    assert.ok(result.includes("---"), "should contain ---");
+    assert.doesNotMatch(result, /---|agent\(\)|parallel\(\)|pipeline\(\)/);
   });
 });
 
 describe("buildForcedWorkflowPrompt (/workflows run)", () => {
-  it("forces — no 'if it's a question just answer' escape (#P5)", async () => {
+  it("uses a compact explicit-command signal", async () => {
     const { buildForcedWorkflowPrompt } = await load();
     const result = buildForcedWorkflowPrompt("audit the repo");
     assert.ok(result.startsWith("audit the repo"), "starts with the original prompt");
-    assert.match(result, /\/workflows run/, "identifies the explicit command");
-    assert.match(result, /Call the `workflow` tool now/i, "tells the model to run the workflow");
-    // The forcing directive must NOT offer the question-answer escape the armed banner has.
-    assert.doesNotMatch(result, /just talk \(about workflows/i);
-    assert.doesNotMatch(result, /answer it directly and stay/i);
-    assert.match(result, /do not answer in prose instead of running the workflow/i);
-  });
-
-  it("still carries the #89 background/deliver-back reassurance", async () => {
-    const { buildForcedWorkflowPrompt } = await load();
-    const result = buildForcedWorkflowPrompt("audit the repo");
-    assert.match(result, /runs in the background/i);
-    assert.match(result, /delivered back into the conversation automatically/i);
-  });
-
-  it("does NOT reintroduce the MUST/ONLY forcing language that caused #88/#89", async () => {
-    const { buildForcedWorkflowPrompt } = await load();
-    const result = buildForcedWorkflowPrompt("audit the repo");
-    assert.ok(!/\bMUST\b/.test(result), "no MUST");
-    assert.ok(!/ONLY acceptable/i.test(result), "no 'ONLY acceptable'");
+    assert.match(result, /Workflow command: call `start_workflow` for this request/);
+    assert.ok(Buffer.byteLength(result.slice("audit the repo".length), "utf8") < 96);
   });
 
   it("appends the extra directive when provided", async () => {
@@ -372,22 +388,27 @@ describe("buildForcedWorkflowPrompt (/workflows run)", () => {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 describe("installWorkflowKeywordArming", () => {
-  it("registers input and turn_end event hooks", async () => {
+  it("registers only the input hook and never leases active tools", async () => {
     const mod = await load();
     const registered: Array<{ event: string }> = [];
+    let setActiveToolsCalls = 0;
     const pi = {
       on: (event: string, _handler: unknown) => {
         registered.push({ event });
       },
       getActiveTools: () => [],
-      setActiveTools: (_tools: string[]) => {},
+      setActiveTools: (_tools: string[]) => {
+        setActiveToolsCalls++;
+      },
     } as unknown as ExtensionAPI;
 
     mod.installWorkflowKeywordArming(pi, undefined, testSettingsOptions());
 
     const events = registered.map((r) => r.event);
     assert.ok(events.includes("input"), 'should register "input" hook');
-    assert.ok(events.includes("turn_end"), 'should register "turn_end" hook');
+    assert.ok(!events.includes("agent_settled"), 'must not register "agent_settled" for tool restoration');
+    assert.ok(!events.includes("turn_end"), 'must not register "turn_end" for tool restoration');
+    assert.equal(setActiveToolsCalls, 0);
   });
 
   it("registers /workflows-trigger and toggles the keyword trigger", async () => {
@@ -576,7 +597,7 @@ describe("installWorkflowKeywordArming", () => {
 
     const result = inputHandler({ source: "interactive", text: "Please run pi-workflow now." });
     assert.equal((result as { action?: string }).action, "transform");
-    assert.equal(setActiveToolsCalls, 1);
+    assert.equal(setActiveToolsCalls, 0);
   });
 
   it("keeps session trigger state when saving the preference fails", async () => {
@@ -618,35 +639,20 @@ describe("installWorkflowKeywordArming", () => {
     assert.match(sent.at(-1)?.content ?? "", /could not be saved/i);
   });
 
-  it("saves active tools and adds WORKFLOW_TOOL_NAME on triggered input", async () => {
+  it("transforms explicit requests without changing the active tool set", async () => {
     const mod = await load();
-    let savedTools: string[] = [];
-    const pi = {
-      on: (_event: string, _handler: unknown) => {},
-      getActiveTools: () => ["bash", "read"],
-      setActiveTools: (tools: string[]) => {
-        savedTools = tools;
-      },
-    } as unknown as ExtensionAPI;
-
-    mod.installWorkflowKeywordArming(pi, undefined, testSettingsOptions());
-
-    // Simulate the "input" event — find the registered handler
-    // We need to actually invoke the handler the install sets up.
-    // Re-implement the scenario more directly:
-
     const captured: Array<{ event: string; handler: (...args: unknown[]) => unknown }> = [];
+    let setActiveToolsCalls = 0;
     const pi2 = {
       on: (event: string, handler: (...args: unknown[]) => unknown) => {
         captured.push({ event, handler });
       },
       getActiveTools: () => ["bash", "read"],
-      setActiveTools: (tools: string[]) => {
-        savedTools = tools;
+      setActiveTools: () => {
+        setActiveToolsCalls++;
       },
     } as unknown as ExtensionAPI;
 
-    savedTools = [];
     mod.installWorkflowKeywordArming(pi2, undefined, testSettingsOptions());
 
     const inputHandler = captured.find((c) => c.event === "input")?.handler as
@@ -654,21 +660,17 @@ describe("installWorkflowKeywordArming", () => {
       | undefined;
     assert.notEqual(inputHandler, undefined, "input handler should be registered");
 
-    // Invoke with non-trigger text — should NOT save tools
+    // Ordinary discussion is unchanged.
     const resultNonTrigger = inputHandler?.({ source: "interactive", text: "hello world" });
     assert.deepEqual(resultNonTrigger, { action: "continue" }, "non-trigger input should return continue");
-    assert.deepEqual(savedTools, [], "tools should not change for non-trigger input");
+    assert.equal(setActiveToolsCalls, 0);
 
-    // Invoke with trigger text — should save and add WORKFLOW_TOOL_NAME
+    // An explicit request gets only the compact marker.
     const resultTrigger = inputHandler?.({ source: "interactive", text: "run a workflow test" });
     assert.ok(typeof resultTrigger === "object" && resultTrigger !== null, "should return a result object");
     assert.equal(resultTrigger.action, "transform", "should return transform action");
-    assert.ok(
-      typeof resultTrigger.text === "string" && resultTrigger.text.length > 0,
-      "should return transformed text",
-    );
-    assert.ok(resultTrigger.text?.includes("run a workflow test"), "transformed text should include original prompt");
-    assert.ok(savedTools.includes("workflow"), `saved tools (${savedTools.join(", ")}) should include "workflow"`);
+    assert.equal(resultTrigger.text, "run a workflow test\n\n[Workflow requested.]");
+    assert.equal(setActiveToolsCalls, 0);
   });
 
   it("does not transform keyword-triggered input when /workflows-trigger is off", async () => {
@@ -735,7 +737,7 @@ describe("installWorkflowKeywordArming", () => {
     assert.equal(state.suppressedKeywordText, undefined, "suppression should be consumed after one submit");
   });
 
-  it("transforms the same keyword input later when it was not just suppressed", async () => {
+  it("keeps ordinary workflow discussion direct after one-shot suppression is consumed", async () => {
     const mod = await load();
     const captured: Array<{ event: string; handler: (...args: unknown[]) => unknown }> = [];
     const pi = {
@@ -755,31 +757,26 @@ describe("installWorkflowKeywordArming", () => {
     assert.ok(inputHandler, "input handler should be registered");
     const result = inputHandler({ source: "interactive", text });
 
-    assert.deepEqual(result, {
-      action: "transform",
-      text: mod.buildArmedWorkflowPrompt(text),
-    });
+    assert.deepEqual(result, { action: "continue" });
   });
 
-  it("still transforms effort-armed input when the keyword trigger is off", async () => {
+  it("does not auto-route ordinary messages from standing effort mode", async () => {
     const mod = await load();
-    const { createEffortState, effortDirective } = await import("../src/effort-command.js");
+    const { createEffortState } = await import("../src/effort-command.js");
     const captured: Array<{ event: string; handler: (...args: unknown[]) => unknown }> = [];
     const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> }>();
     const effort = createEffortState();
     effort.level = "high";
-    let tools: string[] = [];
+    let setActiveToolsCalls = 0;
     const pi = {
-      on: (event: string, handler: (...args: unknown[]) => unknown) => {
-        captured.push({ event, handler });
-      },
+      on: (event: string, handler: (...args: unknown[]) => unknown) => captured.push({ event, handler }),
       registerCommand: (name: string, command: { handler: (args: string, ctx: unknown) => Promise<void> }) => {
         commands.set(name, command);
       },
       sendMessage: () => {},
       getActiveTools: () => ["bash", "read"],
-      setActiveTools: (next: string[]) => {
-        tools = next;
+      setActiveTools: () => {
+        setActiveToolsCalls++;
       },
     } as unknown as ExtensionAPI;
 
@@ -789,84 +786,8 @@ describe("installWorkflowKeywordArming", () => {
     const text = "Please discuss workflows as a normal topic.";
     const inputHandler = captured.find((h) => h.event === "input")?.handler;
     assert.ok(inputHandler, "input handler should be registered");
-    const result = inputHandler({ source: "interactive", text });
-
-    // The effort path arms on ANY substantive message, so its directive also
-    // carries the conversational-escape (skip the workflow on trivial turns) and
-    // states the truthful "effort" opt-in reason (not "the word you typed").
-    const effortExtra = [effortDirective("high"), mod.EFFORT_CONVERSATIONAL_ESCAPE].filter(Boolean).join(" ");
-    assert.deepEqual(result, {
-      action: "transform",
-      text: mod.buildArmedWorkflowPrompt(text, { reason: "effort", extraDirective: effortExtra }),
-    });
-    const transformed = (result as { text: string }).text;
-    assert.match(
-      transformed,
-      /skip the workflow and just respond directly/,
-      "effort path allows skipping the workflow",
-    );
-    assert.match(transformed, /standing effort mode armed this turn/i, "effort path states the truthful reason");
-    assert.ok(!/\bMUST\b/.test(transformed), "effort path must not force with MUST");
-    assert.ok(tools.includes(mod.WORKFLOW_TOOL_NAME), "effort mode should still add the workflow tool");
-  });
-
-  it("restores original tools on turn_end after a triggered turn", async () => {
-    const mod = await load();
-    const captured: Array<{ event: string; handler: (...args: unknown[]) => unknown }> = [];
-
-    let currentTools: string[] = ["bash", "read", "edit", "write"];
-    const pi = {
-      on: (event: string, handler: (...args: unknown[]) => unknown) => {
-        captured.push({ event, handler });
-      },
-      getActiveTools: () => [...currentTools],
-      setActiveTools: (tools: string[]) => {
-        currentTools = [...tools];
-      },
-    } as unknown as ExtensionAPI;
-
-    mod.installWorkflowKeywordArming(pi, undefined, testSettingsOptions());
-
-    const inputHandler = captured.find((c) => c.event === "input")?.handler;
-    const turnEndHandler = captured.find((c) => c.event === "turn_end")?.handler;
-    assert.notEqual(inputHandler, undefined, "input handler should be registered");
-    assert.notEqual(turnEndHandler, undefined, "turn_end handler should be registered");
-
-    const initialTools = ["bash", "read", "edit", "write"];
-
-    // First trigger: save tools and add "workflow"
-    inputHandler?.({ source: "interactive", text: "trigger workflow test" });
-    assert.ok(currentTools.includes("workflow"), "workflow tool should be added");
-    assert.ok(currentTools.length > initialTools.length, "tool set should be expanded");
-
-    // turn_end: restore to saved tools
-    turnEndHandler?.();
-    assert.deepEqual(currentTools, initialTools, "tools should be restored after turn_end");
-  });
-
-  it("does not add WORKFLOW_TOOL_NAME if already present", async () => {
-    const mod = await load();
-    const captured: Array<{ event: string; handler: (...args: unknown[]) => unknown }> = [];
-    let currentTools: string[] = ["bash", "read", "workflow"];
-
-    const pi = {
-      on: (event: string, handler: (...args: unknown[]) => unknown) => {
-        captured.push({ event, handler });
-      },
-      getActiveTools: () => [...currentTools],
-      setActiveTools: (tools: string[]) => {
-        currentTools = [...tools];
-      },
-    } as unknown as ExtensionAPI;
-
-    mod.installWorkflowKeywordArming(pi, undefined, testSettingsOptions());
-
-    const inputHandler = captured.find((c) => c.event === "input")?.handler;
-    assert.notEqual(inputHandler, undefined);
-
-    inputHandler?.({ source: "interactive", text: "run workflow" });
-    // "workflow" was already present, so tool count should not increase beyond duplicates
-    assert.equal(currentTools.filter((t) => t === "workflow").length, 1, "workflow should appear exactly once");
+    assert.deepEqual(inputHandler({ source: "interactive", text }), { action: "continue" });
+    assert.equal(setActiveToolsCalls, 0);
   });
 
   it("input handler ignores non-interactive sources", async () => {

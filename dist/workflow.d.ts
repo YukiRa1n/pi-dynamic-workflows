@@ -53,7 +53,7 @@ export interface JournalEntry {
  * instead of each level getting its own limiter and counters.
  */
 export interface SharedRuntime {
-    limiter: <T>(fn: () => Promise<T>) => Promise<T>;
+    limiter: WorkflowLimiter;
     agentCount: number;
     spent: number;
     tokenUsage: {
@@ -86,6 +86,14 @@ export interface SharedRuntime {
     /** Stable derived child ids keyed by the parent's lexical workflow() call. */
     nestedRunIds: Map<string, string>;
     /**
+     * Shared-store commit sequencing across the whole nested run tree. Agent
+     * calls reserve this sequence in lexical admission order; their isolated
+     * deltas are applied only when all earlier logical calls have settled.
+     */
+    storeOrderSequence: number;
+    nextStoreOrder: number;
+    pendingStoreDeltas: Map<number, Record<string, unknown>>;
+    /**
      * Fires exactly once a run-fatal error is determined: an error that escaped
      * the TOP-level script's own execution completely uncaught (see runWorkflow's
      * catch below) — i.e. nothing anywhere in the call chain, at any nesting
@@ -111,6 +119,39 @@ export interface SharedRuntime {
      * after the run has been marked complete and torn down. See the drain below.
      */
     inFlight: Set<Promise<unknown>>;
+    /** Atomic run-wide Agent Team quotas, inherited by nested frames. */
+    teamMembersReserved: number;
+    teamTasksReserved: number;
+    teamMessagesReserved: number;
+    reservedAgentSlots: number;
+    /** Unconsumed maxAgents reservations, owned by their spawning batch. */
+    agentSlotReservations: Map<string, number>;
+    agentSlotSequence: number;
+    /** Optional manager-wide provider permit. Nested frames inherit this hook. */
+    providerAcquire?: (runId: string, signal: AbortSignal, namespace?: string, generation?: string) => Promise<(() => void) | null>;
+    /** Run-wide admission signal used to cancel provider waiters during drain. */
+    providerAdmissionController: AbortController;
+    /** Bounded attempt registry; entries remain observable after logical drain. */
+    lateAttemptRegistry?: {
+        register: (metadata: {
+            attemptId: string;
+            runId: string;
+            callId: string;
+            generation: number;
+            executionGeneration?: string;
+            resourceGeneration?: string;
+            label?: string;
+        }) => {
+            update: (patch: Record<string, unknown>) => void;
+            settle: () => void;
+        } | null;
+        markLate: (attemptId: string) => void;
+        markLateScope?: (scope: {
+            runId?: string;
+            executionGeneration?: string;
+            resourceGeneration?: string;
+        }) => void;
+    };
     /**
      * Frame admission state (FQ-003 / FRAME-CLOSE-001). "open" while the run
      * accepts new work; "closing" once the top-level drain begins (reject new
@@ -122,6 +163,12 @@ export interface SharedRuntime {
      * completed run after the fact.
      */
     admission: "open" | "closing" | "closed";
+}
+/** Run-scoped concurrency gate. Closing it rejects every queued admission and
+ * prevents a waiter that races with closure from starting its callback. */
+export interface WorkflowLimiter {
+    <T>(fn: () => Promise<T>): Promise<T>;
+    close(reason?: Error): void;
 }
 /** Runtime instrumentation for workflow boundaries, quality helpers, and control attempts. */
 export type WorkflowRuntimeEvent = {
@@ -146,6 +193,16 @@ export type WorkflowRuntimeEvent = {
 /** Minimal injected agent surface used by the workflow runtime and deterministic tests. */
 export interface WorkflowAgentRunner {
     run(prompt: string, options?: AgentRunOptions<TSchema>): Promise<unknown>;
+}
+export type WorkflowDeliveryKind = "blocker" | "critical_finding" | "decision";
+export interface WorkflowDeliveryMessage {
+    kind: WorkflowDeliveryKind;
+    message: string;
+}
+export type WorkflowSteeringKind = "same_task_correction" | "blocker_answer" | "changed_fact";
+export interface WorkflowSteeringMessage {
+    kind: WorkflowSteeringKind;
+    message: string;
 }
 export interface WorkflowRunOptions extends WorkflowAgentOptions {
     args?: unknown;
@@ -176,6 +233,18 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
     persistLogs?: boolean;
     /** Run ID for persistence. Auto-generated if not provided. */
     runId?: string;
+    /** Generation/owner nonce used to fence isolated worktrees across resume. */
+    worktreeOwner?: string;
+    /** Manager execution namespace/generation for resource diagnostics/fencing. */
+    resourceGeneration?: string;
+    /** Execution-generation fence for late provider attempts. */
+    executionGeneration?: string;
+    onWorktreeOwner?: (event: {
+        token: string;
+        active: boolean;
+        runId: string;
+        generation?: string;
+    }) => void;
     /**
      * Resume: cached agent/checkpoint results keyed by `${runId}:${callIndex}`
      * — the same namespacing SharedStore's deltaKey uses — so a nested
@@ -199,14 +268,15 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
      * budget was never leaky) — but onAgentEnd only ever reports the FINAL
      * attempt's tokens, so a caller accumulating a persisted total purely from
      * onAgentEnd (see WorkflowManager) would under-count by exactly the
-     * wasted retried attempts' spend. This is a separate, silent channel
-     * specifically so retried-attempt spend can be accounted for without
-     * changing onAgentEnd's one-call-per-agent-call cadence (a contract other
-     * code depends on).
+     * wasted retried attempts' spend. The first argument remains the historical
+     * scalar token count; the optional second argument carries the provider's
+     * detailed AgentUsage when it exists, without breaking older observers.
      */
-    onRetrySpend?: (tokens: number) => void;
+    onRetrySpend?: (tokens: number, usage?: AgentUsage) => void;
     /** Internal: shared runtime inherited by a nested workflow() call. */
     sharedRuntime?: SharedRuntime;
+    /** Internal: a nested frame invalidated its parent resume suffix. */
+    onResumeMiss?: () => void;
     /**
      * Seed the FRESH SharedRuntime's cumulative spend/tokenUsage counters from a
      * previously-persisted total (resume()), instead of starting at zero. Used
@@ -225,6 +295,10 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
         cacheRead: number;
         cacheWrite: number;
     };
+    /** Internal manager-wide provider resource hook. */
+    providerAcquire?: (runId: string, signal: AbortSignal, namespace?: string, generation?: string) => Promise<(() => void) | null>;
+    /** Internal bounded late-attempt registry hook. */
+    lateAttemptRegistry?: SharedRuntime["lateAttemptRegistry"];
     /**
      * Shared store for this run. One instance is created per top-level run and
      * propagated into nested workflow() calls. Pass an existing instance to share
@@ -241,12 +315,12 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
     confirm?: (promptText: string, options: CheckpointOptions) => Promise<unknown>;
     onLog?: (message: string) => void;
     /**
-     * Bridge for the runtime `deliver(message)` global: forwards a workflow-script
-     * message into the host conversation. Absent => deliver() no-ops.
+     * Bridge for the runtime `deliver({ kind, message })` global: forwards one
+     * task-changing workflow message into the host conversation. Absent => no-op.
      */
-    onDeliver?: (message: string) => void | Promise<void>;
-    /** Consume coordinator-session messages before the next live agent() call. */
-    takePendingMessages?: () => string[];
+    onDeliver?: (delivery: WorkflowDeliveryMessage) => void | Promise<void>;
+    /** Consume classified same-task updates before the next live agent() call. */
+    takePendingMessages?: () => WorkflowSteeringMessage[];
     /** Called when a workflow-scoped Agent Team is created. */
     onTeamCreated?: (team: AgentTeamSnapshot) => void;
     onPhase?: (title: string) => void;
@@ -275,7 +349,7 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
                 deliverAs?: "steer" | "followUp";
             }): Promise<void>;
         };
-        send: (message: string) => Promise<void>;
+        send: (message: string, kind: WorkflowSteeringKind) => Promise<void>;
     }) => void;
     /** Remove the live child session after success, failure, or abort. */
     onAgentSessionEnd?: (event: {
@@ -374,6 +448,8 @@ export interface AgentOptions<TSchemaDef extends TSchema | undefined = TSchema |
     retries?: number;
     /** Internal workflow-runtime identity for an Agent Team member. */
     teamMember?: string;
+    /** Internal, per-team.spawn batch reservation; never part of resume identity. */
+    slotReservation?: string;
 }
 /** Options for a human checkpoint() — a deterministic, journaled, replayable gate. */
 export interface CheckpointOptions {
@@ -392,6 +468,7 @@ export declare function runWorkflow<T = unknown>(script: string, options?: Workf
 export declare function formatWorkflowCoordinatorMessage(message: string, source: {
     runId: string;
     agentId?: string;
+    kind: WorkflowSteeringKind;
 }): string;
 export declare function parseWorkflowScript(script: string): {
     meta: WorkflowMeta;
