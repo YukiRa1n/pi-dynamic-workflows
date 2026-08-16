@@ -18,7 +18,7 @@ const workflowControlSchema = Type.Object({
         Type.Literal("resume"),
         Type.Literal("stop"),
     ], {
-        description: "list = all runs; status = a one-time snapshot for user-requested inspection or suspected lifecycle trouble; pause/resume/stop act on one run. Do not poll status repeatedly—workflow notifications report progress and completion automatically.",
+        description: "list = all runs; status = one diagnostic snapshot, not a wait/result operation; pause/resume/stop change one run. Never poll. Stop only to cancel.",
     }),
     runId: Type.Optional(Type.String({
         description: "Canonical workflow run ID. Required for status, pause, resume, and stop; omit for list.",
@@ -34,14 +34,12 @@ export function createWorkflowControlTool(options) {
     return defineTool({
         name: "workflow_control",
         label: "Workflow Control",
-        description: "List or take a one-time status snapshot of workflow runs, and pause, resume, or stop them without asking the user to run slash commands. Running workflows already emit asynchronous progress, subagent-completion, and terminal notifications; status polling does not advance execution. Do not repeatedly call list/status while waiting. Inspect only when the user asks, notifications conflict, a run appears stalled after a meaningful quiet interval, or before an operation that may conflict with live repository edits.",
-        promptSnippet: "Inspect workflow state sparingly or perform a lifecycle action; rely on automatic workflow notifications instead of polling.",
+        description: "Inspect or control workflow runs. status is a one-time diagnostic snapshot, not a way to wait for or obtain the final result. Never poll list/status; the final result arrives automatically as workflow-result. Stop only to cancel on explicit user request or a confirmed safety/resource conflict, never for cleanup or finalization.",
+        promptSnippet: "status does not wait or return the final result; never poll; stop only to cancel.",
         promptGuidelines: [
-            "Use workflow_control for workflow lifecycle actions; do not ask the user to type /workflows when this tool can perform the action.",
-            "Do not poll list or status. After starting or resuming a workflow, wait for asynchronous workflow-message, agent-completed, and workflow-result notifications.",
-            "Use status only for a user-requested check, contradictory/stale lifecycle notifications, suspected stalling after a meaningful quiet interval, or immediately before a conflicting pause/sync/commit operation.",
-            "A status result is a momentary snapshot and does not advance the workflow; a delivered progress message is not the same as an agent final.",
-            "Use stop to terminate or quit a run. Closing the navigator does not stop a run.",
+            "After starting or resuming a workflow, end the turn and wait for workflow-result.",
+            "workflow-message is intermediate. Do not query status to check whether it finished.",
+            "Stop only to cancel, never as cleanup or finalization.",
         ],
         parameters: workflowControlSchema,
         prepareArguments: normalizeInput,

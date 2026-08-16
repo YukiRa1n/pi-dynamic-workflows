@@ -73,9 +73,14 @@ test("workflow_control exposes only list, status, pause, resume, and stop in a s
 
   assert.equal(tool.name, "workflow_control");
   const guidance = [tool.description, tool.promptSnippet, ...(tool.promptGuidelines ?? [])].join(" ");
-  assert.match(guidance, /do not poll|instead of polling/i);
-  assert.match(guidance, /automatic|asynchronous/i);
-  assert.match(guidance, /does not advance/i);
+  assert.match(guidance, /never poll/i);
+  assert.match(guidance, /status.*not.*wait.*final result|not a wait\/result operation/i);
+  assert.match(guidance, /final result.*automatically.*workflow-result/i);
+  assert.match(guidance, /workflow-message.*intermediate/i);
+  assert.match(guidance, /stop only.*cancel/i);
+  assert.match(guidance, /never.*cleanup|never for cleanup/i);
+  assert.doesNotMatch(guidance, /agent-completed|subagent-completion/i);
+  assert.doesNotMatch(guidance, /meaningful quiet interval/i);
 
   // The top-level parameter schema MUST be `type: "object"`. A discriminated
   // Type.Union serialized to a top-level `anyOf` with no `type`, which strict
