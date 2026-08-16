@@ -2,7 +2,7 @@
 
 This document preserves the decision-by-decision record behind the workflow tool's compact model guidance. It records each reviewed insertion, removal, and compaction with its reasoning, evidence, and confidence.
 
-## Current placement in 3.5.1-yuki.2
+## Current placement in 3.5.1-yuki.3
 
 The record originated in [Whamp/pi-dynamic-workflows#23](https://github.com/Whamp/pi-dynamic-workflows/pull/23). The 3.0.0 target later merged [QuintinShaw/pi-dynamic-workflows#93](https://github.com/QuintinShaw/pi-dynamic-workflows/pull/93), which changed workflow triggering from forced execution to explicit intent. The current extension is compatible with stock Pi: it registers stable start, current-session active-list, and exact-ID stop tools, does not mutate the active tool set between turns, and keeps detailed inspection plus broader lifecycle control on explicit `/workflows` commands. Existing runs are never a model-facing routing target; a new requirement stays in the main session or starts a fresh run.
 

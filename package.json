@@ -1,6 +1,6 @@
 {
   "name": "@quintinshaw/pi-dynamic-workflows",
-  "version": "3.5.1-yuki.2",
+  "version": "3.5.1-yuki.3",
   "description": "A hardened Pi package for parallel subagent workflows, model routing, resume journals, Agent Teams, safe-point delivery, and interactive run control.",
   "type": "module",
   "main": "./dist/index.js",

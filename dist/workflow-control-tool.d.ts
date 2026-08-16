@@ -17,6 +17,8 @@ export interface WorkflowControlToolOptions {
     manager?: WorkflowManager;
     /** Live manager accessor; prefer over a closed-over manager when the extension may replace it. */
     getManager?: () => WorkflowManager;
+    /** Current host-session accessor; keeps ownership checks independent of retained manager prototypes. */
+    getSessionId?: () => string | undefined;
 }
 export interface WorkflowControlRunDetails {
     runId: string;

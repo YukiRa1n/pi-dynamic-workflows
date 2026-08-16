@@ -42,7 +42,7 @@ export function createListActiveWorkflowsTool(options) {
         async execute() {
             try {
                 const manager = getManager();
-                const sessionId = manager.getSessionId();
+                const sessionId = currentSessionId(manager, options);
                 if (!sessionId)
                     return listActiveWorkflowResult([], false, "current session ownership is unavailable");
                 const active = manager
@@ -102,7 +102,7 @@ export function createStopWorkflowTool(options) {
                 return stopWorkflowResult(params.runId, false, undefined, errorText(error));
             }
             try {
-                const sessionId = manager.getSessionId();
+                const sessionId = currentSessionId(manager, options);
                 if (!sessionId) {
                     return stopWorkflowResult(params.runId, false, undefined, "current session ownership is unavailable");
                 }
@@ -282,6 +282,11 @@ function stopWorkflowResult(runId, stopped, status, error) {
 }
 function errorText(error) {
     return error instanceof Error ? error.message : String(error);
+}
+function currentSessionId(manager, options) {
+    if (options.getSessionId)
+        return options.getSessionId();
+    return typeof manager.getSessionId === "function" ? manager.getSessionId() : undefined;
 }
 function result(text, details) {
     return { content: [{ type: "text", text }], details };

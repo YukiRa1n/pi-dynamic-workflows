@@ -1276,6 +1276,8 @@ export default function extension(pi: ExtensionAPI) {
   const getManager = () => manager;
   const getCwd = () => cwd;
   const getStorage = () => storage;
+  let currentSessionId: string | undefined;
+  const getSessionId = () => currentSessionId;
 
   // Install delivery listeners once. Keep suspended until session_start —
   // factory runs before Pi bindCore(), so sendMessage is still the
@@ -1314,8 +1316,8 @@ export default function extension(pi: ExtensionAPI) {
     exposeAdvancedParameters: false,
     modelFacing: true,
   });
-  const listActiveWorkflowsTool = createListActiveWorkflowsTool({ getManager });
-  const stopWorkflowTool = createStopWorkflowTool({ getManager });
+  const listActiveWorkflowsTool = createListActiveWorkflowsTool({ getManager, getSessionId });
+  const stopWorkflowTool = createStopWorkflowTool({ getManager, getSessionId });
   pi.registerTool(workflowTool);
   pi.registerTool(listActiveWorkflowsTool);
   pi.registerTool(stopWorkflowTool);
@@ -1464,6 +1466,7 @@ export default function extension(pi: ExtensionAPI) {
     } catch {
       // sessionManager may be unavailable — fall back to global history.
     }
+    currentSessionId = sessionId;
     manager.setSessionId(sessionId);
     manager.adoptLiveRunsToSession(sessionId);
     usageLimitScheduler.bindSession(sessionId);

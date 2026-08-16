@@ -39,7 +39,7 @@ pi install git:github.com/YukiRa1n/pi-dynamic-workflows
 For a reproducible installation, pin a release tag once tags are available:
 
 ```bash
-pi install git:github.com/YukiRa1n/pi-dynamic-workflows@v3.5.1-yuki.2
+pi install git:github.com/YukiRa1n/pi-dynamic-workflows@v3.5.1-yuki.3
 ```
 
 Reload Pi after installation:

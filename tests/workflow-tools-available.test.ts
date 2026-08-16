@@ -314,12 +314,16 @@ describe("workflow extension - stable tool availability", () => {
       await withFakeHomeAsync(fakeHome, async () => {
         discardWorkflowRuntime(process.cwd());
         const registeredTools: string[] = [];
+        const registeredToolDefinitions: Array<{ name: string; execute?: (...args: any[]) => Promise<any> }> = [];
         const activeTools = ["bash", "read"];
         let setActiveToolsCalls = 0;
         const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> }>();
         const handlers: Record<string, Array<(...args: any[]) => any>> = {};
         const pi = {
-          registerTool: (tool: { name: string }) => registeredTools.push(tool.name),
+          registerTool: (tool: { name: string; execute?: (...args: any[]) => Promise<any> }) => {
+            registeredTools.push(tool.name);
+            registeredToolDefinitions.push(tool);
+          },
           registerCommand: (name: string, command: { handler: (args: string, ctx: unknown) => Promise<void> }) => {
             commands.set(name, command);
           },
@@ -386,12 +390,19 @@ describe("workflow extension - stable tool availability", () => {
         handlers.session_shutdown?.[0]?.({ reason: "reload" });
         const staged = takeWorkflowRuntime(process.cwd());
         assert.ok(staged, "session_shutdown(reload) stages the live manager for the next extension generation");
+        Object.defineProperty(staged.manager, "getSessionId", {
+          value: undefined,
+          configurable: true,
+        });
         staged.effort.level = "high";
         handoffWorkflowRuntime(staged);
 
         const secondHandlers: Record<string, Array<(...args: any[]) => any>> = {};
         const secondPi = {
-          registerTool: (tool: { name: string }) => registeredTools.push(tool.name),
+          registerTool: (tool: { name: string; execute?: (...args: any[]) => Promise<any> }) => {
+            registeredTools.push(tool.name);
+            registeredToolDefinitions.push(tool);
+          },
           registerCommand: () => {},
           getCommands: () => [],
           on: (event: string, handler: (...args: any[]) => any) => {
@@ -426,6 +437,13 @@ describe("workflow extension - stable tool availability", () => {
             ui: { setWidget: () => {}, notify: () => {} },
           },
         );
+
+        const reloadedListTool = registeredToolDefinitions
+          .filter((tool) => tool.name === "list_active_workflows")
+          .at(-1);
+        assert.ok(reloadedListTool?.execute);
+        const listed = await reloadedListTool.execute("list-after-reload", {}, undefined, undefined, {});
+        assert.equal(listed.details.error, undefined, "retained pre-upgrade managers use the current session accessor");
 
         secondHandlers.session_shutdown?.[0]?.({ reason: "reload" });
         const restaged = takeWorkflowRuntime(process.cwd());

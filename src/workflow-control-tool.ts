@@ -45,6 +45,8 @@ export interface WorkflowControlToolOptions {
   manager?: WorkflowManager;
   /** Live manager accessor; prefer over a closed-over manager when the extension may replace it. */
   getManager?: () => WorkflowManager;
+  /** Current host-session accessor; keeps ownership checks independent of retained manager prototypes. */
+  getSessionId?: () => string | undefined;
 }
 
 export interface WorkflowControlRunDetails {
@@ -113,7 +115,7 @@ export function createListActiveWorkflowsTool(
     async execute() {
       try {
         const manager = getManager();
-        const sessionId = manager.getSessionId();
+        const sessionId = currentSessionId(manager, options);
         if (!sessionId) return listActiveWorkflowResult([], false, "current session ownership is unavailable");
         const active = manager
           .listRuns()
@@ -178,7 +180,7 @@ export function createStopWorkflowTool(
       }
 
       try {
-        const sessionId = manager.getSessionId();
+        const sessionId = currentSessionId(manager, options);
         if (!sessionId) {
           return stopWorkflowResult(params.runId, false, undefined, "current session ownership is unavailable");
         }
@@ -368,6 +370,11 @@ function stopWorkflowResult(
 
 function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function currentSessionId(manager: WorkflowManager, options: WorkflowControlToolOptions): string | undefined {
+  if (options.getSessionId) return options.getSessionId();
+  return typeof manager.getSessionId === "function" ? manager.getSessionId() : undefined;
 }
 
 function result(text: string, details: Record<string, unknown>): ControlResult {

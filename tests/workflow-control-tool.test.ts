@@ -180,6 +180,22 @@ test("list_active_workflows fails closed when current-session ownership is unava
   assert.match(response.details.error ?? "", /ownership is unavailable/);
 });
 
+test("session-scoped tools survive a retained pre-upgrade manager without getSessionId", async () => {
+  const fixture = stopManager({ runSessionId: "session-a" });
+  const legacyManager = fixture.manager as WorkflowManager & { getSessionId?: undefined };
+  legacyManager.getSessionId = undefined;
+  const options = { manager: legacyManager, getSessionId: () => "session-a" };
+
+  const listTool = createListActiveWorkflowsTool(options);
+  const listed = await (listTool.execute as any)("list-call", {}, undefined, undefined, {});
+  assert.deepEqual(listed.details.runs, [{ runId: "audit-current-1", name: "audit", status: "running" }]);
+
+  const stopTool = createStopWorkflowTool(options);
+  const stopped = await (stopTool.execute as any)("stop-call", { runId: "audit-current-1" }, undefined, undefined, {});
+  assert.equal(stopped.details.stopped, true);
+  assert.deepEqual(fixture.calls, ["audit-current-1"]);
+});
+
 test("stop_workflow exposes only an exact runId cancellation handle", () => {
   const fixture = stopManager({ sessionId: "session-a", runSessionId: "session-a" });
   const tool = createStopWorkflowTool({ manager: fixture.manager });
