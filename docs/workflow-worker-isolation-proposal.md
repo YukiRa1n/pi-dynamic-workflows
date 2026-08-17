@@ -10,20 +10,20 @@ as fully untrusted.
 Workflow scripts execute under `node:vm` in the host process. Two independent
 gaps remain after the static audit:
 
-1. **Prototype escape (host-realm code execution).** The audit removes every
-   known static route to `fn.constructor` (computed member access, `for...in`,
-   `__proto__`, dynamic code), and DETERMINISM_PRELUDE strips `.constructor`
-   from injected globals at runtime. This is defence-in-depth, not a proof:
-   a single missed exotic route (a future syntax addition, a parser
-   discrepancy, a realm leak through a host object that reaches the VM
-   through a path the bridge did not sanitize) reopens host-realm execution
-   with the user's full permissions.
+1. **Prototype escape (host-realm code execution).** The audit removes the
+   known static routes to `fn.constructor` (computed member access, `for...in`,
+   `__proto__`, dynamic code) and the runtime wraps injected bridge functions
+   in vm-realm closures so their `.constructor` chain stays in-realm. This is
+   defence-in-depth, not a proof: a single missed exotic route (a future
+   syntax addition, a parser discrepancy, a realm leak through a host object
+   that reaches the VM through a path the bridge did not sanitize) reopens
+   host-realm execution with the user's full permissions.
 2. **Event-loop denial of service.** `runInContext`'s timeout bounds only the
    synchronous CPU segment. An async continuation that never yields
-   (`while (true) {}` after an `await`) blocks the host's event loop until the
-   run's wall-clock deadline kills the workflow — and because the workflow
-   shares the process with the interactive session, the host UI freezes with
-   it.
+   (`while (true) {}` after an `await`) blocks the host's event loop; the
+   run's wall-clock deadline cannot preempt a microtask-starved loop, so the
+   workflow — and the interactive session it shares the process with — stays
+   frozen until the loop next yields.
 
 Process isolation removes both classes at once: a compromised or stuck
 worker cannot touch host memory and cannot freeze the host loop.
@@ -31,8 +31,8 @@ worker cannot touch host memory and cannot freeze the host loop.
 ## Non-goals
 
 - Replacing the static audit. Audit stays as the first, cheap layer
-  (sub-millisecond, structured fix lists for the model); the worker is the
-  hard boundary behind it.
+  (structured fix lists for the model); the worker is the hard boundary
+  behind it.
 - Sandboxing subagents. `agent()` results already run under the host's own
   tool-permission system; this proposal isolates only the orchestration
   script.
@@ -43,8 +43,8 @@ worker cannot touch host memory and cannot freeze the host loop.
 
 The naive design — keep orchestration in the host and RPC each capability —
 dies on the bridge surface. The runtime exposes 20 globals
-(`WORKFLOW_CAPABILITY_CONTRACT.assembleRuntimeBindings`), of which roughly
-half are function-valued and several (`parallel`, `pipeline`) take thunks —
+(`WORKFLOW_CAPABILITY_CONTRACT.assembleRuntimeBindings`), of which 15 are
+function-valued and several (`parallel`, `pipeline`) take thunks —
 functions created *inside* the script that the host would have to call back
 into. Crossing a process boundary with closures requires a full bidirectional
 function-call protocol, which is the complexity this proposal exists to
@@ -80,8 +80,9 @@ host process                          worker process
   at risk.
 - **Escape containment**: a script that escapes the VM lands in a process
   whose only host capability is the MessagePort. It can forge agent requests
-  — bounded by the host-side admission limits (agent count, concurrency,
-  token budget) that are enforced per run regardless.
+  — bounded by the host-side admission limits (agent count, concurrency, and
+  the run token budget when one is configured) that the host enforces per
+  run.
 
 ## Hard parts (cost drivers)
 
@@ -125,10 +126,10 @@ usual schedule risk.
 
 | Layer | Blocks | Cost |
 |-------|--------|------|
-| Static audit (shipped) | Known escape syntax; host-global references | sub-ms per call |
-| Resource ceilings (shipped) | Token/CPU fan-out regardless of intent | already enforced |
+| Static audit (shipped) | Known escape syntax; host-global references | a fast parse per call |
+| Resource ceilings (shipped) | Token/CPU fan-out when limits are configured | already enforced |
 | Worker isolation (this proposal) | Unknown escape routes; event-loop DoS | process per run |
 
-The audit remains load-bearing even with the worker: it keeps the model's
-output inside a subset where resume/replay semantics are well-defined, which
-the worker's journal depends on.
+The audit remains useful even with the worker: it narrows the model's output
+to a subset that keeps resume/replay semantics tractable, which the worker's
+journal depends on.

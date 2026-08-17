@@ -2327,3 +2327,27 @@ test("host-provided args are copied into the VM realm without host constructors"
   assert.equal(result.result.processCtor, true);
   assert.equal(result.result.budgetCtor, true);
 });
+
+test("bridge globals are vm-realm wrapped: constructor chains cannot reach the host realm", async () => {
+  const result = await runWorkflow(
+    `export const meta = { name: 'realm', description: 'realm wrapper' }
+const p = agent('x');
+const agentCtor = (() => { try { return String(agent.constructor.constructor("return typeof process")()); } catch (e) { return "threw:" + e.constructor.name; } })();
+const promiseCtor = (() => { try { return String(p.constructor.constructor("return process")()); } catch (e) { return "threw:" + e.constructor.name; } })();
+const realHost = (() => { try { const proc = p.constructor.constructor("return process")(); return typeof proc.getBuiltinModule === "function" ? "HOST" : "not-host"; } catch (e) { return "threw:" + e.constructor.name; } })();
+return { agentCtor, promiseCtor, realHost, promiseInstanceof: p instanceof Promise };`,
+    {
+      runId: "realm-wrap",
+      persistLogs: false,
+      agent: {
+        async run() {
+          return "ok";
+        },
+      },
+    },
+  );
+  const r = result.result as Record<string, unknown>;
+  assert.equal(r.promiseInstanceof, true, "agent() should return a vm-realm Promise");
+  assert.notEqual(r.agentCtor, "object", "agent.constructor must not reach the host realm");
+  assert.notEqual(r.realHost, "HOST", "bridge return promise must not expose the host process");
+});

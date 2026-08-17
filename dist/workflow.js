@@ -276,7 +276,10 @@ const DETERMINISM_PRELUDE = [
     '"use strict";',
     // Workflow scripts are trusted orchestration code, but remove the easiest
     // accidental bridge-function constructor escape. This is defense-in-depth,
-    // not a claim that node:vm is a hostile-code security boundary.
+    // not a claim that node:vm is a hostile-code security boundary. Frozen
+    // injected objects (process, budget) reject defineProperty with a TypeError,
+    // so the patch silently no-ops on them — the realm-wrapper layer above is
+    // what actually neutralizes their .constructor chain.
     'for (const name of ["agent", "parallel", "pipeline", "createTeam", "workflow", "verify", "judgePanel", "loopUntilDry", "completenessCheck", "retry", "gate", "checkpoint", "deliver", "log", "phase", "process", "budget", "console"]) { try { Object.defineProperty(globalThis[name], "constructor", { value: undefined, writable: false, configurable: false }); } catch {} try { const root = globalThis[name]; for (const key of Reflect.ownKeys(root || {})) { try { const child = root[key]; if (typeof child === "function") Object.defineProperty(child, "constructor", { value: undefined, writable: false, configurable: false }); } catch {} } } catch {} }',
     'Math.random = () => { throw new Error("Math.random() is unavailable in a workflow (it breaks resume); pass randomness via args or vary by index"); };',
     "{",
@@ -498,6 +501,14 @@ export async function runWorkflow(script, options = {}) {
     };
     const log = (message) => {
         throwIfAdmissionClosed();
+        appendLog(message, true);
+    };
+    // Same as log() but tolerant of a closed admission: used for post-drain
+    // retry/failure reporting where the message is best-effort and must not
+    // reject a promise the script already stopped awaiting.
+    const logBestEffort = (message) => {
+        if (shared.admission !== "open")
+            return;
         appendLog(message, true);
     };
     // Runtime deliver() global: only a classified task-changing message may wake
@@ -1277,7 +1288,7 @@ export async function runWorkflow(script, options = {}) {
                         // Unconditional: this covers both retries and exhausted failures.
                         attemptStore?.discardDelta(attemptDeltaKey);
                         if (workflowError.recoverable && attempt < maxAttempts) {
-                            log(`agent "${label}" attempt ${attempt}/${maxAttempts} failed: ${workflowError.code} ${workflowError.message}; retrying`);
+                            logBestEffort(`agent "${label}" attempt ${attempt}/${maxAttempts} failed: ${workflowError.code} ${workflowError.message}; retrying`);
                             // This attempt's spend already accrued into shared.spent/tokenUsage
                             // above (recordTokens) — but it will never reach onAgentEnd (only
                             // the final attempt does), so report it on the dedicated channel
@@ -1312,7 +1323,7 @@ export async function runWorkflow(script, options = {}) {
                             recoverable: workflowError.recoverable,
                         });
                         if (workflowError.recoverable) {
-                            log(`agent "${label}" exhausted ${maxAttempts} attempt${maxAttempts === 1 ? "" : "s"}: ${workflowError.code} ${workflowError.message}`);
+                            logBestEffort(`agent "${label}" exhausted ${maxAttempts} attempt${maxAttempts === 1 ? "" : "s"}: ${workflowError.code} ${workflowError.message}`);
                             return null;
                         }
                         throw workflowError;
@@ -1928,13 +1939,55 @@ export async function runWorkflow(script, options = {}) {
     const { globals: projectGlobals, diagnostics: bindingDiagnostics } = WORKFLOW_CAPABILITY_CONTRACT.assembleRuntimeBindings(runtimeImplementations);
     for (const diagnostic of bindingDiagnostics)
         logger.warn(diagnostic.message);
+    // Inject bridge globals under HIDDEN keys, then re-expose them through
+    // wrappers created inside the vm realm. A host function injected directly
+    // keeps the host Function as its .constructor, which is the classic
+    // `fn.constructor("return process")()` escape; a wrapper built by vm-realm
+    // code closes over the host implementation but presents a vm-realm
+    // prototype chain. Return values are re-wrapped with the vm realm's
+    // Promise.resolve so a host Promise's .constructor is never exposed either.
+    const hostBridge = {};
+    const bridgeGlobals = {};
+    for (const [name, value] of Object.entries(projectGlobals)) {
+        if (typeof value === "function") {
+            hostBridge[`__host_${name}`] = value;
+        }
+        else {
+            bridgeGlobals[name] = value;
+        }
+    }
     const context = vm.createContext({
-        ...projectGlobals,
+        ...hostBridge,
+        ...bridgeGlobals,
         // Object/Array/JSON/Math/Date/Promise/Set/Map/etc. come from the vm realm
         // itself — we deliberately do NOT inject host built-ins, whose .constructor
         // would be the host Function (a determinism-guard bypass). Math/Date are
         // neutered in-realm by DETERMINISM_PRELUDE below.
     });
+    // Build the realm-side wrappers in one vm evaluation. The wrapper generator
+    // runs in the vm realm, so `Function` here is the VM realm's Function and
+    // every wrapper it produces has a vm-realm prototype chain. Plain-data
+    // globals (args, cwd, budget, ...) are copied as-is.
+    new vm.Script(`"use strict";
+for (const name of Object.getOwnPropertyNames(globalThis)) {
+  if (!name.startsWith("__host_")) continue;
+  const exposed = name.slice("__host_".length);
+  const impl = globalThis[name];
+  // Every bridge returns through the vm realm's Promise.resolve so a host
+  // Promise's .constructor is never exposed. Sync bridges (log, phase) return
+  // their value synchronously unless the host produced a thenable.
+  globalThis[exposed] = (...args) => {
+    const result = impl(...args);
+    if (!result || typeof result.then !== "function") return result;
+    // Attach a noop rejection handler to the HOST promise immediately so a
+    // bridge rejection the script never awaits cannot surface as an
+    // unhandledRejection in the host process; the vm-realm promise below
+    // still carries the rejection to any real awaiter.
+    Promise.resolve(result).catch(() => {});
+    return Promise.resolve(result);
+  };
+  delete globalThis[name];
+}`).runInContext(context);
     // JSON.parse executes in the VM realm, so even plain objects do not retain a
     // host Object/Array constructor. Descriptor-only cloning avoids getters and
     // user conversion hooks on host-provided args.
