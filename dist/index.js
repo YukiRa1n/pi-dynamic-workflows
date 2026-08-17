@@ -33,6 +33,7 @@ export { defaultWorkflowResourceCoordinator, WorkflowResourceCoordinator, } from
 export { DEFAULT_WORKFLOW_RESULT_CHARS, summarizeWorkflowResult, } from "./workflow-result-projection.js";
 export { evaluateWorkflowRoutingChoice, WORKFLOW_ROUTING_CHOICE_SCENARIOS } from "./workflow-routing-choice.js";
 export { assertSafeSavedWorkflowName, createWorkflowStorage, isSafeSavedWorkflowName } from "./workflow-saved.js";
+export { auditWorkflowScript, decideWorkflowScriptGate } from "./workflow-script-gate.js";
 export { getWorkflowProjectSettingsPath, getWorkflowSettingsPath, loadWorkflowSettings, saveWorkflowSettings, saveWorkflowSettingsForCwd, } from "./workflow-settings.js";
 export { createWorkflowSteerTool } from "./workflow-steer-tool.js";
 export { backgroundStartedText, createWorkflowTool } from "./workflow-tool.js";

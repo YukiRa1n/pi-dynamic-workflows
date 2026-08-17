@@ -40,6 +40,7 @@ import {
 import { truncateUtf8 } from "../src/safe-serialize.js";
 import { redactForModel, sanitizeForTerminal } from "../src/sanitize.js";
 import type { WorkflowStorage } from "../src/workflow-saved.js";
+import { decideWorkflowScriptGate } from "../src/workflow-script-gate.js";
 
 /**
  * Bound for the read-only session-header probe (first line only). Independent of
@@ -1345,6 +1346,40 @@ function installWorkflowToolResultContextBridge(pi: ExtensionAPI, getManager: ()
   });
 }
 
+type WorkflowScriptGateToolCallEvent = {
+  toolName: string;
+  input: Record<string, unknown>;
+};
+
+/**
+ * Static audit gate for model-authored custom scripts. node:vm is a
+ * determinism boundary, not a hostile-code sandbox (prototype escapes reach
+ * host constructors; async continuations outlive the run timeout), so a
+ * model-supplied `script` must stay inside the audited declarative
+ * orchestration subset before it ever reaches the runner. The audit is
+ * automatic — no user confirmation, no env overrides. Presets are curated
+ * in-repo and pass ungated.
+ *
+ * The handler is generic (event shape only) so the policy is unit-testable
+ * without standing up a full Pi session.
+ */
+export function gateWorkflowScriptToolCall(
+  event: WorkflowScriptGateToolCallEvent,
+): { block: true; reason: string; terminate: true } | undefined {
+  if (event.toolName !== "start_workflow") return undefined;
+  const input = event.input as { script?: unknown };
+  const script = typeof input.script === "string" && input.script.trim().length > 0 ? input.script : undefined;
+  const decision = decideWorkflowScriptGate(script);
+  if (decision.action === "allow") return undefined;
+  // terminate: a rejected script is the end of this request; do not let the
+  // model immediately retry a reworded variant inside the same batch.
+  return { block: true, reason: decision.reason, terminate: true };
+}
+
+function installWorkflowScriptGate(pi: ExtensionAPI): void {
+  pi.on("tool_call", (event) => gateWorkflowScriptToolCall(event as WorkflowScriptGateToolCallEvent));
+}
+
 export default function extension(pi: ExtensionAPI) {
   // Mutable host state. Tools/commands resolve through getters so a
   // session_start that discovers a cross-project cwd can replace the manager
@@ -1443,6 +1478,7 @@ export default function extension(pi: ExtensionAPI) {
   pi.registerTool(listActiveWorkflowsTool);
   pi.registerTool(getWorkflowOutputTool);
   pi.registerTool(stopWorkflowTool);
+  installWorkflowScriptGate(pi);
   registerWorkflowMessageRenderers(pi);
   // Keep workflow history as custom entries for the UI, but expose it to the
   // provider as tool_result semantics through the context transform.

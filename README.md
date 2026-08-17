@@ -253,8 +253,8 @@ Pi packages execute with the current user's system permissions. Review extension
 
 Additional boundaries:
 
-- Workflow orchestration uses Node's `vm` for determinism and synchronous execution limits, **not as a hostile-code security sandbox**. Run scripts only from trusted users or trusted model output. Host-provided arguments are copied into the VM realm without host constructors.
-- The orchestration script cannot directly call `require`, import modules, or use nondeterministic `Date.now()`/`Math.random()` globals, but subagents can use whatever tools the host grants them.
+- Workflow orchestration uses Node's `vm` for determinism and synchronous execution limits, **not as a hostile-code security sandbox**. Host-provided arguments are copied into the VM realm without host constructors. Because of this, model-authored custom scripts passed to `start_workflow` are statically audited before execution: the audit rejects constructs that defeat the in-realm guards (dynamic code execution via `eval`/`Function`, computed member access and `for...in` string-keyed reflection, `__proto__` in any position, `import`, `with`, and free references to host-reachable globals), and blocks the tool call with a fix list. Audited scripts run without user confirmation; curated built-in `preset`s are not gated.
+- The orchestration script cannot directly call `require`, import modules, or use nondeterministic `Date.now()`/`Math.random()` globals, but subagents can use whatever tools the host grants them. The static audit narrows script structure; it does not bound model behaviour, so run resource limits (agent count, concurrency, token budget) remain the cost guardrails.
 - Built-in web fetch tools restrict protocols, credentials, redirects, private/local IP ranges, timeout, and response size. These controls reduce risk but do not make arbitrary web content trustworthy.
 - Worktree isolation requires a Git repository and does not automatically merge changes.
 - Review workflow prompts and model output before applying destructive changes.

@@ -226,6 +226,8 @@ export type {
 export { evaluateWorkflowRoutingChoice, WORKFLOW_ROUTING_CHOICE_SCENARIOS } from "./workflow-routing-choice.js";
 export type { SavedWorkflow, WorkflowStorage } from "./workflow-saved.js";
 export { assertSafeSavedWorkflowName, createWorkflowStorage, isSafeSavedWorkflowName } from "./workflow-saved.js";
+export type { WorkflowScriptAuditViolation, WorkflowScriptGateDecision } from "./workflow-script-gate.js";
+export { auditWorkflowScript, decideWorkflowScriptGate } from "./workflow-script-gate.js";
 export type { WorkflowSettings, WorkflowSettingsOptions, WorkflowSettingsStore } from "./workflow-settings.js";
 export {
   getWorkflowProjectSettingsPath,

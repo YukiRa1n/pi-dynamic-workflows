@@ -53,6 +53,8 @@ export type { CapturedWorkflowRoutingCall, WorkflowRoutingChoiceEvaluation, Work
 export { evaluateWorkflowRoutingChoice, WORKFLOW_ROUTING_CHOICE_SCENARIOS } from "./workflow-routing-choice.js";
 export type { SavedWorkflow, WorkflowStorage } from "./workflow-saved.js";
 export { assertSafeSavedWorkflowName, createWorkflowStorage, isSafeSavedWorkflowName } from "./workflow-saved.js";
+export type { WorkflowScriptAuditViolation, WorkflowScriptGateDecision } from "./workflow-script-gate.js";
+export { auditWorkflowScript, decideWorkflowScriptGate } from "./workflow-script-gate.js";
 export type { WorkflowSettings, WorkflowSettingsOptions, WorkflowSettingsStore } from "./workflow-settings.js";
 export { getWorkflowProjectSettingsPath, getWorkflowSettingsPath, loadWorkflowSettings, saveWorkflowSettings, saveWorkflowSettingsForCwd, } from "./workflow-settings.js";
 export type { WorkflowSteerInput, WorkflowSteerToolOptions } from "./workflow-steer-tool.js";
