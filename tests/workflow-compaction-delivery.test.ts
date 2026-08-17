@@ -227,7 +227,7 @@ test("workflow delivery retries once after Pi rejects an abort-window send", asy
   }
 });
 
-test("an aborted agent fences delivery retries until the next user prompt", async () => {
+test("an aborted agent auto-drains the dropped delivery as a custom message after settle", async () => {
   const fakeHome = mkdtempSync(join(tmpdir(), "pi-dw-abort-fence-"));
   try {
     await withFakeHomeAsync(fakeHome, async () => {
@@ -263,15 +263,12 @@ test("an aborted agent fences delivery retries until the next user prompt", asyn
       }
       for (const handler of handlers.agent_settled ?? []) handler({ type: "agent_settled" });
       await new Promise((resolve) => setTimeout(resolve, 20));
-      assert.equal(sent.length, 1, "abort must not let agent_settled start a delivery turn");
-
-      for (const handler of handlers.before_agent_start ?? []) {
-        handler({ type: "before_agent_start", prompt: "new user request", images: [] });
-      }
-      for (const handler of handlers.agent_settled ?? []) handler({ type: "agent_settled" });
-      await new Promise((resolve) => setTimeout(resolve, 20));
-      assert.equal(sent.length, 2, "the next user prompt releases the durable delivery");
-      assert.equal(sent[1]?.message.details.deliveryId, stableId, "release keeps the stable delivery ID");
+      // Esc recovery auto-drains the dropped delivery once the run has settled:
+      // no manual Enter, still a custom message (not user), stable delivery ID.
+      assert.equal(sent.length, 2, "settled recovery auto-drains the dropped delivery without waiting for input");
+      assert.equal(sent[1]?.message.customType, "workflow-deliver", "auto-drain keeps the customType (not user)");
+      assert.equal(sent[1]?.message.details.deliveryId, stableId, "auto-drain keeps the stable delivery ID");
+      assert.deepEqual(sent[1]?.options, { triggerTurn: true, deliverAs: "steer" });
 
       handlers.session_shutdown?.[0]?.({ reason: "quit" });
       discardWorkflowRuntime();
@@ -596,15 +593,12 @@ test("an abort during tool execution fences the delivery without an ack-timeout 
       }
       for (const handler of handlers.agent_settled ?? []) handler({ type: "agent_settled" });
       await new Promise((resolve) => setTimeout(resolve, 20));
-      assert.equal(sent.length, 1, "settled fence must not resend a host-dropped delivery as a duplicate");
-
-      for (const handler of handlers.before_agent_start ?? []) {
-        handler({ type: "before_agent_start", prompt: "next user request", images: [] });
-      }
-      for (const handler of handlers.agent_settled ?? []) handler({ type: "agent_settled" });
-      await new Promise((resolve) => setTimeout(resolve, 20));
-      assert.equal(sent.length, 2, "the next user prompt releases the recovered delivery");
-      assert.equal(sent[1]?.message.details.deliveryId, stableId, "recovery keeps the stable delivery ID");
+      // The settled fence recovers the host-dropped delivery, then auto-drains it
+      // as a custom message (no ack-timeout warn, no user-role merge, no manual Enter).
+      assert.equal(sent.length, 2, "settled recovery auto-drains the tool-abort-dropped delivery");
+      assert.equal(sent[1]?.message.customType, "workflow-deliver", "auto-drain keeps the customType (not user)");
+      assert.equal(sent[1]?.message.details.deliveryId, stableId, "auto-drain keeps the stable delivery ID");
+      assert.deepEqual(sent[1]?.options, { triggerTurn: true, deliverAs: "steer" });
 
       handlers.session_shutdown?.[0]?.({ reason: "quit" });
       discardWorkflowRuntime();
@@ -684,6 +678,65 @@ test("an Esc-restored steering message is intercepted and re-sent with its custo
         }
       }
       assert.equal(passthrough?.action, undefined, "non-matching input must not be intercepted");
+
+      handlers.session_shutdown?.[0]?.({ reason: "quit" });
+      discardWorkflowRuntime();
+    });
+  } finally {
+    discardWorkflowRuntime();
+    rmSync(fakeHome, { recursive: true, force: true });
+  }
+});
+
+test("multiple Esc-dropped deliveries auto-drain as separate custom messages, never merged or user-role", async () => {
+  const fakeHome = mkdtempSync(join(tmpdir(), "pi-dw-multi-esc-drain-"));
+  try {
+    await withFakeHomeAsync(fakeHome, async () => {
+      discardWorkflowRuntime();
+      const { default: installExtension } = await import("../extensions/workflow.js");
+
+      const seedHandlers: Record<string, Handler[]> = {};
+      installExtension(makePi(seedHandlers, []));
+      startSession(seedHandlers);
+      seedHandlers.session_shutdown?.[0]?.({ reason: "reload" });
+      const staged = takeWorkflowRuntime();
+      assert.ok(staged);
+      handoffWorkflowRuntime(staged);
+
+      const handlers: Record<string, Handler[]> = {};
+      const sent: Array<{ message: any; options: any }> = [];
+      installExtension(makePi(handlers, sent));
+      startSession(handlers);
+
+      // Three deliveries arrive while a turn is streaming (each enters awaitingAck).
+      staged.manager.onDeliver?.("check-1 finding", { runId: "multi-run", workflowName: "multi", alertKind: "critical_finding", sequence: 1 });
+      staged.manager.onDeliver?.("check-2 finding", { runId: "multi-run", workflowName: "multi", alertKind: "critical_finding", sequence: 2 });
+      staged.manager.onDeliver?.("check-3 decision", { runId: "multi-run", workflowName: "multi", alertKind: "decision", sequence: 3 });
+      assert.equal(sent.length, 3);
+      const ids = sent.map((s) => s.message.details.deliveryId);
+
+      // Esc aborts the streaming run: the host drops all three from the steering queue.
+      for (const handler of handlers.agent_end ?? []) {
+        handler({ type: "agent_end", messages: [{ role: "assistant", content: [], stopReason: "aborted" }] });
+      }
+      for (const handler of handlers.agent_settled ?? []) handler({ type: "agent_settled" });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      // All three auto-drain as SEPARATE custom messages — one wake + two queued
+      // steers — with stable IDs, no merge into a blob, and no user-role downgrade.
+      assert.equal(sent.length, 6, "all three dropped deliveries auto-drain after settle");
+      const drained = sent.slice(3);
+      assert.deepEqual(
+        drained.map((s) => s.message.details.deliveryId),
+        ids,
+        "auto-drain preserves each stable delivery ID in order",
+      );
+      for (const s of drained) {
+        assert.equal(s.message.customType, "workflow-deliver", "each auto-drained message keeps its customType");
+        assert.equal(s.message.role, undefined, "no user-role downgrade on auto-drain");
+      }
+      const wakes = drained.filter((s) => s.options?.triggerTurn === true);
+      assert.ok(wakes.length >= 1, "exactly one wake leads the drained batch");
 
       handlers.session_shutdown?.[0]?.({ reason: "quit" });
       discardWorkflowRuntime();

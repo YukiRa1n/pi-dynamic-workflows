@@ -627,9 +627,13 @@ function requeueWorkflowDeliveryAfterPersistenceFailure(
   scheduleWorkflowDeliveryRetry(bridge, item.id, bridge.generation);
 }
 
-function sendWorkflowDeliveryNow(bridge: WorkflowBridge, rawDelivery: WorkflowBridgeDelivery): void {
+function sendWorkflowDeliveryNow(
+  bridge: WorkflowBridge,
+  rawDelivery: WorkflowBridgeDelivery,
+  opts?: { bypassAbortFence?: boolean },
+): void {
   const delivery = normalizedWorkflowDelivery(rawDelivery);
-  if (bridge.suspended || bridge.compacting || bridge.abortFence) {
+  if (bridge.suspended || bridge.compacting || (bridge.abortFence && !opts?.bypassAbortFence)) {
     queueWorkflowDelivery(bridge, delivery);
     return;
   }
@@ -804,8 +808,9 @@ function fenceWorkflowBridgeAfterAbort(bridge: WorkflowBridge): void {
   }
 }
 
-function flushWorkflowBridge(bridge: WorkflowBridge): void {
-  if (bridge.suspended || bridge.compacting || bridge.abortFence) return;
+function flushWorkflowBridge(bridge: WorkflowBridge, opts?: { bypassAbortFence?: boolean }): void {
+  if (bridge.suspended || bridge.compacting) return;
+  if (bridge.abortFence && !opts?.bypassAbortFence) return;
   replayDurableOutbox(bridge.manager, bridge);
   if (bridge.pending.length === 0) return;
   const queued = bridge.pending.splice(0, bridge.pending.length);
@@ -816,7 +821,7 @@ function flushWorkflowBridge(bridge: WorkflowBridge): void {
   for (let index = 0; index < queued.length; index++) {
     const delivery = queued[index];
     if (delivery.customType !== "workflow-agent") {
-      sendWorkflowDeliveryNow(bridge, index === selectedWake ? delivery : { ...delivery, wake: false });
+      sendWorkflowDeliveryNow(bridge, index === selectedWake ? delivery : { ...delivery, wake: false }, opts);
     }
   }
   // Queue-full records were intentionally left only in the durable outbox.
@@ -928,8 +933,28 @@ function installWorkflowCompactionFence(pi: ExtensionAPI, getManager: () => Work
     // Recover host-dropped deliveries BEFORE any flush so a settled flush cannot
     // resend a duplicate of a message the host discarded on Esc/abort-during-tool.
     fenceWorkflowBridgeDroppedDeliveries(bridge);
-    if (bridge.compacting) releaseCompactionFence(bridge, bridge.compactionGeneration);
-    else flushWorkflowBridge(bridge);
+    if (bridge.compacting) {
+      releaseCompactionFence(bridge, bridge.compactionGeneration);
+      return;
+    }
+    if (bridge.abortFence && bridge.pending.length > 0) {
+      // Esc/abort recovery: the run has fully settled, so automatically re-send
+      // each dropped delivery as its own custom message (no merge, no manual
+      // Enter). The first wake starts a turn; the host queues the rest as
+      // steering while that turn streams, so they are delivered one by one in
+      // order — never a parallel provider run, never a merged user blob.
+      // Clear the fence only for this controlled drain; it is re-set below so a
+      // later unrelated settled event cannot wake an idle session on its own.
+      for (const delivery of bridge.pending) {
+        const fingerprint = deliveryFingerprint(delivery);
+        if (fingerprint) bridge.droppedByFingerprint.delete(fingerprint);
+      }
+      bridge.abortFence = false;
+      flushWorkflowBridge(bridge, { bypassAbortFence: true });
+      bridge.abortFence = true;
+      return;
+    }
+    flushWorkflowBridge(bridge);
   });
 }
 
