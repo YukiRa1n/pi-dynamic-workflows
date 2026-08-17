@@ -314,6 +314,14 @@ type WorkflowBridge = {
   retryingSendIds: Set<string>;
   /** Set after a user-aborted agent run; delivery must not wake a new run until input. */
   abortFence: boolean;
+  /**
+   * Esc-recovery map: normalized text fingerprint of each delivery the host
+   * dropped from its steering queue (user pressed Esc, which converts the
+   * message to plain editor text). When the user re-submits that exact text,
+   * the input event handler intercepts it and re-sends the original custom
+   * message so role/customType/details survive instead of becoming role=user.
+   */
+  droppedByFingerprint: Map<string, WorkflowBridgeDelivery>;
 };
 
 type ManagerWithWorkflowBridge = WorkflowManager & {
@@ -732,6 +740,38 @@ function sendWorkflowDelivery(bridge: WorkflowBridge, delivery: WorkflowBridgeDe
 }
 
 /**
+ * Normalize a delivery's provider-visible text into the fingerprint the input
+ * handler matches against. The host's Esc path flattens the custom message to
+ * the same plain text (contentText of message.content), so normalizing our own
+ * content the same way lets us recognize when the user re-submits it verbatim.
+ * Whitespace is collapsed to tolerate editor reflow without changing identity.
+ */
+function deliveryFingerprint(delivery: WorkflowBridgeDelivery): string {
+  return customMessageText(delivery.content).replace(/\s+/g, " ").trim();
+}
+
+/**
+ * Record each host-dropped delivery by its text fingerprint so the input event
+ * can intercept the Esc-restored re-submission. Host clearQueue() returns the
+ * steering texts joined by "\n\n", so a single dropped delivery maps cleanly;
+ * multiple simultaneous drops are joined into one combined editor text, which
+ * we register under the combined fingerprint as well as each individual one.
+ */
+function registerDroppedDeliveries(bridge: WorkflowBridge, deliveries: Iterable<WorkflowBridgeDelivery>): void {
+  const list = [...deliveries];
+  for (const delivery of list) {
+    const fingerprint = deliveryFingerprint(delivery);
+    if (fingerprint) bridge.droppedByFingerprint.set(fingerprint, delivery);
+  }
+  // Cap the map so a long session of aborted runs cannot grow it without bound.
+  while (bridge.droppedByFingerprint.size > WORKFLOW_BRIDGE_DEDUP_LIMIT) {
+    const oldest = bridge.droppedByFingerprint.keys().next().value as string | undefined;
+    if (oldest === undefined) break;
+    bridge.droppedByFingerprint.delete(oldest);
+  }
+}
+
+/**
  * A user abort ends the current host turn. Do not let a rejected custom-message
  * promise, an ack timeout, or agent_settled turn that abort wake the model again.
  * Move only in-memory submissions back to the durable/pending path; the durable
@@ -753,6 +793,9 @@ function fenceWorkflowBridgeAfterAbort(bridge: WorkflowBridge): void {
   bridge.uncertainAck.clear();
   bridge.projectedForNextRequest = [];
   bridge.includedInProviderRequest = [];
+  // The host dropped these from its steering queue on Esc; register them BEFORE
+  // requeueing so the input handler can restore metadata when the user re-sends.
+  registerDroppedDeliveries(bridge, unacknowledged.values());
   for (const delivery of unacknowledged.values()) {
     queueWorkflowDelivery(bridge, {
       ...delivery,
@@ -882,9 +925,58 @@ function installWorkflowCompactionFence(pi: ExtensionAPI, getManager: () => Work
   pi.on("agent_settled", () => {
     const bridge = bridgeFor(getManager());
     if (!bridge) return;
+    // Recover host-dropped deliveries BEFORE any flush so a settled flush cannot
+    // resend a duplicate of a message the host discarded on Esc/abort-during-tool.
+    fenceWorkflowBridgeDroppedDeliveries(bridge);
     if (bridge.compacting) releaseCompactionFence(bridge, bridge.compactionGeneration);
     else flushWorkflowBridge(bridge);
   });
+}
+
+/**
+ * Settled fence: the catch-all for deliveries the host dropped without an
+ * "aborted" stopReason. The primary abort fence relies on agent_end carrying a
+ * final assistant message with stopReason "aborted", but a user Esc during a
+ * tool call ends the run with that assistant's stopReason still "toolUse" —
+ * the primary fence then never fires and the 120s ack watchdog would warn and
+ * resend a duplicate. Here, at the settled boundary, any awaitingAck entry of
+ * the current generation that never reached includedInProviderRequest is proof
+ * the message never entered provider context: the host discarded it. Requeue it
+ * silently (no warn, no immediate flush) so it is recovered on the next real
+ * user input instead of timing out noisily.
+ *
+ * Idempotent: when the primary abort fence already ran, awaitingAck is empty
+ * and this is a no-op. Entries already in includedInProviderRequest are left
+ * for the watchdog / a late 2xx (genuine transport uncertainty), not here.
+ */
+function fenceWorkflowBridgeDroppedDeliveries(bridge: WorkflowBridge): void {
+  if (bridge.suspended) return;
+  const dropped: WorkflowBridgeDelivery[] = [];
+  for (const [id, delivery] of [...bridge.awaitingAck.entries()]) {
+    const generation = delivery.details?.deliveryGeneration;
+    if (typeof generation !== "number") continue;
+    const reachedProvider = bridge.includedInProviderRequest.some(
+      (item) => item.id === id && item.generation === generation,
+    );
+    if (reachedProvider) continue;
+    clearWorkflowAckWatchdog(bridge, id, generation);
+    bridge.awaitingAck.delete(id);
+    clearWorkflowProviderTracking(bridge, id, generation);
+    dropped.push(delivery);
+  }
+  if (dropped.length === 0) return;
+  // These were dropped by the host (Esc / abort-during-tool). Register their
+  // fingerprints so the input handler can restore metadata on re-submission,
+  // and hold the wake until the next genuine user prompt.
+  registerDroppedDeliveries(bridge, dropped);
+  bridge.abortFence = true;
+  bridge.retryingSendIds.clear();
+  for (const delivery of dropped) {
+    queueWorkflowDelivery(bridge, {
+      ...delivery,
+      details: { ...delivery.details, deliveryGeneration: undefined },
+    });
+  }
 }
 
 function installWorkflowAbortFence(pi: ExtensionAPI, getManager: () => WorkflowManager): void {
@@ -950,6 +1042,7 @@ function bindDeliverBridge(manager: WorkflowManager, pi: ExtensionAPI): void {
       includedInProviderRequest: [],
       retryingSendIds: new Set<string>(),
       abortFence: false,
+      droppedByFingerprint: new Map<string, WorkflowBridgeDelivery>(),
     } satisfies WorkflowBridge);
   // Backfill fields when handing off a manager created by an older extension
   // generation that predates batching support.
@@ -960,6 +1053,7 @@ function bindDeliverBridge(manager: WorkflowManager, pi: ExtensionAPI): void {
   bridge.includedInProviderRequest ??= [];
   bridge.retryingSendIds ??= new Set<string>();
   bridge.abortFence ??= false;
+  bridge.droppedByFingerprint ??= new Map<string, WorkflowBridgeDelivery>();
   bridge.retryingSendIds.clear();
   requeueUnacknowledgedForNextGeneration(bridge);
   bridge.compacting = false;
@@ -1380,6 +1474,37 @@ function installWorkflowScriptGate(pi: ExtensionAPI): void {
   pi.on("tool_call", (event) => gateWorkflowScriptToolCall(event as WorkflowScriptGateToolCallEvent));
 }
 
+/**
+ * Esc-recovery intercept. When the user aborts a turn, the host flattens queued
+ * steering custom messages to plain text in the editor (agent-session.clearQueue
+ * keeps only text) and, on the next Enter, re-queues them through _queueSteer
+ * with a hardcoded role:"user" — customType/details/deliveryId are lost. The
+ * input event fires on that re-submission before the steer is queued. If the
+ * submitted text matches a dropped delivery's fingerprint, swallow it
+ * ({action:"handled"}) and re-send the original custom message instead, so the
+ * delivery keeps role:"custom" and its metadata rather than becoming user text.
+ * A non-matching input passes through untouched.
+ */
+function installWorkflowEscRecovery(pi: ExtensionAPI, getManager: () => WorkflowManager): void {
+  pi.on("input", (event) => {
+    const bridge = bridgeFor(getManager());
+    if (!bridge || bridge.droppedByFingerprint.size === 0) return undefined;
+    if (typeof event.text !== "string" || event.text.trim().length === 0) return undefined;
+    const fingerprint = event.text.replace(/\s+/g, " ").trim();
+    const dropped = bridge.droppedByFingerprint.get(fingerprint);
+    if (!dropped) return undefined;
+    bridge.droppedByFingerprint.delete(fingerprint);
+    // Release the abort fence: this re-submission is the user's explicit input.
+    bridge.abortFence = false;
+    // Re-send through the normal safe-point path. sendWorkflowDeliveryNow dedups
+    // against pending/awaitingAck, and the pending copy (requeued by the fence)
+    // is discarded here so only this metadata-rich resend proceeds.
+    bridge.pending = bridge.pending.filter((item) => item.id !== dropped.id);
+    sendWorkflowDelivery(bridge, dropped);
+    return { action: "handled" };
+  });
+}
+
 export default function extension(pi: ExtensionAPI) {
   // Mutable host state. Tools/commands resolve through getters so a
   // session_start that discovers a cross-project cwd can replace the manager
@@ -1560,6 +1685,7 @@ export default function extension(pi: ExtensionAPI) {
   registerEffortCommand(pi, effort);
 
   let armingInstalled = false;
+  let escRecoveryInstalled = false;
 
   pi.on("session_start", (_event: unknown, ctx: ExtensionContext) => {
     // True project cwd for this session. Pi keeps process.cwd() on the
@@ -1654,6 +1780,14 @@ export default function extension(pi: ExtensionAPI) {
         },
       });
       armingInstalled = true;
+    }
+    // Esc-recovery reads the final (possibly keyword-transformed) input text, so
+    // it registers after keyword arming: a read-only matcher that runs last and
+    // never shadows the arming handler's input[0] position. Guarded because
+    // session_start fires on every reload.
+    if (!escRecoveryInstalled) {
+      installWorkflowEscRecovery(pi, getManager);
+      escRecoveryInstalled = true;
     }
   });
 }

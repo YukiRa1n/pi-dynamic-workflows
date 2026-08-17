@@ -553,3 +553,143 @@ test("durable delivery phase failures release in-memory fences and retry at a sa
     rmSync(fakeHome, { recursive: true, force: true });
   }
 });
+
+test("an abort during tool execution fences the delivery without an ack-timeout resend", async () => {
+  const fakeHome = mkdtempSync(join(tmpdir(), "pi-dw-tool-abort-fence-"));
+  try {
+    await withFakeHomeAsync(fakeHome, async () => {
+      discardWorkflowRuntime();
+      const { default: installExtension } = await import("../extensions/workflow.js");
+
+      const seedHandlers: Record<string, Handler[]> = {};
+      installExtension(makePi(seedHandlers, []));
+      startSession(seedHandlers);
+      seedHandlers.session_shutdown?.[0]?.({ reason: "reload" });
+      const staged = takeWorkflowRuntime();
+      assert.ok(staged);
+      handoffWorkflowRuntime(staged);
+
+      const handlers: Record<string, Handler[]> = {};
+      const sent: Array<{ message: any; options: any }> = [];
+      installExtension(makePi(handlers, sent));
+      startSession(handlers);
+
+      staged.manager.onDeliver?.("dropped by tool abort", {
+        runId: "tool-abort-run",
+        workflowName: "tool abort",
+        alertKind: "critical_finding",
+      });
+      assert.equal(sent.length, 1);
+      const stableId = sent[0]?.message.details.deliveryId;
+
+      // Esc during a tool call: agent_end's last assistant stopReason is "toolUse",
+      // not "aborted", so the primary abort fence misses it. The settled fence must
+      // recover the host-dropped delivery instead of letting the ack watchdog resend.
+      for (const handler of handlers.agent_end ?? []) {
+        handler({
+          type: "agent_end",
+          messages: [
+            { role: "assistant", content: [{ type: "toolCall", id: "t1", name: "get_workflow_output" }], stopReason: "toolUse" },
+            { role: "toolResult", toolCallId: "t1", content: [] },
+          ],
+        });
+      }
+      for (const handler of handlers.agent_settled ?? []) handler({ type: "agent_settled" });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.equal(sent.length, 1, "settled fence must not resend a host-dropped delivery as a duplicate");
+
+      for (const handler of handlers.before_agent_start ?? []) {
+        handler({ type: "before_agent_start", prompt: "next user request", images: [] });
+      }
+      for (const handler of handlers.agent_settled ?? []) handler({ type: "agent_settled" });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.equal(sent.length, 2, "the next user prompt releases the recovered delivery");
+      assert.equal(sent[1]?.message.details.deliveryId, stableId, "recovery keeps the stable delivery ID");
+
+      handlers.session_shutdown?.[0]?.({ reason: "quit" });
+      discardWorkflowRuntime();
+    });
+  } finally {
+    discardWorkflowRuntime();
+    rmSync(fakeHome, { recursive: true, force: true });
+  }
+});
+
+test("an Esc-restored steering message is intercepted and re-sent with its custom metadata", async () => {
+  const fakeHome = mkdtempSync(join(tmpdir(), "pi-dw-esc-recovery-"));
+  try {
+    await withFakeHomeAsync(fakeHome, async () => {
+      discardWorkflowRuntime();
+      const { default: installExtension } = await import("../extensions/workflow.js");
+
+      const seedHandlers: Record<string, Handler[]> = {};
+      installExtension(makePi(seedHandlers, []));
+      startSession(seedHandlers);
+      seedHandlers.session_shutdown?.[0]?.({ reason: "reload" });
+      const staged = takeWorkflowRuntime();
+      assert.ok(staged);
+      handoffWorkflowRuntime(staged);
+
+      const handlers: Record<string, Handler[]> = {};
+      const sent: Array<{ message: any; options: any }> = [];
+      installExtension(makePi(handlers, sent));
+      startSession(handlers);
+
+      const deliveryText = "subagent finished its review";
+      staged.manager.onDeliver?.(deliveryText, {
+        runId: "esc-recovery-run",
+        workflowName: "esc recovery",
+        alertKind: "critical_finding",
+      });
+      assert.equal(sent.length, 1);
+      const stableId = sent[0]?.message.details.deliveryId;
+
+      // Esc aborts the run (stream abort: primary fence registers the fingerprint).
+      for (const handler of handlers.agent_end ?? []) {
+        handler({
+          type: "agent_end",
+          messages: [{ role: "assistant", content: [], stopReason: "aborted" }],
+        });
+      }
+
+      // The host flattens the dropped message to plain editor text; the user hits
+      // Enter. The input event must intercept that exact text and re-send the
+      // original custom message instead of letting it become role:"user". The
+      // real host short-circuits on the first "handled" result, so mirror that.
+      let inputResult: any;
+      for (const handler of handlers.input ?? []) {
+        const result = handler({ type: "input", text: deliveryText, source: "interactive" });
+        if (result?.action === "handled") {
+          inputResult = result;
+          break;
+        }
+        inputResult = result;
+      }
+      assert.equal(inputResult?.action, "handled", "the re-submitted delivery text must be intercepted");
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.equal(sent.length, 2, "the intercepted input re-sends the delivery");
+      assert.equal(sent[1]?.message.customType, "workflow-deliver", "recovery preserves the customType");
+      assert.equal(sent[1]?.message.details.deliveryId, stableId, "recovery preserves the stable delivery ID");
+      assert.deepEqual(sent[1]?.options, { triggerTurn: true, deliverAs: "steer" });
+
+      // A later unrelated user input must pass through untouched (no false positive).
+      // No handler may short-circuit it with "handled"; a "continue" from the
+      // keyword-arming handler is a pass-through, not an interception.
+      let passthrough: any;
+      for (const handler of handlers.input ?? []) {
+        const result = handler({ type: "input", text: "an unrelated question", source: "interactive" });
+        if (result?.action === "handled") {
+          passthrough = result;
+          break;
+        }
+      }
+      assert.equal(passthrough?.action, undefined, "non-matching input must not be intercepted");
+
+      handlers.session_shutdown?.[0]?.({ reason: "quit" });
+      discardWorkflowRuntime();
+    });
+  } finally {
+    discardWorkflowRuntime();
+    rmSync(fakeHome, { recursive: true, force: true });
+  }
+});
