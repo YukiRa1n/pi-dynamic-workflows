@@ -70,9 +70,18 @@ test("string-keyed reflection routes are all blocked", () => {
 });
 
 test("__proto__ in every position is blocked", () => {
-  assertBlocked(`${META}\nreturn ({}).__proto__;`, "proto-access");
+  assertBlocked(`${META}\nreturn ({}).__proto__;`, "dangerous-member");
   assertBlocked(`${META}\nconst o = { __proto__: null };`, "proto-key");
   assertBlocked(`${META}\nconst o = { "__proto__": null };`, "proto-key");
+});
+
+test("literal constructor / prototype member access is blocked", () => {
+  // The runtime prelude patches .constructor on injected globals; the audit
+  // rejects the literal form so a missed runtime patch is not exploitable.
+  assertBlocked(`${META}\nreturn agent.constructor;`, "dangerous-member");
+  assertBlocked(`${META}\nreturn Object.getPrototypeOf;`, "object-reflection");
+  assertBlocked(`${META}\nreturn SomeClass.prototype;`, "unknown-global");
+  assertBlocked(`${META}\nconst o = {}; return o.constructor;`, "dangerous-member");
 });
 
 test("dynamic code execution is blocked", () => {
@@ -177,4 +186,90 @@ const o = { customName: 1 };
 outer: for (const x of [1]) { break outer; }
 const { customName: renamed } = o;
 return renamed;`);
+});
+
+// ─── realm-escape primitives are not whitelisted ─────────────────────────────
+
+test("globalThis, Reflect, and Proxy are not in the safe built-in set", () => {
+  // globalThis.constructor is the host Object (probe-verified); Reflect.*
+  // and Proxy reach across the realm boundary regardless of literal checks.
+  assertBlocked(`${META}\nreturn globalThis.constructor;`, "dangerous-member");
+  assertBlocked(`${META}\nreturn Reflect.get(agent, "x");`, "unknown-global");
+  assertBlocked(`${META}\nreturn new Proxy({}, {});`, "unknown-global");
+});
+
+test("Object cross-realm reflection methods are blocked", () => {
+  assertBlocked(`${META}\nreturn Object.getPrototypeOf(agent);`, "object-reflection");
+  assertBlocked(`${META}\nreturn Object.setPrototypeOf({}, null);`, "object-reflection");
+  assertBlocked(`${META}\nreturn Object.defineProperty({}, "x", {});`, "object-reflection");
+  assertBlocked(`${META}\nreturn Object.create(null);`, "object-reflection");
+  // Data-shape helpers stay allowed.
+  assertAllowed(`${META}\nreturn Object.keys({ a: 1 }).length + Object.values({ b: 2 }).length;`);
+});
+
+// ─── indexed-access carve-out ────────────────────────────────────────────────
+
+test("local array indexed by a number or loop variable passes", () => {
+  assertAllowed(`${META}
+const verdicts = [1, 2, 3];
+let total = verdicts[0];
+for (let i = 0; i < verdicts.length; i++) { total += verdicts[i]; }
+const first = verdicts[0];
+return { total, first };`);
+});
+
+test("indexed access on bridge globals and non-array locals stays blocked", () => {
+  // args / agent results are not plain local arrays — the audit cannot prove
+  // the container shape, so string-keyed access stays rejected.
+  assertBlocked(`${META}\nconst k = "x"; return args[k];`, "computed-member-access");
+  assertBlocked(`${META}\nreturn agent["constructor"];`, "computed-member-access");
+  assertBlocked(`${META}\nconst o = { a: 1 }; return o["a"];`, "computed-member-access");
+});
+
+// ─── bridge-global shadowing in nested positions ─────────────────────────────
+
+test("bridge globals cannot be shadowed as params or catch bindings", () => {
+  assertBlocked(`${META}\nconst f = (agent) => agent;`, "shadowed-bridge-global");
+  assertBlocked(`${META}\ntry {} catch (log) {}`, "shadowed-bridge-global");
+  assertBlocked(`${META}\nconst g = function parallel() {};`, "shadowed-bridge-global");
+});
+
+// ─── gate byte cap ───────────────────────────────────────────────────────────
+
+test("oversized script is rejected without parsing", () => {
+  const huge = `${META}\n//` + "x".repeat(1_100_000);
+  const violations = auditWorkflowScript(huge);
+  assert.equal(violations.length, 1);
+  assert.equal(violations[0].rule, "script-too-large");
+});
+
+// ─── tool_call wiring (mock event, no Pi session) ───────────────────────────
+
+test("gateWorkflowScriptToolCall blocks a malicious start_workflow call", async () => {
+  const { gateWorkflowScriptToolCall } = await import("../extensions/workflow.js");
+  const result = gateWorkflowScriptToolCall({
+    toolName: "start_workflow",
+    input: { script: `${META}\nreturn globalThis.constructor.constructor("return process")();` },
+  });
+  assert.ok(result, "expected a block result");
+  assert.equal(result.block, true);
+  assert.equal(result.terminate, true);
+  assert.match(result.reason, /static audit/);
+});
+
+test("gateWorkflowScriptToolCall passes through non-workflow tools and clean scripts", async () => {
+  const { gateWorkflowScriptToolCall } = await import("../extensions/workflow.js");
+  // Other tools are never gated.
+  assert.equal(gateWorkflowScriptToolCall({ toolName: "read_file", input: { script: "evil" } }), undefined);
+  // Preset / no-script invocations are never gated.
+  assert.equal(gateWorkflowScriptToolCall({ toolName: "start_workflow", input: { preset: "code-review" } }), undefined);
+  assert.equal(gateWorkflowScriptToolCall({ toolName: "start_workflow", input: {} }), undefined);
+  // Clean script passes.
+  assert.equal(
+    gateWorkflowScriptToolCall({
+      toolName: "start_workflow",
+      input: { script: `${META}\nreturn agent("ok", { label: "x" });` },
+    }),
+    undefined,
+  );
 });

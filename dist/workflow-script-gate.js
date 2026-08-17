@@ -24,10 +24,16 @@ import { parse } from "acorn";
  *   key.
  * - Reflection-by-string: no computed member access `obj[expr]`, no computed
  *   property keys, no `for...in` — string-keyed access can reach
- *   `constructor`/mutators that literal checks cannot see.
+ *   `constructor`/mutators that literal checks cannot see. (Plain indexed
+ *   access on a local array with a numeric/loop-variable index is allowed;
+ *   see `isLocalIndexedAccess`.)
+ * - Dangerous members: literal `.constructor` / `.prototype` / `__proto__`
+ *   member access is always rejected — these are the escape primitives that
+ *   string-keyed reflection is just a longer path to.
  * - Global names: free references must resolve to a local binding, an
  *   injected workflow global, or a safe vm-realm built-in (Function/eval are
- *   NOT in the built-in set).
+ *   NOT in the built-in set; `globalThis`, `Reflect`, and `Proxy` are also
+ *   not in the built-in set because they are realm-escape primitives).
  *
  * Known limits (documented, not hidden): a script inside this subset can
  * still waste tokens through agent() fan-out (bounded by run resource
@@ -36,7 +42,9 @@ import { parse } from "acorn";
  * sandbox escapes, and are enforced by the manager's existing ceilings.
  */
 /** Injected workflow runtime globals (mirrors the capability contract's
- * runtimeGlobal list — keep in sync). */
+ * runtimeGlobal list — keep in sync). `meta` is NOT listed: the runner strips
+ * the `export const meta` declaration before wrapping, so a top-level `meta`
+ * reference would be a ReferenceError at runtime. */
 const WORKFLOW_GLOBALS = new Set([
     "agent",
     "parallel",
@@ -58,15 +66,16 @@ const WORKFLOW_GLOBALS = new Set([
     "process",
     "budget",
     "console",
-    "meta",
 ]);
 /** vm-realm built-ins that cannot reach host state. Function, eval,
  * GeneratorFunction and AsyncFunction are deliberately absent (dynamic code
- * execution). Date/Math are present; their nondeterministic entry points are
- * neutered in-realm by DETERMINISM_PRELUDE and rejected by the runner's own
- * findNondeterminism pass. */
+ * execution). `globalThis`, `Reflect`, and `Proxy` are absent: they are
+ * realm-escape primitives (globalThis.constructor is the host Object;
+ * Reflect.get/setPrototypeOf reach across the realm boundary regardless of
+ * the audit's literal-member checks). Date/Math are present; their
+ * nondeterministic entry points are neutered in-realm by DETERMINISM_PRELUDE
+ * and rejected by the runner's own findNondeterminism pass. */
 const SAFE_BUILTINS = new Set([
-    "globalThis",
     "undefined",
     "NaN",
     "Infinity",
@@ -96,13 +105,12 @@ const SAFE_BUILTINS = new Set([
     "Uint8ClampedArray",
     "Uint16Array",
     "Uint32Array",
+    "Intl",
     "JSON",
     "Map",
     "Math",
     "Number",
     "Promise",
-    "Proxy",
-    "Reflect",
     "RegExp",
     "Set",
     "SharedArrayBuffer",
@@ -122,14 +130,26 @@ const SAFE_BUILTINS = new Set([
     "isNaN",
     "parseFloat",
     "parseInt",
-    "queueMicrotask",
-    "structuredClone",
-    "atob",
-    "btoa",
-    "TextEncoder",
-    "TextDecoder",
-    "URL",
-    "URLSearchParams",
+]);
+/** Object static methods that mutate or introspect prototype/own-property
+ * metadata — these reach across the realm boundary and defeat the audit's
+ * literal-member checks. Only the pure data-shape helpers stay allowed. */
+const OBJECT_REFLECTION_METHODS = new Set([
+    "getPrototypeOf",
+    "setPrototypeOf",
+    "defineProperty",
+    "defineProperties",
+    "create",
+    "getOwnPropertyDescriptor",
+    "getOwnPropertyDescriptors",
+    "getOwnPropertyNames",
+    "getOwnPropertySymbols",
+    "freeze",
+    "seal",
+    "preventExtensions",
+    "isFrozen",
+    "isSealed",
+    "isExtensible",
 ]);
 /** Host bridge globals that can never be redeclared locally: a local
  * `const agent = ...` would both shadow the runtime and give the script a
@@ -154,9 +174,18 @@ const PROTECTED_GLOBALS = new Set([
     "budget",
     "console",
 ]);
+/** Members that are always rejected when accessed literally. These are the
+ * host-realm escape primitives; string-keyed reflection (`obj["constructor"]`)
+ * is the same attack and is already rejected by the computed-member rule. */
+const DANGEROUS_MEMBERS = new Set(["constructor", "prototype", "__proto__"]);
 /** Cap the report size; the scan still covers the whole file so the model
  * sees the shape of what to fix, but reason text stays small. */
 const MAX_REPORTED_VIOLATIONS = 8;
+/** Hard byte cap on what the gate will even parse. Larger inputs are rejected
+ * without parsing so a multi-MB model response cannot stall the session in a
+ * synchronous acorn pass. The runner's own 10 MB limit stays as the outer
+ * boundary; this is the gate's cheaper early exit. */
+const GATE_MAX_SCRIPT_BYTES = 1_000_000;
 const NON_CHILD_KEYS = new Set([
     "type",
     "start",
@@ -219,11 +248,55 @@ function patternNames(pattern, out = []) {
     }
     return out;
 }
+function createScope(parent) {
+    return { names: new Set(), parent };
+}
+function scopeLookup(scope, name) {
+    let current = scope;
+    while (current) {
+        if (current.names.has(name))
+            return true;
+        current = current.parent;
+    }
+    return false;
+}
+/** Register a binding pattern's names in the given scope. */
+function bindPattern(scope, pattern) {
+    for (const name of patternNames(pattern))
+        scope.names.add(name);
+}
+/** Whether a node opens a new lexical scope for its body. Note: class
+ * declarations/expressions do NOT open a scope for the class name itself
+ * (the name is visible to following statements), only for the class body —
+ * pass 1 handles that by registering the name in the enclosing scope before
+ * descending into the body scope. */
+function opensScope(node) {
+    switch (node.type) {
+        case "FunctionDeclaration":
+        case "FunctionExpression":
+        case "ArrowFunctionExpression":
+        case "BlockStatement":
+        case "ForStatement":
+        case "ForOfStatement":
+        case "CatchClause":
+        case "StaticBlock":
+            return true;
+        default:
+            return false;
+    }
+}
+/** ForInStatement does NOT open a scope here — it is rejected outright in
+ * pass 2, so its body's scoping is irrelevant. */
 /**
  * Whether an Identifier occurrence reads a value, classified from the parent
  * slot recorded during the walk. Non-reference slots (declaration ids, member
  * property names, labels, import/export specifiers, binding patterns) are
  * excluded so the unknown-global rule only fires on genuine free references.
+ *
+ * Assignment/UpdateExpression targets (`x = 1`, `[x] = arr`, `({p: x} = o)`)
+ * are references: they write through the resolved binding, so an unresolved
+ * target must still be reported (strict-mode ReferenceError at runtime, and
+ * a silent host-global write in sloppy mode).
  */
 function isReferencePosition(node) {
     const parent = node.__parent;
@@ -246,8 +319,12 @@ function isReferencePosition(node) {
         case "FunctionExpression":
         case "ArrowFunctionExpression":
         case "ClassDeclaration":
+            // `id` is the declaration binding (registered in the enclosing scope
+            // by pass 1); `superClass`/`body` are evaluated positions.
+            return key !== "id";
         case "ClassExpression":
-            return key !== "id" && key !== "params";
+            // `id` binds only inside the class's own scope (registered by pass 1).
+            return key !== "id";
         case "LabeledStatement":
         case "BreakStatement":
         case "ContinueStatement":
@@ -263,12 +340,42 @@ function isReferencePosition(node) {
         case "ArrayPattern":
         case "RestElement":
             return false;
-        case "AssignmentPattern":
-            return key === "right";
         case "MetaProperty":
             return false;
         default:
+            // Assignment targets (`x = 1`, `[x] = arr`, `({p: x} = o)`) write
+            // through the resolved binding, so an unresolved target must still be
+            // reported (strict-mode ReferenceError at runtime, silent host-global
+            // write in sloppy mode).
             return true;
+    }
+}
+/** Whether `node` is an allowed indexed access: a local identifier bound to
+ * an array literal, indexed by a numeric literal or a local identifier.
+ * `arr[0]` / `verdicts[i]` pass; `args[key]` / `agent["x"]` / anything whose
+ * base is not a locally-declared array stays rejected — the audit cannot
+ * prove those containers are plain data. */
+function isLocalIndexedAccess(node, scope) {
+    const object = node.object;
+    if (!object || object.type !== "Identifier")
+        return false;
+    // Only a local binding, and only one pass 1 saw initialized from an array
+    // literal, qualifies. Bridge globals (args, agent, ...) and whitelisted
+    // built-ins are never in any local scope, so they cannot reach here.
+    if (!scopeLookup(scope, object.name))
+        return false;
+    if (!node.__arrayLocals?.has(object.name))
+        return false;
+    const property = node.property;
+    if (!property)
+        return false;
+    switch (property.type) {
+        case "Literal":
+            return typeof property.value === "number";
+        case "Identifier":
+            return scopeLookup(scope, property.name);
+        default:
+            return false;
     }
 }
 /**
@@ -284,6 +391,14 @@ export function auditWorkflowScript(script) {
             return;
         violations.push({ rule, message, line: node?.loc?.start?.line });
     };
+    if (typeof script === "string" && script.length > GATE_MAX_SCRIPT_BYTES) {
+        return [
+            {
+                rule: "script-too-large",
+                message: `Script exceeds the audit's ${GATE_MAX_SCRIPT_BYTES}-character parse budget`,
+            },
+        ];
+    }
     let ast;
     try {
         // Same parse surface as the runner's parseWorkflowScript: module source
@@ -305,73 +420,107 @@ export function auditWorkflowScript(script) {
             },
         ];
     }
-    // Pass 1: collect every local binding (function/class declarations hoist,
-    // so this must be a full pre-pass before reference checks).
-    const localBindings = new Set();
+    // Pass 1: build the lexical scope tree and register bindings. Function and
+    // class declarations hoist within their scope, so they are registered
+    // before any reference is evaluated in pass 2. Each scope-opening node gets
+    // a fresh child scope; everything else shares the enclosing scope.
+    //
+    // We store the scope each node belongs to on `__scope` so pass 2 can look
+    // up the correct chain for any reference without re-deriving it. We also
+    // record which local names were initialized from an array literal
+    // (`__arrayLocals`) so the indexed-access carve-out only applies to plain
+    // local arrays — never to bridge globals like `args`.
+    const moduleScope = createScope(null);
+    const arrayLocals = new Set();
     {
-        const stack = [ast];
+        const stack = [{ node: ast, scope: moduleScope }];
         while (stack.length) {
-            const node = stack.pop();
+            const { node, scope } = stack.pop();
+            node.__scope = scope;
+            node.__arrayLocals = arrayLocals;
             switch (node.type) {
-                case "VariableDeclaration":
+                case "VariableDeclaration": {
                     for (const declaration of node.declarations ?? []) {
-                        for (const name of patternNames(declaration.id))
-                            localBindings.add(name);
+                        bindPattern(scope, declaration.id);
+                        if (declaration.id?.type === "Identifier" && declaration.init?.type === "ArrayExpression") {
+                            arrayLocals.add(declaration.id.name);
+                        }
                     }
                     break;
-                case "FunctionDeclaration":
+                }
+                case "FunctionDeclaration": {
                     if (node.id)
-                        localBindings.add(node.id.name);
-                    for (const param of node.params ?? []) {
-                        for (const name of patternNames(param))
-                            localBindings.add(name);
-                    }
+                        scope.names.add(node.id.name);
+                    // Function params live in the function's own scope, registered when
+                    // we descend into the function node below (it opens a new scope).
                     break;
+                }
+                case "ClassDeclaration": {
+                    if (node.id)
+                        scope.names.add(node.id.name);
+                    // Class body opens its own scope; register the class name there too
+                    // so methods/computed keys can reference the class being defined.
+                    break;
+                }
                 case "FunctionExpression":
-                case "ArrowFunctionExpression":
-                    if (node.type === "FunctionExpression" && node.id)
-                        localBindings.add(node.id.name);
-                    for (const param of node.params ?? []) {
-                        for (const name of patternNames(param))
-                            localBindings.add(name);
-                    }
+                case "ArrowFunctionExpression": {
+                    // Named function expressions bind their own name only inside their
+                    // own scope; params likewise. Registered on descent.
                     break;
-                case "ClassDeclaration":
+                }
                 case "ClassExpression":
-                    if (node.id)
-                        localBindings.add(node.id.name);
                     break;
-                case "CatchClause":
-                    for (const name of patternNames(node.param))
-                        localBindings.add(name);
+                case "CatchClause": {
+                    // Catch param is registered in the catch scope on descent.
                     break;
-                case "ImportDeclaration":
+                }
+                case "ImportDeclaration": {
                     // Static imports are rejected in pass 2; collecting the names here
                     // avoids a second wave of "unknown global" noise on the same code.
                     for (const specifier of node.specifiers ?? []) {
                         if (specifier.local?.name)
-                            localBindings.add(specifier.local.name);
+                            scope.names.add(specifier.local.name);
                     }
                     break;
+                }
                 default:
                     break;
             }
             for (const key of childKeys(node)) {
-                for (const child of childrenOf(node, key))
-                    stack.push(child);
+                for (const child of childrenOf(node, key)) {
+                    const childScope = opensScope(child) ? createScope(scope) : scope;
+                    // Register bindings that belong to the NEW child scope before
+                    // descending: function/arrow params, function-expression name,
+                    // catch param. Class declaration/expression names were already
+                    // registered in the OUTER scope when the class node itself was
+                    // visited (they are visible to following statements), so they are
+                    // NOT re-registered here.
+                    if (childScope !== scope) {
+                        if (child.type === "FunctionExpression" && child.id) {
+                            childScope.names.add(child.id.name);
+                        }
+                        if (child.type === "FunctionDeclaration" ||
+                            child.type === "FunctionExpression" ||
+                            child.type === "ArrowFunctionExpression") {
+                            for (const param of child.params ?? [])
+                                bindPattern(childScope, param);
+                        }
+                        if (child.type === "CatchClause")
+                            bindPattern(childScope, child.param);
+                    }
+                    stack.push({ node: child, scope: childScope });
+                }
             }
         }
     }
     // Pass 2: enforce the subset. Parent links are attached as we descend so
-    // Identifier reference classification can inspect its slot.
+    // Identifier reference classification can inspect its slot; scope lookups
+    // use the `__scope` recorded in pass 1.
     {
         const stack = [ast];
         while (stack.length) {
             const node = stack.pop();
             switch (node.type) {
-                case "WithStatement":
-                    push("with-statement", "`with` is not allowed (scope ambiguity defeats the audit)", node);
-                    break;
                 case "ImportDeclaration":
                     push("import-declaration", "`import` is not allowed; workflows use injected globals, not modules", node);
                     break;
@@ -385,17 +534,30 @@ export function auditWorkflowScript(script) {
                     push("for-in", "`for...in` is not allowed (string-key enumeration can reach prototype mutators the audit cannot see)", node);
                     break;
                 case "MemberExpression":
-                case "OptionalMemberExpression":
+                case "OptionalMemberExpression": {
+                    const scope = node.__scope ?? moduleScope;
                     if (node.computed) {
-                        push("computed-member-access", "computed member access `obj[expr]` is not allowed (string-keyed access can reach `constructor`/`__proto__`); use a literal property name", node);
+                        if (!isLocalIndexedAccess(node, scope)) {
+                            push("computed-member-access", "computed member access `obj[expr]` is not allowed (string-keyed access can reach `constructor`/`__proto__`); use a literal property name, or a numeric/loop-variable index on a local array", node);
+                        }
                     }
-                    else if (node.property?.type === "Identifier" && node.property.name === "__proto__") {
-                        push("proto-access", "`__proto__` access is not allowed", node);
+                    else if (node.property?.type === "Identifier" && DANGEROUS_MEMBERS.has(node.property.name)) {
+                        push("dangerous-member", `\`.${node.property.name}\` member access is not allowed (host-realm escape primitive)`, node);
+                    }
+                    else if (
+                    // `Object.getPrototypeOf` referenced as a VALUE (not just called)
+                    // is the same cross-realm primitive; reject the member read so an
+                    // alias (`const g = Object.getPrototypeOf; g(x)`) cannot smuggle
+                    // it past the call-site check.
+                    node.object?.type === "Identifier" &&
+                        node.object.name === "Object" &&
+                        node.property?.type === "Identifier" &&
+                        OBJECT_REFLECTION_METHODS.has(node.property.name)) {
+                        push("object-reflection", `\`Object.${node.property.name}\` is not allowed (cross-realm prototype/own-property introspection)`, node);
                     }
                     break;
-                case "Property":
-                case "PropertyDefinition":
-                case "MethodDefinition": {
+                }
+                case "Property": {
                     if (node.computed) {
                         push("computed-property-key", "computed property keys are not allowed", node);
                     }
@@ -404,6 +566,36 @@ export function auditWorkflowScript(script) {
                         const name = key?.type === "Identifier" ? key.name : key?.type === "Literal" ? String(key.value) : undefined;
                         if (name === "__proto__")
                             push("proto-key", "`__proto__` property keys are not allowed", node);
+                    }
+                    break;
+                }
+                case "PropertyDefinition": {
+                    // Class field named `constructor` is legal and shadowed by the
+                    // method; only `__proto__` / `prototype` field names are dangerous.
+                    if (node.computed) {
+                        push("computed-property-key", "computed property keys are not allowed", node);
+                    }
+                    else {
+                        const key = node.key;
+                        const name = key?.type === "Identifier" ? key.name : key?.type === "Literal" ? String(key.value) : undefined;
+                        if (name === "__proto__" || name === "prototype") {
+                            push("proto-key", `\`${name}\` class field names are not allowed`, node);
+                        }
+                    }
+                    break;
+                }
+                case "MethodDefinition": {
+                    // Class `constructor` methods are normal; static blocks and
+                    // `__proto__`/`prototype` methods are not.
+                    if (node.computed) {
+                        push("computed-property-key", "computed property keys are not allowed", node);
+                    }
+                    else {
+                        const key = node.key;
+                        const name = key?.type === "Identifier" ? key.name : key?.type === "Literal" ? String(key.value) : undefined;
+                        if (name === "__proto__" || name === "prototype") {
+                            push("proto-key", `\`${name}\` method names are not allowed`, node);
+                        }
                     }
                     break;
                 }
@@ -421,12 +613,21 @@ export function auditWorkflowScript(script) {
                             push("function-constructor", `\`${node.type === "NewExpression" ? "new " : ""}${callee.name}()\` is not allowed (dynamic code execution)`, node);
                         }
                     }
+                    else if ((callee?.type === "MemberExpression" || callee?.type === "OptionalMemberExpression") &&
+                        !callee.computed &&
+                        callee.object?.type === "Identifier" &&
+                        callee.object.name === "Object" &&
+                        callee.property?.type === "Identifier" &&
+                        OBJECT_REFLECTION_METHODS.has(callee.property.name)) {
+                        push("object-reflection", `\`Object.${callee.property.name}\` is not allowed (cross-realm prototype/own-property introspection)`, node);
+                    }
                     break;
                 }
                 case "Identifier": {
                     if (isReferencePosition(node)) {
                         const name = node.name;
-                        if (!localBindings.has(name) && !WORKFLOW_GLOBALS.has(name) && !SAFE_BUILTINS.has(name)) {
+                        const scope = node.__scope ?? moduleScope;
+                        if (!scopeLookup(scope, name) && !WORKFLOW_GLOBALS.has(name) && !SAFE_BUILTINS.has(name)) {
                             push("unknown-global", `\`${name}\` is not a declared local, an injected workflow global, or a safe built-in`, node);
                         }
                     }
@@ -447,6 +648,31 @@ export function auditWorkflowScript(script) {
                         push("shadowed-bridge-global", `\`${node.id.name}\` is a runtime bridge global and cannot be redeclared`, node);
                     }
                     break;
+                // Function/arrow params and catch params may shadow a bridge global
+                // inside their own scope (the prelude's protection is top-level
+                // only); shadowing the name locally is how a script would stash a
+                // host reference under an audit-trusted name.
+                case "FunctionExpression":
+                case "ArrowFunctionExpression": {
+                    if (node.type === "FunctionExpression" && node.id && PROTECTED_GLOBALS.has(node.id.name)) {
+                        push("shadowed-bridge-global", `\`${node.id.name}\` is a runtime bridge global and cannot be redeclared`, node);
+                    }
+                    for (const param of node.params ?? []) {
+                        for (const name of patternNames(param)) {
+                            if (PROTECTED_GLOBALS.has(name)) {
+                                push("shadowed-bridge-global", `\`${name}\` is a runtime bridge global and cannot be used as a parameter name`, node);
+                            }
+                        }
+                    }
+                    break;
+                }
+                case "CatchClause":
+                    for (const name of patternNames(node.param)) {
+                        if (PROTECTED_GLOBALS.has(name)) {
+                            push("shadowed-bridge-global", `\`${name}\` is a runtime bridge global and cannot be used as a catch binding`, node);
+                        }
+                    }
+                    break;
                 default:
                     break;
             }
@@ -454,6 +680,7 @@ export function auditWorkflowScript(script) {
                 for (const child of childrenOf(node, key)) {
                     child.__parent = node;
                     child.__parentKey = key;
+                    // Scope was already assigned in pass 1; nothing to recompute.
                     stack.push(child);
                 }
             }
