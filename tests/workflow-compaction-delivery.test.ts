@@ -23,6 +23,18 @@ function makePi(
       handlers[event] ??= [];
       handlers[event].push(handler);
     },
+    once: (event: string, handler: Handler) => {
+      handlers[event] ??= [];
+      const wrapped: Handler = (...args: any[]) => {
+        const list = handlers[event];
+        if (list) {
+          const index = list.indexOf(wrapped);
+          if (index >= 0) list.splice(index, 1);
+        }
+        return handler(...args);
+      };
+      handlers[event].push(wrapped);
+    },
     getActiveTools: () => [...activeTools],
     setActiveTools: (tools: string[]) => {
       activeTools.splice(0, activeTools.length, ...tools);
@@ -227,7 +239,7 @@ test("workflow delivery retries once after Pi rejects an abort-window send", asy
   }
 });
 
-test("an aborted agent auto-drains the dropped delivery as a custom message after settle", async () => {
+test("an aborted agent does not auto-drain the dismissed delivery after settle", async () => {
   const fakeHome = mkdtempSync(join(tmpdir(), "pi-dw-abort-fence-"));
   try {
     await withFakeHomeAsync(fakeHome, async () => {
@@ -263,11 +275,19 @@ test("an aborted agent auto-drains the dropped delivery as a custom message afte
       }
       for (const handler of handlers.agent_settled ?? []) handler({ type: "agent_settled" });
       await new Promise((resolve) => setTimeout(resolve, 20));
-      // Esc recovery auto-drains the dropped delivery once the run has settled:
-      // no manual Enter, still a custom message (not user), stable delivery ID.
-      assert.equal(sent.length, 2, "settled recovery auto-drains the dropped delivery without waiting for input");
-      assert.equal(sent[1]?.message.customType, "workflow-deliver", "auto-drain keeps the customType (not user)");
-      assert.equal(sent[1]?.message.details.deliveryId, stableId, "auto-drain keeps the stable delivery ID");
+      // The delivery woke a turn the user aborted: it was SEEN and dismissed.
+      // The settled boundary must stay silent — no auto-drain, no new wake.
+      assert.equal(sent.length, 1, "settled recovery must not re-wake a turn the user aborted");
+
+      // A real user keystroke releases the fence; the held-back delivery rides
+      // the user's own turn (single pending record → no batch wrapper).
+      for (const handler of handlers.input ?? []) {
+        handler({ type: "input", text: "continue please", source: "interactive" });
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.equal(sent.length, 2, "the next real user input flushes the held-back delivery");
+      assert.equal(sent[1]?.message.customType, "workflow-deliver", "the flush keeps the customType (not user)");
+      assert.equal(sent[1]?.message.details.deliveryId, stableId, "the flush keeps the stable delivery ID");
       assert.deepEqual(sent[1]?.options, { triggerTurn: true, deliverAs: "steer" });
 
       handlers.session_shutdown?.[0]?.({ reason: "quit" });
@@ -593,11 +613,18 @@ test("an abort during tool execution fences the delivery without an ack-timeout 
       }
       for (const handler of handlers.agent_settled ?? []) handler({ type: "agent_settled" });
       await new Promise((resolve) => setTimeout(resolve, 20));
-      // The settled fence recovers the host-dropped delivery, then auto-drains it
-      // as a custom message (no ack-timeout warn, no user-role merge, no manual Enter).
-      assert.equal(sent.length, 2, "settled recovery auto-drains the tool-abort-dropped delivery");
-      assert.equal(sent[1]?.message.customType, "workflow-deliver", "auto-drain keeps the customType (not user)");
-      assert.equal(sent[1]?.message.details.deliveryId, stableId, "auto-drain keeps the stable delivery ID");
+      // The settled fence recovers the host-dropped delivery but does NOT
+      // re-wake the host: the user just pressed Esc. No ack-timeout warn, no
+      // auto-drain, no user-role merge — it waits for real input.
+      assert.equal(sent.length, 1, "settled recovery must not re-wake a turn the user aborted");
+
+      for (const handler of handlers.input ?? []) {
+        handler({ type: "input", text: "go on", source: "interactive" });
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.equal(sent.length, 2, "the next real user input flushes the recovered delivery");
+      assert.equal(sent[1]?.message.customType, "workflow-deliver", "the flush keeps the customType (not user)");
+      assert.equal(sent[1]?.message.details.deliveryId, stableId, "the flush keeps the stable delivery ID");
       assert.deepEqual(sent[1]?.options, { triggerTurn: true, deliverAs: "steer" });
 
       handlers.session_shutdown?.[0]?.({ reason: "quit" });
@@ -661,7 +688,13 @@ test("an Esc-restored steering message is intercepted and re-sent with its custo
       }
       assert.equal(inputResult?.action, "handled", "the re-submitted delivery text must be intercepted");
       await new Promise((resolve) => setTimeout(resolve, 20));
-      assert.equal(sent.length, 2, "the intercepted input re-sends the delivery");
+      assert.equal(sent.length, 1, "the intercepted input re-queues but defers the flush until the turn settles");
+
+      // The re-submitted text starts the user's own turn; when it settles, the
+      // deferred flush re-sends the original custom message (metadata intact).
+      for (const handler of handlers.agent_settled ?? []) handler({ type: "agent_settled" });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.equal(sent.length, 2, "the deferred flush re-sends the delivery after the user's turn settles");
       assert.equal(sent[1]?.message.customType, "workflow-deliver", "recovery preserves the customType");
       assert.equal(sent[1]?.message.details.deliveryId, stableId, "recovery preserves the stable delivery ID");
       assert.deepEqual(sent[1]?.options, { triggerTurn: true, deliverAs: "steer" });
@@ -688,7 +721,7 @@ test("an Esc-restored steering message is intercepted and re-sent with its custo
   }
 });
 
-test("multiple Esc-dropped deliveries auto-drain as separate custom messages, never merged or user-role", async () => {
+test("multiple Esc-dropped deliveries wait for input, then flush as ONE merged custom batch", async () => {
   const fakeHome = mkdtempSync(join(tmpdir(), "pi-dw-multi-esc-drain-"));
   try {
     await withFakeHomeAsync(fakeHome, async () => {
@@ -713,7 +746,6 @@ test("multiple Esc-dropped deliveries auto-drain as separate custom messages, ne
       staged.manager.onDeliver?.("check-2 finding", { runId: "multi-run", workflowName: "multi", alertKind: "critical_finding", sequence: 2 });
       staged.manager.onDeliver?.("check-3 decision", { runId: "multi-run", workflowName: "multi", alertKind: "decision", sequence: 3 });
       assert.equal(sent.length, 3);
-      const ids = sent.map((s) => s.message.details.deliveryId);
 
       // Esc aborts the streaming run: the host drops all three from the steering queue.
       for (const handler of handlers.agent_end ?? []) {
@@ -721,22 +753,193 @@ test("multiple Esc-dropped deliveries auto-drain as separate custom messages, ne
       }
       for (const handler of handlers.agent_settled ?? []) handler({ type: "agent_settled" });
       await new Promise((resolve) => setTimeout(resolve, 20));
+      // Settled must stay silent: the user just pressed Esc, so no auto-drain.
+      assert.equal(sent.length, 3, "settled recovery must not re-wake a turn the user aborted");
 
-      // All three auto-drain as SEPARATE custom messages — one wake + two queued
-      // steers — with stable IDs, no merge into a blob, and no user-role downgrade.
-      assert.equal(sent.length, 6, "all three dropped deliveries auto-drain after settle");
-      const drained = sent.slice(3);
-      assert.deepEqual(
-        drained.map((s) => s.message.details.deliveryId),
-        ids,
-        "auto-drain preserves each stable delivery ID in order",
-      );
-      for (const s of drained) {
-        assert.equal(s.message.customType, "workflow-deliver", "each auto-drained message keeps its customType");
-        assert.equal(s.message.role, undefined, "no user-role downgrade on auto-drain");
+      // A real user keystroke releases the fence and flushes everything the
+      // bridge held back as ONE merged custom message — never N wake turns,
+      // never a user-role blob.
+      for (const handler of handlers.input ?? []) {
+        handler({ type: "input", text: "ok continue", source: "interactive" });
       }
-      const wakes = drained.filter((s) => s.options?.triggerTurn === true);
-      assert.ok(wakes.length >= 1, "exactly one wake leads the drained batch");
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.equal(sent.length, 4, "the three held-back deliveries flush as one merged batch on user input");
+      const batch = sent[3];
+      assert.equal(batch?.message.customType, "workflow-deliver", "the batch stays a custom message");
+      assert.equal(batch?.message.role, undefined, "no user-role downgrade on the batch");
+      assert.deepEqual(batch?.options, { triggerTurn: true, deliverAs: "steer" });
+      const batchText: string = batch?.message.content ?? "";
+      for (const needle of ["check-1 finding", "check-2 finding", "check-3 decision"]) {
+        assert.ok(batchText.includes(needle), `merged batch must contain section: ${needle}`);
+      }
+      assert.ok(batchText.includes("multi-run / critical_finding / seq 1"), "each section keeps its run/kind/seq label");
+      assert.ok(
+        batchText.indexOf("check-1 finding") < batchText.indexOf("check-2 finding") &&
+          batchText.indexOf("check-2 finding") < batchText.indexOf("check-3 decision"),
+        "sections preserve the original arrival order",
+      );
+
+      // Acknowledging the batch retires every member: nothing may replay.
+      projectSentDelivery(handlers, batch, 7);
+      for (const handler of handlers.after_provider_response ?? []) handler({ status: 200, headers: {} });
+      for (const handler of handlers.agent_settled ?? []) handler({ type: "agent_settled" });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.equal(sent.length, 4, "an acknowledged batch must never resend its members");
+
+      handlers.session_shutdown?.[0]?.({ reason: "quit" });
+      discardWorkflowRuntime();
+    });
+  } finally {
+    discardWorkflowRuntime();
+    rmSync(fakeHome, { recursive: true, force: true });
+  }
+});
+
+test("repeated Esc presses never create a resend storm (regression: 13-abort incident)", async () => {
+  const fakeHome = mkdtempSync(join(tmpdir(), "pi-dw-esc-storm-"));
+  try {
+    await withFakeHomeAsync(fakeHome, async () => {
+      discardWorkflowRuntime();
+      const { default: installExtension } = await import("../extensions/workflow.js");
+
+      const seedHandlers: Record<string, Handler[]> = {};
+      installExtension(makePi(seedHandlers, []));
+      startSession(seedHandlers);
+      seedHandlers.session_shutdown?.[0]?.({ reason: "reload" });
+      const staged = takeWorkflowRuntime();
+      assert.ok(staged);
+      handoffWorkflowRuntime(staged);
+
+      const handlers: Record<string, Handler[]> = {};
+      const sent: Array<{ message: any; options: any }> = [];
+      installExtension(makePi(handlers, sent));
+      startSession(handlers);
+
+      // Incident replay: a background workflow delivery arrives mid-turn, the
+      // turn aborts (provider error + user Esc), and the user keeps pressing
+      // Esc on every auto-woken turn. Session log 2026-08-17T17-46-52 showed
+      // 13 aborted turns each followed by an identical re-delivery.
+      staged.manager.onDeliver?.("critical finding the user keeps dismissing", {
+        runId: "storm-run",
+        workflowName: "storm",
+        alertKind: "critical_finding",
+      });
+      assert.equal(sent.length, 1);
+      const stableId = sent[0]?.message.details.deliveryId;
+
+      for (let round = 0; round < 13; round++) {
+        for (const handler of handlers.agent_end ?? []) {
+          handler({
+            type: "agent_end",
+            messages: [{ role: "assistant", content: [], stopReason: "aborted" }],
+          });
+        }
+        for (const handler of handlers.agent_settled ?? []) handler({ type: "agent_settled" });
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        assert.equal(sent.length, 1, `abort round ${round + 1} must not resend the dismissed delivery`);
+      }
+
+      // The message is settled, not lost: the next genuine user input flushes
+      // it exactly once, with its stable ID and custom role intact.
+      for (const handler of handlers.input ?? []) {
+        handler({ type: "input", text: "what was that finding?", source: "interactive" });
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.equal(sent.length, 2, "one real user input flushes the held-back delivery exactly once");
+      assert.equal(sent[1]?.message.details.deliveryId, stableId);
+      assert.equal(sent[1]?.message.customType, "workflow-deliver");
+
+      // And after acknowledgement, nothing can bring it back.
+      projectSentDelivery(handlers, sent[1], 9);
+      for (const handler of handlers.after_provider_response ?? []) handler({ status: 200, headers: {} });
+      for (const handler of handlers.agent_settled ?? []) handler({ type: "agent_settled" });
+      for (const handler of handlers.input ?? []) {
+        handler({ type: "input", text: "thanks", source: "interactive" });
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.equal(sent.length, 2, "an acknowledged delivery never replays");
+
+      handlers.session_shutdown?.[0]?.({ reason: "quit" });
+      discardWorkflowRuntime();
+    });
+  } finally {
+    discardWorkflowRuntime();
+    rmSync(fakeHome, { recursive: true, force: true });
+  }
+});
+
+test("an aborted merged batch restores its members and re-merges on the next user input", async () => {
+  const fakeHome = mkdtempSync(join(tmpdir(), "pi-dw-batch-abort-"));
+  try {
+    await withFakeHomeAsync(fakeHome, async () => {
+      discardWorkflowRuntime();
+      const { default: installExtension } = await import("../extensions/workflow.js");
+
+      const seedHandlers: Record<string, Handler[]> = {};
+      installExtension(makePi(seedHandlers, []));
+      startSession(seedHandlers);
+      seedHandlers.session_shutdown?.[0]?.({ reason: "reload" });
+      const staged = takeWorkflowRuntime();
+      assert.ok(staged);
+      handoffWorkflowRuntime(staged);
+
+      const handlers: Record<string, Handler[]> = {};
+      const sent: Array<{ message: any; options: any }> = [];
+      installExtension(makePi(handlers, sent));
+      startSession(handlers);
+
+      // Fence the bridge first (as a prior abort would), then queue two
+      // deliveries behind it — the pending backlog the batch path merges.
+      for (const handler of handlers.agent_end ?? []) {
+        handler({
+          type: "agent_end",
+          messages: [{ role: "assistant", content: [], stopReason: "aborted" }],
+        });
+      }
+      staged.manager.onDeliver?.("first held finding", {
+        runId: "batch-run",
+        workflowName: "batch",
+        alertKind: "blocker",
+        sequence: 1,
+      });
+      staged.manager.onDeliver?.("second held finding", {
+        runId: "batch-run",
+        workflowName: "batch",
+        alertKind: "critical_finding",
+        sequence: 2,
+      });
+      assert.equal(sent.length, 0, "fenced deliveries queue instead of waking the host");
+
+      for (const handler of handlers.input ?? []) {
+        handler({ type: "input", text: "resume", source: "interactive" });
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.equal(sent.length, 1, "the held backlog flushes as one merged batch");
+      const firstBatchText: string = sent[0]?.message.content ?? "";
+      assert.ok(firstBatchText.includes("2 queued deliveries"));
+      assert.ok((sent[0]?.message.details?.deliveryId ?? "").startsWith("wf_batch_"));
+
+      // The batch's own turn gets aborted before any provider request.
+      for (const handler of handlers.agent_end ?? []) {
+        handler({
+          type: "agent_end",
+          messages: [{ role: "assistant", content: [], stopReason: "aborted" }],
+        });
+      }
+      for (const handler of handlers.agent_settled ?? []) handler({ type: "agent_settled" });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.equal(sent.length, 1, "an aborted batch must not auto-resend after settle");
+
+      // Next real input: the members are restored and re-merged, still one
+      // message, still carrying both findings in order.
+      for (const handler of handlers.input ?? []) {
+        handler({ type: "input", text: "again", source: "interactive" });
+      }
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      assert.equal(sent.length, 2, "the next user input re-sends the restored members as one batch");
+      const secondText: string = sent[1]?.message.content ?? "";
+      assert.ok(secondText.includes("first held finding") && secondText.includes("second held finding"));
+      assert.ok(secondText.indexOf("first held finding") < secondText.indexOf("second held finding"));
 
       handlers.session_shutdown?.[0]?.({ reason: "quit" });
       discardWorkflowRuntime();

@@ -718,6 +718,70 @@ export class WorkflowManager extends EventEmitter {
         }
         return pending;
     }
+    /** Mark an in-memory-only delivery (no durable outbox record) as admitted by
+     * the host session for the given bridge generation. Returns false when the
+     * generation is stale. Outbox-backed deliveries use acknowledgeDelivery(). */
+    markDeliverySubmitted(deliveryId, generation) {
+        if (!this.bridgeDeliveryState)
+            this.bridgeDeliveryState = new Map();
+        const existing = this.bridgeDeliveryState.get(deliveryId);
+        if (existing !== undefined && generation < existing)
+            return false;
+        this.bridgeDeliveryState.set(deliveryId, generation);
+        // Bounded map: admission markers are short-lived same-generation evidence.
+        while (this.bridgeDeliveryState.size > 1024) {
+            const oldest = this.bridgeDeliveryState.keys().next().value;
+            if (oldest === undefined)
+                break;
+            this.bridgeDeliveryState.delete(oldest);
+        }
+        return true;
+    }
+    /** Drop a durable outbox record the user has seen and dismissed (Esc), or
+     * whose merged batch was acknowledged. Generation-independent: identity is
+     * the stable delivery ID. In-memory CAS failure is non-fatal (the in-memory
+     * dedup pin still prevents a resend); persisted-state failure returns false. */
+    discardDelivery(runId, deliveryId) {
+        assertSafeRunId(runId);
+        const managed = this.runs.get(runId);
+        if (managed) {
+            const index = managed.deliveryOutbox.findIndex((item) => item.deliveryId === deliveryId);
+            if (index < 0)
+                return true;
+            const [removed] = managed.deliveryOutbox.splice(index, 1);
+            try {
+                this.persistRunStrict(managed);
+                return true;
+            }
+            catch {
+                managed.deliveryOutbox.splice(Math.min(index, managed.deliveryOutbox.length), 0, removed);
+                return false;
+            }
+        }
+        const state = this.persistence.load(runId);
+        if (!this.ownsPersistedRun(state) || !state)
+            return false;
+        const target = (state.deliveryOutbox ?? []).find((item) => item.deliveryId === deliveryId);
+        if (!target)
+            return true;
+        state.deliveryOutbox = (state.deliveryOutbox ?? []).filter((item) => item.deliveryId !== deliveryId);
+        const lease = this.persistence.acquireRunLease(runId);
+        if (!lease)
+            return false;
+        try {
+            const fresh = this.persistence.load(runId);
+            if (!fresh || fresh.revision !== state.revision)
+                return false;
+            this.persistence.save(state, state.revision, lease);
+            return true;
+        }
+        catch {
+            return false;
+        }
+        finally {
+            this.persistence.releaseRunLease(lease);
+        }
+    }
     /** Advance outbox state under the run's CAS/lease fence. Generation is
      * checked on every transition and never changes logical delivery identity. */
     acknowledgeDelivery(runId, deliveryId, generation, phase) {
@@ -1459,6 +1523,9 @@ export class WorkflowManager extends EventEmitter {
     static PERSIST_THROTTLE_MS = 400;
     /** Pending trailing-edge persist timers for high-frequency progress events, keyed by runId. */
     persistTimers = new Map();
+    /** Same-generation host-admission markers for deliveries that have no
+     * durable outbox record (see markDeliverySubmitted). */
+    bridgeDeliveryState;
     /**
      * Coalesce rapid progress persists (currently: onAgentJournal, which fires
      * once per completed agent and can burst under concurrency) to at most one

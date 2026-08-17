@@ -482,6 +482,15 @@ export declare class WorkflowManager extends EventEmitter {
         workflowName: string;
         runStatus: RunStatus;
     }>;
+    /** Mark an in-memory-only delivery (no durable outbox record) as admitted by
+     * the host session for the given bridge generation. Returns false when the
+     * generation is stale. Outbox-backed deliveries use acknowledgeDelivery(). */
+    markDeliverySubmitted(deliveryId: string, generation: number): boolean;
+    /** Drop a durable outbox record the user has seen and dismissed (Esc), or
+     * whose merged batch was acknowledged. Generation-independent: identity is
+     * the stable delivery ID. In-memory CAS failure is non-fatal (the in-memory
+     * dedup pin still prevents a resend); persisted-state failure returns false. */
+    discardDelivery(runId: string, deliveryId: string): boolean;
     /** Advance outbox state under the run's CAS/lease fence. Generation is
      * checked on every transition and never changes logical delivery identity. */
     acknowledgeDelivery(runId: string, deliveryId: string, generation: number, phase: "submitted" | "projected" | "acknowledged"): boolean;
@@ -567,6 +576,9 @@ export declare class WorkflowManager extends EventEmitter {
     private static readonly PERSIST_THROTTLE_MS;
     /** Pending trailing-edge persist timers for high-frequency progress events, keyed by runId. */
     private persistTimers;
+    /** Same-generation host-admission markers for deliveries that have no
+     * durable outbox record (see markDeliverySubmitted). */
+    private bridgeDeliveryState?;
     /**
      * Coalesce rapid progress persists (currently: onAgentJournal, which fires
      * once per completed agent and can burst under concurrency) to at most one
