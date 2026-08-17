@@ -817,7 +817,6 @@ export class WorkflowManager extends EventEmitter {
         // Explicit tools win for this execution; else re-resolve the run's persisted
         // toolset tag (how a resumed /deep-research keeps its web tools); else the
         // agent layer's default coding tools.
-        const resolvedTools = tools ?? (managed.toolset ? this.toolsets?.[managed.toolset]?.() : undefined);
         // Gated the same way as this.emitLive() below (see isCurrent()) — a stale
         // execution's progress callback would otherwise keep driving live UI
         // (task panel, etc.) for a run that's been superseded or deleted.
@@ -837,6 +836,24 @@ export class WorkflowManager extends EventEmitter {
             }
         }
         try {
+            const resolvedTools = tools ??
+                (managed.toolset
+                    ? (() => {
+                        // Own-property lookup: a persisted tag like "constructor"/"toString"
+                        // would otherwise resolve through Object.prototype and bypass the
+                        // unknown-tag fail-closed check below.
+                        const hasToolset = Object.hasOwn(this.toolsets ?? {}, managed.toolset);
+                        const resolveToolset = hasToolset ? this.toolsets?.[managed.toolset] : undefined;
+                        if (typeof resolveToolset !== "function") {
+                            throw new WorkflowError(`Unknown persisted workflow toolset "${managed.toolset}"; cannot resume safely`, WorkflowErrorCode.PERSISTENCE_ERROR, { recoverable: false, details: { toolset: managed.toolset } });
+                        }
+                        const resolved = resolveToolset();
+                        if (!Array.isArray(resolved)) {
+                            throw new WorkflowError(`Persisted workflow toolset "${managed.toolset}" resolved to no tools; cannot resume safely`, WorkflowErrorCode.PERSISTENCE_ERROR, { recoverable: false, details: { toolset: managed.toolset } });
+                        }
+                        return resolved;
+                    })()
+                    : undefined);
             const result = await runWorkflow(script, {
                 cwd: this.cwd,
                 args,

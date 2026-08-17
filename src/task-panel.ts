@@ -19,7 +19,7 @@ import {
   type WorkflowAgentSnapshot,
   type WorkflowSnapshot,
 } from "./display.js";
-import { truncateUtf8 } from "./safe-serialize.js";
+import { redactAbsolutePaths, redactForModel, sanitizeForTerminal } from "./sanitize.js";
 import type { ManagedRun, WorkflowManager } from "./workflow-manager.js";
 import { DEFAULT_WORKFLOW_RESULT_CHARS, summarizeWorkflowResult } from "./workflow-result-projection.js";
 import type { WorkflowStorage } from "./workflow-saved.js";
@@ -81,6 +81,18 @@ function fitLine(line: string, width?: number): string {
   return truncateToWidth(line, maxWidth);
 }
 
+function terminalText(value: unknown): string {
+  try {
+    return sanitizeForTerminal(typeof value === "string" ? value : String(value ?? ""));
+  } catch {
+    return "";
+  }
+}
+
+function modelText(value: string): string {
+  return sanitizeForTerminal(redactForModel(value, Buffer.byteLength(value, "utf8")));
+}
+
 export function deliverText(run: ManagedRun, opts: { resultPath?: string; maxChars?: number } = {}): string {
   const maxChars =
     typeof opts.maxChars === "number" && Number.isFinite(opts.maxChars)
@@ -94,14 +106,16 @@ export function deliverText(run: ManagedRun, opts: { resultPath?: string; maxCha
   const agents = run.result?.agentCount ?? run.snapshot.agentCount;
   const duration = run.result?.durationMs ? ` · ${(run.result.durationMs / 1000).toFixed(1)}s` : "";
   const lines = [
-    `✓ Background workflow "${run.snapshot.name}" finished (${agents} agents${tokens}${duration}).`,
+    `✓ Background workflow "${terminalText(run.snapshot.name)}" finished (${agents} agents${tokens}${duration}).`,
     "",
     summary,
   ];
   // The full result is intentionally not duplicated into provider context.
-  // Point at the durable run record for exact JSON and per-agent reports.
-  if (opts.resultPath) lines.push("", `↳ Full result and subagent reports: ${opts.resultPath}`);
-  return lines.join("\n");
+  // Point at the durable run record for exact JSON and per-agent reports. The
+  // path may live outside the user's home (workspace/UNC/tmp), so redact the
+  // absolute location before it enters provider context.
+  if (opts.resultPath) lines.push("", `↳ Full result and subagent reports: ${redactAbsolutePaths(opts.resultPath)}`);
+  return modelText(lines.join("\n"));
 }
 
 /** Absolute path to a run's persisted result JSON. Undefined if the persistence
@@ -162,6 +176,7 @@ export type WorkflowDeliveryPayload = {
 
 type DeliveryManager = WorkflowManager & {
   __deliveryInstalled?: boolean;
+  __deliveryDisposer?: () => void;
   __holder?: DeliveryHolder;
 };
 
@@ -337,6 +352,8 @@ export function resumeResultDelivery(manager: WorkflowManager): void {
  *    result is queued and picked up at the next safe point — the active provider
  *    request is never aborted.
  *
+ * Returns an idempotent disposer that removes the three manager listeners and
+ * clears the installation marker so a later session can install a fresh holder.
  * Set up once per extension; idempotent via an internal guard. Across session
  * replacement the manager (and this listener) survive via the handoff path;
  * each new generation only refreshes `holder.pi` and flushes any messages that
@@ -366,10 +383,17 @@ function installResultContextBridge(pi: ExtensionAPI): void {
         message && typeof message === "object" ? Object.getOwnPropertyDescriptor(message, "content") : undefined;
       const rawText =
         contentDescriptor && !contentDescriptor.get && !contentDescriptor.set ? contentDescriptor.value : "";
-      const text = truncateUtf8(typeof rawText === "string" ? rawText : String(rawText ?? ""), 32_000, "…");
+      const raw = typeof rawText === "string" ? rawText : String(rawText ?? "");
+      const text = sanitizeForTerminal(redactForModel(raw, 32_000));
       const deliveryId =
         message.details && typeof message.details.deliveryId === "string" ? message.details.deliveryId : undefined;
-      const toolCallId = deliveryId ?? `workflow_result_${index}_${message.timestamp ?? 0}`;
+      // A corrupt/persisted deliveryId may contain characters a provider rejects
+      // in a toolCall id; fall back to a positional id instead of passing it through.
+      const PROVIDER_TOOL_CALL_ID = /^[A-Za-z0-9_-]{1,64}$/;
+      const toolCallId =
+        deliveryId && PROVIDER_TOOL_CALL_ID.test(deliveryId)
+          ? deliveryId
+          : `workflow_result_${index}_${message.timestamp ?? 0}`;
       output.push({
         role: "assistant",
         content: [
@@ -405,7 +429,7 @@ export function installResultDelivery(
     /** Route terminal results through an extension-owned batching/dedup bridge. */
     sendResult?: (payload: WorkflowDeliveryPayload) => void;
   } = {},
-): void {
+): () => void {
   // Standalone package-root consumers need this minimal bridge. The full Pi
   // extension installs a richer task-notification bridge for all workflow
   // message types and disables this one to avoid double transformation.
@@ -425,7 +449,7 @@ export function installResultDelivery(
       m.__holder.generation += 1;
       m.__holder.submittedGeneration.clear();
     }
-    return;
+    return m.__deliveryDisposer ?? (() => {});
   }
   m.__deliveryInstalled = true;
   m.__holder = {
@@ -443,106 +467,114 @@ export function installResultDelivery(
   const deliver = (payload: WorkflowDeliveryPayload) => {
     const holder = m.__holder;
     if (!holder) return;
+    const content = modelText(payload.content);
+    const safePayload = content === payload.content ? payload : { ...payload, content };
     if (holder.suspended) {
-      enqueuePending(holder, payload);
+      enqueuePending(holder, safePayload);
       return;
     }
-    trySend(holder, payload);
+    trySend(holder, safePayload);
   };
 
   let notificationSequence = 0;
-  manager.on(
-    "complete",
-    ({ runId, deliveryId, sequence }: { runId: string; deliveryId?: string; sequence?: number }) => {
-      const run = manager.getRun(runId);
-      // Only background/resumed runs are delivered: a foreground (sync) run already
-      // returns its result inline as the tool result, so re-delivering would dup it.
-      if (run?.background) {
-        let maxChars: number | undefined;
-        try {
-          maxChars = m.__holder?.loadSettings?.().deliveredResultMaxChars;
-        } catch {
-          // Settings are optional presentation input; delivery must still proceed.
-        }
-        deliver({
-          content: deliverText(run, {
-            resultPath: persistedResultPath(manager, runId),
-            maxChars,
-          }),
-          details: {
-            status: "completed",
-            isError: false,
-            notificationKind: "workflow-result",
-            runId,
-            sequence: sequence ?? notificationSequence++,
-            deliveryId,
-          },
-        });
+  const onComplete = ({ runId, deliveryId, sequence }: { runId: string; deliveryId?: string; sequence?: number }) => {
+    const run = manager.getRun(runId);
+    // Only background/resumed runs are delivered: a foreground (sync) run already
+    // returns its result inline as the tool result, so re-delivering would dup it.
+    if (run?.background) {
+      let maxChars: number | undefined;
+      try {
+        maxChars = m.__holder?.loadSettings?.().deliveredResultMaxChars;
+      } catch {
+        // Settings are optional presentation input; delivery must still proceed.
       }
-    },
-  );
-  manager.on(
-    "error",
-    ({
-      runId,
-      error,
-      deliveryId,
-      sequence,
-    }: {
-      runId: string;
-      error?: { message?: string };
-      deliveryId?: string;
-      sequence?: number;
-    }) => {
-      if (!manager.getRun(runId)?.background) return;
       deliver({
-        content: `✗ Background workflow ${runId} failed: ${error?.message ?? "unknown error"}`,
+        content: deliverText(run, {
+          resultPath: persistedResultPath(manager, runId),
+          maxChars,
+        }),
         details: {
-          status: "failed",
-          isError: true,
+          status: "completed",
+          isError: false,
           notificationKind: "workflow-result",
           runId,
           sequence: sequence ?? notificationSequence++,
           deliveryId,
         },
       });
-    },
-  );
+    }
+  };
+  manager.on("complete", onComplete);
+  const onError = ({
+    runId,
+    error,
+    deliveryId,
+    sequence,
+  }: {
+    runId: string;
+    error?: { message?: string };
+    deliveryId?: string;
+    sequence?: number;
+  }) => {
+    if (!manager.getRun(runId)?.background) return;
+    deliver({
+      content: `✗ Background workflow ${runId} failed: ${error?.message ?? "unknown error"}`,
+      details: {
+        status: "failed",
+        isError: true,
+        notificationKind: "workflow-result",
+        runId,
+        sequence: sequence ?? notificationSequence++,
+        deliveryId,
+      },
+    });
+  };
+  manager.on("error", onError);
   // A provider usage/quota limit checkpoints the run as paused (not failed): tell the
   // user it is resumable once their budget refills, rather than letting it look dead.
   // Manual pause() also emits "paused" but with no reason — guard so only the
   // usage-limit case delivers a message.
-  manager.on(
-    "paused",
-    ({
-      runId,
-      reason,
-      error,
-      resetHint,
-    }: {
-      runId: string;
-      reason?: string;
-      error?: { message?: string };
-      resetHint?: string;
-    }) => {
-      if (reason !== "usage_limit") return;
-      if (!manager.getRun(runId)?.background) return;
-      const when = resetHint ? ` (${resetHint})` : "";
-      const cause = error?.message ?? "provider usage limit reached";
-      deliver({
-        content:
-          `⏸ Background workflow ${runId} paused: ${cause}${when}. ` +
-          `Completed steps are saved — run /workflows resume ${runId} once your usage limit resets.`,
-        details: {
-          status: "paused",
-          isError: true,
-          notificationKind: "workflow-result",
-          runId,
-          sequence: notificationSequence++,
-        },
-      });
-    },
-  );
+  const onPaused = ({
+    runId,
+    reason,
+    error,
+    resetHint,
+  }: {
+    runId: string;
+    reason?: string;
+    error?: { message?: string };
+    resetHint?: string;
+  }) => {
+    if (reason !== "usage_limit") return;
+    if (!manager.getRun(runId)?.background) return;
+    const when = resetHint ? ` (${resetHint})` : "";
+    const cause = error?.message ?? "provider usage limit reached";
+    deliver({
+      content:
+        `⏸ Background workflow ${runId} paused: ${cause}${when}. ` +
+        `Completed steps are saved — run /workflows resume ${runId} once your usage limit resets.`,
+      details: {
+        status: "paused",
+        isError: true,
+        notificationKind: "workflow-result",
+        runId,
+        sequence: notificationSequence++,
+      },
+    });
+  };
+  manager.on("paused", onPaused);
+
+  const disposer = () => {
+    if (!m.__deliveryInstalled || m.__deliveryDisposer !== disposer) return;
+    manager.off("complete", onComplete);
+    manager.off("error", onError);
+    manager.off("paused", onPaused);
+    m.__deliveryInstalled = false;
+    m.__deliveryDisposer = undefined;
+    m.__holder = undefined;
+  };
+  m.__deliveryDisposer = disposer;
+  return disposer;
 }
 
 export function renderPanel(manager: WorkflowManager, theme: Theme, width?: number): string[] {
@@ -556,8 +588,8 @@ export function renderPanel(manager: WorkflowManager, theme: Theme, width?: numb
     const agents = safeAgentSnapshots(live?.snapshot.agents ?? r.agents);
     const done = agents.filter((a) => a.status === "done").length;
     const icon = r.status === "paused" ? "⏸" : "◆";
-    const phase = live?.snapshot.currentPhase ? ` · ${live.snapshot.currentPhase}` : "";
-    return `  ${icon} ${r.workflowName}  ${done}/${agents.length} agents${phase}`;
+    const phase = live?.snapshot.currentPhase ? ` · ${terminalText(live.snapshot.currentPhase)}` : "";
+    return `  ${icon} ${terminalText(r.workflowName)}  ${done}/${agents.length} agents${phase}`;
   });
   // Finished runs leave this live panel but are kept in the navigator. Tell the
   // user so a completed run doesn't look like it vanished.
@@ -663,15 +695,15 @@ function renderRunBody(
     ]
       .filter(Boolean)
       .join(" · ");
-    lines.push(theme.fg("accent", `  ${marker} ${title}`) + dim(`  ${phaseMeta}`));
+    lines.push(theme.fg("accent", `  ${marker} ${terminalText(title)}`) + dim(`  ${phaseMeta}`));
 
     const visible = phaseAgents.slice(-maxAgents);
     for (const a of visible) {
       const segment = fmtTokenSegment(tokenFigures(a.tokenUsage, a.tokens), fmtTokensShort);
       const tok = segment ? dim(` ${segment}`) : "";
-      const mdl = shortModel(a.model);
+      const mdl = terminalText(shortModel(a.model) ?? "");
       const model = mdl ? dim(` · ${mdl}`) : "";
-      lines.push(`    [${a.id}] ${statusIcon(a.status)} ${shorten(a.label, 40)}${tok}${model}`);
+      lines.push(`    [${a.id}] ${statusIcon(a.status)} ${shorten(terminalText(a.label), 40)}${tok}${model}`);
     }
     if (phaseAgents.length > visible.length) {
       lines.push(dim(`    … ${phaseAgents.length - visible.length} earlier agents`));
@@ -719,7 +751,7 @@ export function renderPanelDetailed(
     const rate = r.status === "running" ? tokensPerSecond(r.runId) : 0;
     const meta = [
       `${done}/${agents.length} agents`,
-      snap?.currentPhase || "",
+      snap?.currentPhase ? terminalText(snap.currentPhase) : "",
       fmtTokenSegment(runUsage, fmtTokensShort),
       // (cost is only known once the run finalizes its usage.)
       usage?.cost ? fmtCost(usage.cost) : "",
@@ -727,7 +759,7 @@ export function renderPanelDetailed(
     ]
       .filter(Boolean)
       .join(" · ");
-    out.push(`  ${icon} ${theme.bold(r.workflowName)}  ${dim(meta)}`);
+    out.push(`  ${icon} ${theme.bold(terminalText(r.workflowName))}  ${dim(meta)}`);
     if (snap) out.push(...renderRunBody(snap, agents, maxAgents, theme));
   }
 

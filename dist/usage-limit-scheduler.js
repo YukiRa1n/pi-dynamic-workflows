@@ -20,6 +20,13 @@ const DEFAULT_MAX_ATTEMPTS = 5;
 const DEFAULT_MIN_DELAY_MS = 60_000;
 const DEFAULT_FALLBACK_DELAY_MS = 300_000;
 const DEFAULT_MAX_DELAY_MS = 6 * 60 * 60 * 1000;
+function validateSchedulerOption(name, value, minimum, integer = false) {
+    if (!Number.isFinite(value) || value < minimum || (integer && !Number.isInteger(value))) {
+        const kind = integer ? "finite integer" : "finite number";
+        throw new RangeError(`${name} must be a ${kind} greater than or equal to ${minimum}`);
+    }
+    return value;
+}
 /**
  * Best-effort parse of a provider's human reset hint ("Resets in ~3h",
  * "resets in 5m", "in 90s", "1h30m") into milliseconds. Sums every
@@ -120,11 +127,19 @@ export class UsageLimitScheduler {
         this.now = options.now ?? Date.now;
         this.setTimer = options.setTimer ?? ((fn, ms) => setTimeout(fn, ms));
         this.clearTimer = options.clearTimer ?? ((handle) => clearTimeout(handle));
-        this.maxArmedTimers = Math.max(1, Math.floor(options.maxArmedTimers ?? 64));
-        this.maxAttempts = options.maxAttempts ?? DEFAULT_MAX_ATTEMPTS;
-        this.minDelayMs = options.minDelayMs ?? DEFAULT_MIN_DELAY_MS;
-        this.fallbackDelayMs = options.fallbackDelayMs ?? DEFAULT_FALLBACK_DELAY_MS;
-        this.maxDelayMs = options.maxDelayMs ?? DEFAULT_MAX_DELAY_MS;
+        const maxAttempts = validateSchedulerOption("maxAttempts", options.maxAttempts ?? DEFAULT_MAX_ATTEMPTS, 1, true);
+        const minDelayMs = validateSchedulerOption("minDelayMs", options.minDelayMs ?? DEFAULT_MIN_DELAY_MS, 0);
+        const fallbackDelayMs = validateSchedulerOption("fallbackDelayMs", options.fallbackDelayMs ?? DEFAULT_FALLBACK_DELAY_MS, 0);
+        const maxDelayMs = validateSchedulerOption("maxDelayMs", options.maxDelayMs ?? DEFAULT_MAX_DELAY_MS, 0);
+        const maxArmedTimers = validateSchedulerOption("maxArmedTimers", options.maxArmedTimers ?? 64, 1, true);
+        if (maxDelayMs < minDelayMs) {
+            throw new RangeError("maxDelayMs must be greater than or equal to minDelayMs");
+        }
+        this.maxArmedTimers = maxArmedTimers;
+        this.maxAttempts = maxAttempts;
+        this.minDelayMs = minDelayMs;
+        this.fallbackDelayMs = fallbackDelayMs;
+        this.maxDelayMs = maxDelayMs;
         this.boundSessionId = options.sessionId;
         this.diagnostic =
             options.onDiagnostic ??

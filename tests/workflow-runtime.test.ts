@@ -12,6 +12,7 @@ import {
   runWorkflow,
 } from "../src/workflow.js";
 import { WorkflowResourceCoordinator } from "../src/workflow-resource-coordinator.js";
+import { waitFor } from "./helpers/wait-for.js";
 
 /** Agent runner that counts real invocations and echoes a per-call result. */
 function countingAgent() {
@@ -616,7 +617,9 @@ const xs = await parallel(['a','b','c','d'].map((p) => () => agent(p, { label: p
 return xs`;
 
   const run = runWorkflow(script, { agent: runner, concurrency: 2, persistLogs: false });
-  while (started.length < 2) await new Promise((resolve) => setTimeout(resolve, 0));
+  await waitFor(() => started.length >= 2 || undefined, {
+    description: "first two agents to start before the gate opens",
+  });
   assert.equal(started.length, 2, "only the first two agents should start before the gate opens");
   release.resolve();
   const result = await run;

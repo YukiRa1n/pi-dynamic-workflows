@@ -4,10 +4,15 @@ import { Type } from "typebox";
 import { BUILTIN_WORKFLOW_NAMES, findBuiltinWorkflow, resolveWorkflowInvocation } from "./builtin-workflows.js";
 import { MAX_WORKFLOW_TIMEOUT_MS } from "./config.js";
 import { renderWorkflowText, type WorkflowSnapshot } from "./display.js";
+import { WorkflowError, WorkflowErrorCode } from "./errors.js";
 import { parseWorkflowScript } from "./workflow.js";
 import { WorkflowManager } from "./workflow-manager.js";
 import { createWorkflowStorage, type WorkflowStorage } from "./workflow-saved.js";
 import { loadWorkflowSettings } from "./workflow-settings.js";
+
+// Matches the runtime/persistence ceiling in workflow.ts and run-persistence.ts
+// (10_000_000), so the tool does not accept a script the runner will then reject.
+const MAX_WORKFLOW_SCRIPT_BYTES = 10_000_000;
 
 const workflowToolSchema = Type.Object(
   {
@@ -249,6 +254,14 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
       let invocationToolset: string | undefined;
       let script: string;
       const invocationName = modelFacing ? (params as WorkflowToolInput).preset : params.name;
+      if (invocationName && params.script !== undefined) {
+        if (typeof params.script !== "string") {
+          throw new Error(
+            `workflow's \`script\` must be a string when provided alongside \`${modelFacing ? "preset" : "name"}\``,
+          );
+        }
+        throw new Error(`workflow accepts either \`${modelFacing ? "preset" : "name"}\` or \`script\`, not both`);
+      }
       if (invocationName) {
         if (params.resumeFromRunId) {
           throw new Error(
@@ -271,6 +284,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
           throw new Error(`workflow requires either \`script\` or \`${modelFacing ? "preset" : "name"}\``);
         script = normalizeWorkflowScript(params.script, modelFacing);
       }
+      assertWorkflowScriptSize(script);
       const parsed = parseWorkflowScript(script);
 
       // Iteration / cached-prefix reuse: resume a prior run with THIS (edited)
@@ -506,6 +520,10 @@ function normalizeWorkflowToolArgs(
         ...normalized,
         ...(hasPreset ? { preset: (value.preset as string).trim() } : {}),
         ...(hasScript ? { script: normalizeWorkflowScript(value.script as string, true) } : {}),
+        // An empty/whitespace `script` is treated as "not provided" (hasScript=false);
+        // drop it so a preset-only invocation does not trip the execute-time
+        // "either preset or script" conflict on a leftover empty string.
+        ...(!hasScript ? { script: undefined } : {}),
       } as WorkflowToolInput;
     }
     throw new Error("workflow requires either `script` or `preset` to be a string");
@@ -515,10 +533,13 @@ function normalizeWorkflowToolArgs(
     if (value.script !== undefined && typeof value.script !== "string") {
       throw new Error("workflow's `script` must be a string when provided alongside `name`");
     }
+    if (value.script !== undefined) {
+      throw new Error("workflow accepts either `name` or `script`, not both");
+    }
     return {
       ...normalized,
       name: value.name.trim(),
-      script: typeof value.script === "string" ? normalizeWorkflowScript(value.script, false) : undefined,
+      script: undefined,
     } as WorkflowToolInput;
   }
   if (typeof value.script !== "string") throw new Error("workflow requires either `script` or `name` to be a string");
@@ -535,5 +556,17 @@ function normalizeWorkflowScript(script: string, fillMetadata = false): string {
   if (fillMetadata && !/^export\s+const\s+meta\s*=/.test(text) && !/\bexport\s+const\s+meta\s*=/.test(text)) {
     text = `export const meta = { name: "model_workflow", description: "Model-authored workflow" }\n${text}`;
   }
+  assertWorkflowScriptSize(text);
   return text;
+}
+
+function assertWorkflowScriptSize(script: string): void {
+  const bytes = Buffer.byteLength(script, "utf8");
+  if (bytes > MAX_WORKFLOW_SCRIPT_BYTES) {
+    throw new WorkflowError(
+      `Workflow script exceeds the ${MAX_WORKFLOW_SCRIPT_BYTES}-byte resource limit`,
+      WorkflowErrorCode.RESOURCE_LIMIT_EXCEEDED,
+      { recoverable: false },
+    );
+  }
 }

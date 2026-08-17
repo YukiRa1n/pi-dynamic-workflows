@@ -286,6 +286,47 @@ test("/workflows status watches a running run: live status bar + prints on compl
   assert.ok(statusLine.includes(undefined), "clears the status line");
 });
 
+test("/workflows status watcher sanitizes dynamic progress and completion text", async () => {
+  const control = "\x1b]52;c;clipboard\x07";
+  const snapshot = {
+    name: `${control}workflow`,
+    phases: [`${control}phase`],
+    currentPhase: `${control}phase`,
+    logs: [],
+    agents: [{ id: 1, label: `${control}agent`, status: "running", phase: `${control}phase`, prompt: "x" }],
+    agentCount: 1,
+    runningCount: 1,
+    doneCount: 0,
+    errorCount: 0,
+  };
+  const manager: any = new EventEmitter();
+  manager.getRun = (id: string) => (id === "run-safe" ? { runId: id, status: "running", snapshot } : undefined);
+  manager.getSnapshot = () => null;
+  manager.listRuns = () => [];
+
+  const statusLine: Array<string | undefined> = [];
+  const printed: string[] = [];
+  let handler: ((a: string, c: any) => Promise<void>) | undefined;
+  const pi: any = {
+    getCommands: () => [],
+    registerCommand: (_n: string, o: any) => {
+      handler = o.handler;
+    },
+    sendMessage: async (m: any) => printed.push(m.content),
+  };
+  registerWorkflowCommands(pi as unknown as ExtensionAPI, manager as unknown as WorkflowManager);
+  const ctx = { ui: { notify: () => {}, setStatus: (_k: string, t?: string) => statusLine.push(t) } };
+
+  assert.ok(handler);
+  await handler("status run-safe", ctx);
+  const liveStatus = statusLine.find((value) => typeof value === "string") ?? "";
+  assert.ok(!liveStatus.includes("\x1b") && !liveStatus.includes("\x07"));
+  snapshot.agents[0].status = "done";
+  manager.emit("complete", { runId: "run-safe" });
+  assert.equal(printed.length, 1);
+  assert.ok(!printed[0].includes("\x1b") && !printed[0].includes("\x07"));
+});
+
 test("/workflows status watcher treats deletion as terminal and removes its listeners", async () => {
   const snapshot = {
     name: "demo",

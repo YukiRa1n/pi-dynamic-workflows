@@ -8,6 +8,7 @@ import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
 import { WorkflowManager } from "../src/workflow-manager.js";
 import { NavigatorModel, NavigatorState, renderNavigator } from "../src/workflow-ui.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
+import { waitForPromise } from "./helpers/wait-for.js";
 
 /** Agent runner that reports fixed usage so token accounting is exercised. */
 function fakeAgent(usage: Partial<AgentUsage> = {}, result: unknown = "ok") {
@@ -1596,11 +1597,14 @@ test(
 
     // 'a' finishing schedules a throttled (trailing-edge) write via onAgentJournal
     // that would normally not hit disk for hundreds of ms.
-    await new Promise((resolve) => {
-      manager.on("agentStart", (event) => {
-        if ((event as { label?: string }).label === "b") resolve(undefined);
-      });
+    let resolveB!: () => void;
+    const bStarted = new Promise<void>((resolve) => {
+      resolveB = resolve;
     });
+    manager.on("agentStart", (event) => {
+      if ((event as { label?: string }).label === "b") resolveB();
+    });
+    await waitForPromise(bStarted, { description: "agent 'b' to start (pause() flush test)" });
 
     manager.pause(runId);
 
@@ -1625,11 +1629,14 @@ test(
     manager.on("error", () => {});
     const { runId, promise } = manager.startInBackground(twoAgentScript);
 
-    await new Promise((resolve) => {
-      manager.on("agentStart", (event) => {
-        if ((event as { label?: string }).label === "b") resolve(undefined);
-      });
+    let resolveB!: () => void;
+    const bStarted = new Promise<void>((resolve) => {
+      resolveB = resolve;
     });
+    manager.on("agentStart", (event) => {
+      if ((event as { label?: string }).label === "b") resolveB();
+    });
+    await waitForPromise(bStarted, { description: "agent 'b' to start (stop() flush test)" });
 
     manager.stop(runId);
 

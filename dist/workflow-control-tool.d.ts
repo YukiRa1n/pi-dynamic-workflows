@@ -75,6 +75,8 @@ export interface GetWorkflowOutputResultDetails extends Record<string, unknown> 
     interrupted?: boolean;
     resultPath?: string;
     error?: string;
+    errorCode?: string;
+    recoverable?: boolean;
 }
 /** Exact cancellation handles for active runs owned by the bound Pi session. */
 export declare function createListActiveWorkflowsTool(options: WorkflowControlToolOptions): ToolDefinition<typeof listActiveWorkflowsSchema, ListActiveWorkflowsResultDetails>;

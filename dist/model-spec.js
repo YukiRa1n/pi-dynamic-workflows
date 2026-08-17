@@ -96,7 +96,9 @@ function tryMatchModel(modelPattern, availableModels) {
     const exactMatch = findExactModelReferenceMatch(modelPattern, availableModels);
     if (exactMatch)
         return exactMatch;
-    const normalizedPattern = modelPattern.toLowerCase();
+    const normalizedPattern = modelPattern.trim().toLowerCase();
+    if (!normalizedPattern)
+        return undefined;
     const matches = availableModels.filter((model) => model.id.toLowerCase().includes(normalizedPattern) || model.name?.toLowerCase().includes(normalizedPattern));
     if (matches.length === 0)
         return undefined;
@@ -182,8 +184,15 @@ export function resolveModelSpecWithThinking(spec, modelRegistry) {
         const maybeProvider = requestedSpec.slice(0, slashIndex);
         const canonicalProvider = providerMap.get(maybeProvider.toLowerCase());
         if (canonicalProvider) {
+            const providerPattern = requestedSpec.slice(slashIndex + 1).trim();
+            if (!providerPattern || providerPattern.startsWith(":")) {
+                return {
+                    requestedSpec,
+                    error: `Model spec "${requestedSpec}" must include a non-empty model id after the provider slash.`,
+                };
+            }
             provider = canonicalProvider;
-            pattern = requestedSpec.slice(slashIndex + 1);
+            pattern = providerPattern;
             inferredProvider = true;
         }
     }

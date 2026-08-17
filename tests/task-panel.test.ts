@@ -902,6 +902,43 @@ describe("renderPanelDetailed", () => {
     };
   }
 
+  it("sanitizes untrusted fields in detailed panel rows and headers", async () => {
+    const { renderPanelDetailed } = await import("../src/task-panel.js");
+    const control = "\x1b]8;;https://evil.example\x07";
+    const snapshot = {
+      name: `${control}workflow`,
+      phases: [`${control}phase`],
+      currentPhase: `${control}phase`,
+      logs: [],
+      agents: [
+        {
+          id: 1,
+          label: `${control}agent`,
+          status: "running",
+          phase: `${control}phase`,
+          model: `provider/${control}model`,
+        },
+      ],
+      tokenUsage: { total: 0, input: 0, output: 0 },
+    };
+    const manager = {
+      listRuns: () => [
+        {
+          runId: "safe-run",
+          workflowName: `${control}workflow`,
+          status: "running",
+          agents: snapshot.agents,
+          tokenUsage: snapshot.tokenUsage,
+        },
+      ],
+      getRun: (id: string) => (id === "safe-run" ? { snapshot, status: "running" } : undefined),
+    };
+
+    const lines = renderPanelDetailed(manager as never, theme as never, undefined, 8, 1000);
+    const output = lines.join("\n");
+    assert.ok(!output.includes("\x1b") && !output.includes("\x07"), "detailed TUI output must strip terminal controls");
+  });
+
   it("renders a per-agent fresh/cache split when tokenUsage is present", async () => {
     const { renderPanelDetailed } = await import("../src/task-panel.js");
     const snapshot = {
@@ -1138,7 +1175,7 @@ describe("deliverText", () => {
     const verdict = "V".repeat(600);
     const text = deliverText(makeResult({ verdict }) as never, { resultPath: "/r/x.json" });
     assert.ok(text.includes(verdict), "long verdict passed through in full");
-    assert.ok(text.includes("↳ Full result and subagent reports: /r/x.json"), "pointer appended");
+    assert.ok(text.includes("↳ Full result and subagent reports: [path redacted]"), "pointer appended");
     assert.ok(!/truncated/.test(text), "verdict branch bypasses truncation");
   });
 
@@ -1154,7 +1191,7 @@ describe("deliverText", () => {
     const text = deliverText(makeResult({ ok: true, changed: 2 }) as never, { resultPath: "/r/x.json" });
     assert.ok(text.includes('"ok": true'), "full JSON shown");
     assert.ok(!text.includes("middle omitted"), "no omission under the threshold");
-    assert.ok(text.includes("↳ Full result and subagent reports: /r/x.json"), "pointer still appended");
+    assert.ok(text.includes("↳ Full result and subagent reports: [path redacted]"), "pointer still appended");
   });
 
   it("truncates the JSON dump at maxChars and reports the dropped size", async () => {
@@ -1164,7 +1201,7 @@ describe("deliverText", () => {
       maxChars: 100,
     });
     assert.ok(text.includes("middle omitted"), "head/tail omission marker present");
-    assert.ok(text.includes("↳ Full result and subagent reports: /r/x.json"), "pointer still appended");
+    assert.ok(text.includes("↳ Full result and subagent reports: [path redacted]"), "pointer still appended");
     // Body is capped near maxChars, so the 500-char tail is not delivered in full.
     assert.ok(!text.includes("x".repeat(500)), "the full tail is not inlined");
   });

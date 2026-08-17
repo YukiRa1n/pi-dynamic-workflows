@@ -5,6 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { WorkflowErrorCode } from "../src/errors.js";
 import { MAX_EXPLICIT_DELIVERIES_PER_WINDOW, WorkflowManager } from "../src/workflow-manager.js";
+import { waitFor } from "./helpers/wait-for.js";
 
 const script = `export const meta = { name: "delivery-governance", description: "delivery test" }
 const value = await agent("produce", { label: "producer" })
@@ -92,7 +93,7 @@ test("acknowledged explicit delivery cannot reuse its stable ID for terminal com
     const run = m.startInBackground(`export const meta = { name: "sequence", description: "monotonic delivery ids" }
 await deliver({ kind: "decision", message: "early" })
 return await agent("finish", { label: "finisher" })`);
-    while (!explicit?.deliveryId) await new Promise((resolve) => setTimeout(resolve, 5));
+    await waitFor(() => explicit?.deliveryId, { description: "explicit delivery id to be allocated" });
     assert.equal(m.acknowledgeDelivery(run.runId, explicit.deliveryId, 1, "submitted"), true);
     assert.equal(m.acknowledgeDelivery(run.runId, explicit.deliveryId, 1, "projected"), true);
     assert.equal(m.acknowledgeDelivery(run.runId, explicit.deliveryId, 1, "acknowledged"), true);

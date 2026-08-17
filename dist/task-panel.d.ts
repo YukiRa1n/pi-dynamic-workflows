@@ -55,7 +55,7 @@ export declare function installResultDelivery(pi: ExtensionAPI, manager: Workflo
     installContextBridge?: boolean;
     /** Route terminal results through an extension-owned batching/dedup bridge. */
     sendResult?: (payload: WorkflowDeliveryPayload) => void;
-}): void;
+}): () => void;
 export declare function renderPanel(manager: WorkflowManager, theme: Theme, width?: number): string[];
 /** Record a token-total sample for `runId` at time `now` (ms). */
 export declare function sampleTokens(runId: string, total: number, now: number): void;

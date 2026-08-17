@@ -54,12 +54,20 @@ test("resolveModelForPhase uses regex when useRegex is true", () => {
   assert.equal(resolveModelForPhase("Not Matching", config), undefined);
 });
 
-test("resolveModelForPhase handles invalid regex gracefully (skips)", () => {
+test("resolveModelForPhase rejects invalid regex patterns", () => {
   const config: ModelRoutingConfig = {
     defaultModel: "default-model",
     routes: [{ phasePattern: "[invalid", model: "bad", useRegex: true }],
   };
-  assert.equal(resolveModelForPhase("anything", config), "default-model");
+  assert.throws(() => resolveModelForPhase("anything", config), /Invalid phasePattern regex/);
+});
+
+test("resolveModelForPhase rejects nested-quantifier regex patterns", () => {
+  const config: ModelRoutingConfig = {
+    defaultModel: "default-model",
+    routes: [{ phasePattern: "(a+)+", model: "bad", useRegex: true }],
+  };
+  assert.throws(() => resolveModelForPhase("aaaa", config), /nested quantifiers/);
 });
 
 test("resolveModelForPhase regex is case-insensitive", () => {

@@ -14,6 +14,7 @@ import {
 } from "./display.js";
 import { type EffortState, effortDirective } from "./effort-command.js";
 import type { PersistedRunState } from "./run-persistence.js";
+import { redactForModel, sanitizeForTerminal } from "./sanitize.js";
 import { registerSavedWorkflow } from "./saved-commands.js";
 import { buildForcedWorkflowPrompt } from "./workflow-editor.js";
 import type { WorkflowManager } from "./workflow-manager.js";
@@ -34,13 +35,22 @@ const USAGE =
 
 const RUN_USAGE = "Usage: /workflows run <prompt> — force a dynamic workflow from the prompt";
 
+function terminalText(value: unknown): string {
+  return sanitizeForTerminal(typeof value === "string" ? value : String(value ?? ""));
+}
+
+function modelText(value: string): string {
+  return sanitizeForTerminal(redactForModel(value, Buffer.byteLength(value, "utf8")));
+}
+
 function summarizeRun(run: PersistedRunState): string {
   const icon = STATUS_ICON[run.status] ?? "?";
   const done = run.agents.filter((a) => a.status === "done").length;
   const total = run.agents.length;
   const segment = fmtTokenSegment(tokenFigures(run.tokenUsage), fmtFull);
   const tokens = segment ? ` · ${segment}` : "";
-  return `${icon} ${run.runId}  ${run.workflowName} [${run.status}] ${done}/${total} agents${tokens}`;
+  const workflowName = terminalText(run.workflowName);
+  return modelText(`${icon} ${run.runId}  ${workflowName} [${run.status}] ${done}/${total} agents${tokens}`);
 }
 
 function oneLineProgress(snapshot: WorkflowSnapshot): string {
@@ -48,8 +58,8 @@ function oneLineProgress(snapshot: WorkflowSnapshot): string {
   const done = snapshot.agents.filter((a) => a.status === "done").length;
   const running = snapshot.agents.filter((a) => a.status === "running").length;
   const errs = snapshot.agents.filter((a) => a.status === "error").length;
-  const phase = snapshot.currentPhase ? ` · ${snapshot.currentPhase}` : "";
-  return `◆ ${snapshot.name}: ${done}/${total} done${running ? `, ${running} running` : ""}${
+  const phase = snapshot.currentPhase ? ` · ${terminalText(snapshot.currentPhase)}` : "";
+  return `◆ ${terminalText(snapshot.name)}: ${done}/${total} done${running ? `, ${running} running` : ""}${
     errs ? `, ${errs} err` : ""
   }${phase}`;
 }
@@ -95,11 +105,22 @@ function watchRun(
     const run = manager.getRun(id);
     dispose();
     if (run) {
-      void pi.sendMessage({
-        customType: "workflows",
-        content: renderWorkflowText(recomputeWorkflowSnapshot(run.snapshot), true),
-        display: true,
-      });
+      try {
+        const sent = pi.sendMessage({
+          customType: "workflows",
+          content: renderWorkflowText(recomputeWorkflowSnapshot(run.snapshot), true),
+          display: true,
+        });
+        void Promise.resolve(sent).catch((err: unknown) => {
+          console.warn(
+            `[workflows] async completion update failed: ${terminalText(err instanceof Error ? err.message : String(err))}`,
+          );
+        });
+      } catch (err) {
+        console.warn(
+          `[workflows] completion update failed: ${terminalText(err instanceof Error ? err.message : String(err))}`,
+        );
+      }
     }
   };
   for (const ev of progressEvents) manager.on(ev, onEvent);
@@ -109,17 +130,18 @@ function watchRun(
 }
 
 function renderPersistedStatus(run: PersistedRunState): string {
-  const lines = [`${STATUS_ICON[run.status] ?? "?"} ${run.workflowName} (${run.runId}) — ${run.status}`];
-  if (run.currentPhase) lines.push(`  phase: ${run.currentPhase}`);
+  const workflowName = terminalText(run.workflowName);
+  const lines = [`${STATUS_ICON[run.status] ?? "?"} ${workflowName} (${run.runId}) — ${run.status}`];
+  if (run.currentPhase) lines.push(`  phase: ${terminalText(run.currentPhase)}`);
   for (const agent of run.agents) {
     const icon =
       agent.status === "done" ? "✓" : agent.status === "error" ? "✗" : agent.status === "running" ? "◆" : "·";
-    lines.push(`  ${icon} ${agent.label}`);
+    lines.push(`  ${icon} ${terminalText(agent.label)}`);
   }
   const tokenSegment = fmtTokenSegment(tokenFigures(run.tokenUsage), fmtFull);
   if (tokenSegment) lines.push(`  tokens: ${tokenSegment}`);
   if (run.durationMs) lines.push(`  duration: ${(run.durationMs / 1000).toFixed(1)}s`);
-  return lines.join("\n");
+  return modelText(lines.join("\n"));
 }
 
 export interface WorkflowCommandOptions {

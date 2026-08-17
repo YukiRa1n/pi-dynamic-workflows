@@ -8,7 +8,7 @@
 import { join } from "node:path";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { aggregateAgentUsage, fmtCost, fmtTokenSegment, shorten, statusIcon, tokenFigures, } from "./display.js";
-import { truncateUtf8 } from "./safe-serialize.js";
+import { redactAbsolutePaths, redactForModel, sanitizeForTerminal } from "./sanitize.js";
 import { DEFAULT_WORKFLOW_RESULT_CHARS, summarizeWorkflowResult } from "./workflow-result-projection.js";
 import { shortModel } from "./workflow-ui.js";
 // `tokenUsage` is included so the detailed panel's live token/s counter refreshes
@@ -54,6 +54,17 @@ function fitLine(line, width) {
         return line;
     return truncateToWidth(line, maxWidth);
 }
+function terminalText(value) {
+    try {
+        return sanitizeForTerminal(typeof value === "string" ? value : String(value ?? ""));
+    }
+    catch {
+        return "";
+    }
+}
+function modelText(value) {
+    return sanitizeForTerminal(redactForModel(value, Buffer.byteLength(value, "utf8")));
+}
 export function deliverText(run, opts = {}) {
     const maxChars = typeof opts.maxChars === "number" && Number.isFinite(opts.maxChars)
         ? Math.max(0, Math.floor(opts.maxChars))
@@ -66,15 +77,17 @@ export function deliverText(run, opts = {}) {
     const agents = run.result?.agentCount ?? run.snapshot.agentCount;
     const duration = run.result?.durationMs ? ` · ${(run.result.durationMs / 1000).toFixed(1)}s` : "";
     const lines = [
-        `✓ Background workflow "${run.snapshot.name}" finished (${agents} agents${tokens}${duration}).`,
+        `✓ Background workflow "${terminalText(run.snapshot.name)}" finished (${agents} agents${tokens}${duration}).`,
         "",
         summary,
     ];
     // The full result is intentionally not duplicated into provider context.
-    // Point at the durable run record for exact JSON and per-agent reports.
+    // Point at the durable run record for exact JSON and per-agent reports. The
+    // path may live outside the user's home (workspace/UNC/tmp), so redact the
+    // absolute location before it enters provider context.
     if (opts.resultPath)
-        lines.push("", `↳ Full result and subagent reports: ${opts.resultPath}`);
-    return lines.join("\n");
+        lines.push("", `↳ Full result and subagent reports: ${redactAbsolutePaths(opts.resultPath)}`);
+    return modelText(lines.join("\n"));
 }
 /** Absolute path to a run's persisted result JSON. Undefined if the persistence
  *  layer can't be resolved — delivery must never throw in the complete handler. */
@@ -259,6 +272,8 @@ export function resumeResultDelivery(manager) {
  *    result is queued and picked up at the next safe point — the active provider
  *    request is never aborted.
  *
+ * Returns an idempotent disposer that removes the three manager listeners and
+ * clears the installation marker so a later session can install a fresh holder.
  * Set up once per extension; idempotent via an internal guard. Across session
  * replacement the manager (and this listener) survive via the handoff path;
  * each new generation only refreshes `holder.pi` and flushes any messages that
@@ -286,9 +301,15 @@ function installResultContextBridge(pi) {
             }
             const contentDescriptor = message && typeof message === "object" ? Object.getOwnPropertyDescriptor(message, "content") : undefined;
             const rawText = contentDescriptor && !contentDescriptor.get && !contentDescriptor.set ? contentDescriptor.value : "";
-            const text = truncateUtf8(typeof rawText === "string" ? rawText : String(rawText ?? ""), 32_000, "…");
+            const raw = typeof rawText === "string" ? rawText : String(rawText ?? "");
+            const text = sanitizeForTerminal(redactForModel(raw, 32_000));
             const deliveryId = message.details && typeof message.details.deliveryId === "string" ? message.details.deliveryId : undefined;
-            const toolCallId = deliveryId ?? `workflow_result_${index}_${message.timestamp ?? 0}`;
+            // A corrupt/persisted deliveryId may contain characters a provider rejects
+            // in a toolCall id; fall back to a positional id instead of passing it through.
+            const PROVIDER_TOOL_CALL_ID = /^[A-Za-z0-9_-]{1,64}$/;
+            const toolCallId = deliveryId && PROVIDER_TOOL_CALL_ID.test(deliveryId)
+                ? deliveryId
+                : `workflow_result_${index}_${message.timestamp ?? 0}`;
             output.push({
                 role: "assistant",
                 content: [
@@ -335,7 +356,7 @@ export function installResultDelivery(pi, manager, opts = {}) {
             m.__holder.generation += 1;
             m.__holder.submittedGeneration.clear();
         }
-        return;
+        return m.__deliveryDisposer ?? (() => { });
     }
     m.__deliveryInstalled = true;
     m.__holder = {
@@ -353,14 +374,16 @@ export function installResultDelivery(pi, manager, opts = {}) {
         const holder = m.__holder;
         if (!holder)
             return;
+        const content = modelText(payload.content);
+        const safePayload = content === payload.content ? payload : { ...payload, content };
         if (holder.suspended) {
-            enqueuePending(holder, payload);
+            enqueuePending(holder, safePayload);
             return;
         }
-        trySend(holder, payload);
+        trySend(holder, safePayload);
     };
     let notificationSequence = 0;
-    manager.on("complete", ({ runId, deliveryId, sequence }) => {
+    const onComplete = ({ runId, deliveryId, sequence }) => {
         const run = manager.getRun(runId);
         // Only background/resumed runs are delivered: a foreground (sync) run already
         // returns its result inline as the tool result, so re-delivering would dup it.
@@ -387,8 +410,9 @@ export function installResultDelivery(pi, manager, opts = {}) {
                 },
             });
         }
-    });
-    manager.on("error", ({ runId, error, deliveryId, sequence, }) => {
+    };
+    manager.on("complete", onComplete);
+    const onError = ({ runId, error, deliveryId, sequence, }) => {
         if (!manager.getRun(runId)?.background)
             return;
         deliver({
@@ -402,12 +426,13 @@ export function installResultDelivery(pi, manager, opts = {}) {
                 deliveryId,
             },
         });
-    });
+    };
+    manager.on("error", onError);
     // A provider usage/quota limit checkpoints the run as paused (not failed): tell the
     // user it is resumable once their budget refills, rather than letting it look dead.
     // Manual pause() also emits "paused" but with no reason — guard so only the
     // usage-limit case delivers a message.
-    manager.on("paused", ({ runId, reason, error, resetHint, }) => {
+    const onPaused = ({ runId, reason, error, resetHint, }) => {
         if (reason !== "usage_limit")
             return;
         if (!manager.getRun(runId)?.background)
@@ -425,7 +450,20 @@ export function installResultDelivery(pi, manager, opts = {}) {
                 sequence: notificationSequence++,
             },
         });
-    });
+    };
+    manager.on("paused", onPaused);
+    const disposer = () => {
+        if (!m.__deliveryInstalled || m.__deliveryDisposer !== disposer)
+            return;
+        manager.off("complete", onComplete);
+        manager.off("error", onError);
+        manager.off("paused", onPaused);
+        m.__deliveryInstalled = false;
+        m.__deliveryDisposer = undefined;
+        m.__holder = undefined;
+    };
+    m.__deliveryDisposer = disposer;
+    return disposer;
 }
 export function renderPanel(manager, theme, width) {
     const all = manager.listRuns();
@@ -439,8 +477,8 @@ export function renderPanel(manager, theme, width) {
         const agents = safeAgentSnapshots(live?.snapshot.agents ?? r.agents);
         const done = agents.filter((a) => a.status === "done").length;
         const icon = r.status === "paused" ? "⏸" : "◆";
-        const phase = live?.snapshot.currentPhase ? ` · ${live.snapshot.currentPhase}` : "";
-        return `  ${icon} ${r.workflowName}  ${done}/${agents.length} agents${phase}`;
+        const phase = live?.snapshot.currentPhase ? ` · ${terminalText(live.snapshot.currentPhase)}` : "";
+        return `  ${icon} ${terminalText(r.workflowName)}  ${done}/${agents.length} agents${phase}`;
     });
     // Finished runs leave this live panel but are kept in the navigator. Tell the
     // user so a completed run doesn't look like it vanished.
@@ -544,14 +582,14 @@ function renderRunBody(snap, agents, maxAgents, theme) {
         ]
             .filter(Boolean)
             .join(" · ");
-        lines.push(theme.fg("accent", `  ${marker} ${title}`) + dim(`  ${phaseMeta}`));
+        lines.push(theme.fg("accent", `  ${marker} ${terminalText(title)}`) + dim(`  ${phaseMeta}`));
         const visible = phaseAgents.slice(-maxAgents);
         for (const a of visible) {
             const segment = fmtTokenSegment(tokenFigures(a.tokenUsage, a.tokens), fmtTokensShort);
             const tok = segment ? dim(` ${segment}`) : "";
-            const mdl = shortModel(a.model);
+            const mdl = terminalText(shortModel(a.model) ?? "");
             const model = mdl ? dim(` · ${mdl}`) : "";
-            lines.push(`    [${a.id}] ${statusIcon(a.status)} ${shorten(a.label, 40)}${tok}${model}`);
+            lines.push(`    [${a.id}] ${statusIcon(a.status)} ${shorten(terminalText(a.label), 40)}${tok}${model}`);
         }
         if (phaseAgents.length > visible.length) {
             lines.push(dim(`    … ${phaseAgents.length - visible.length} earlier agents`));
@@ -592,7 +630,7 @@ export function renderPanelDetailed(manager, theme, width, maxAgents, now) {
         const rate = r.status === "running" ? tokensPerSecond(r.runId) : 0;
         const meta = [
             `${done}/${agents.length} agents`,
-            snap?.currentPhase || "",
+            snap?.currentPhase ? terminalText(snap.currentPhase) : "",
             fmtTokenSegment(runUsage, fmtTokensShort),
             // (cost is only known once the run finalizes its usage.)
             usage?.cost ? fmtCost(usage.cost) : "",
@@ -600,7 +638,7 @@ export function renderPanelDetailed(manager, theme, width, maxAgents, now) {
         ]
             .filter(Boolean)
             .join(" · ");
-        out.push(`  ${icon} ${theme.bold(r.workflowName)}  ${dim(meta)}`);
+        out.push(`  ${icon} ${theme.bold(terminalText(r.workflowName))}  ${dim(meta)}`);
         if (snap)
             out.push(...renderRunBody(snap, agents, maxAgents, theme));
     }

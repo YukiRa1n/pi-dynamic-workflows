@@ -203,7 +203,8 @@ test("get_workflow_output returns a bounded completed result immediately", async
   assert.equal(response.details.status, "completed");
   assert.equal(response.details.timedOut, undefined);
   assert.match(response.content[0].text, /final report/);
-  assert.match(response.content[0].text, /Full persisted run: C:[\\/]workflow-runs[\\/]audit-abc123\.json/);
+  assert.match(response.content[0].text, /Full persisted run: \[path redacted\]/);
+  assert.equal(response.details.resultPath, "[path redacted]");
   assert.equal(manager.eventNames().length, 0);
 });
 
@@ -318,6 +319,26 @@ test("list_active_workflows returns only bounded current-session cancellation ha
     false,
   );
   assert.match(response.content[0].text, /More active workflows are available through \/workflows list/);
+});
+
+test("list_active_workflows redacts hostile workflow names for model output", async () => {
+  const control = "\x1b]52;c;clipboard\x07";
+  const hostile = {
+    ...run("running", "active-hostile"),
+    workflowName: `${control}workflow Bearer secret-token`,
+    sessionId: "session-a",
+  } as PersistedRunState;
+  const manager = {
+    getSessionId: () => "session-a",
+    listRuns: () => [hostile],
+  } as unknown as WorkflowManager;
+
+  const response = await executeList(manager);
+  const name = response.details.runs[0]?.name ?? "";
+  assert.ok(!name.includes("\x1b") && !name.includes("\x07"));
+  assert.doesNotMatch(name, /secret-token/);
+  assert.ok(!response.content[0].text.includes("\x1b") && !response.content[0].text.includes("\x07"));
+  assert.doesNotMatch(response.content[0].text, /secret-token/);
 });
 
 test("list_active_workflows fails closed when current-session ownership is unavailable", async () => {
@@ -536,6 +557,29 @@ test("a manager exception is returned as a structured tool error", async () => {
   assert.match(text(response), /^action=stop result=error runId=throws-1 error=disk I\/O failed/);
   assert.equal(response.details.result, "error");
   assert.equal(response.details.error, "disk I/O failed");
+});
+
+test("workflow_control redacts manager exception text before returning control errors", async () => {
+  const control = "\x1b]8;;https://evil.example\x07";
+  const throwingRun = run("paused", "throws-hostile");
+  const manager = {
+    listRuns: () => [throwingRun],
+    getSnapshot: () => null,
+    getRun: () => undefined,
+    pause: () => false,
+    async resume() {
+      return false;
+    },
+    stop() {
+      throw new Error(`${control}Bearer secret-token`);
+    },
+  } as unknown as WorkflowManager;
+
+  const response = await execute(manager, { action: "stop", runId: "throws-hostile" });
+  const output = text(response);
+  assert.ok(!output.includes("\x1b") && !output.includes("\x07"));
+  assert.doesNotMatch(output, /secret-token/);
+  assert.equal(response.details.error, "Bearer [REDACTED]");
 });
 
 test("unknown IDs and illegal transitions return explicit mutation-only actions", async () => {

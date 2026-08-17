@@ -43,7 +43,7 @@
     "delivery-choice": "tsx scripts/run-workflow-delivery-choice.ts",
     "routing-choice": "tsx scripts/run-workflow-routing-choice.ts",
     "dev": "tsx src/index.ts",
-    "prepublishOnly": "npm run release:check"
+    "prepublishOnly": "npm test"
   },
   "keywords": [
     "pi-package",

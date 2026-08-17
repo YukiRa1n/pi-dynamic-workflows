@@ -28,6 +28,7 @@ import type { ThemeLike, WorkflowAgentSnapshot, WorkflowSnapshot } from "./displ
 import { aggregateAgentUsage, fmtCost, fmtTokenSegment, tokenFigures } from "./display.js";
 import type { PersistedRunState } from "./run-persistence.js";
 import { safeStringify, serializeBounded } from "./safe-serialize.js";
+import { redactCommandSecrets, redactForModel, sanitizeForTerminal } from "./sanitize.js";
 import { registerSavedWorkflow } from "./saved-commands.js";
 import type { WorkflowManager } from "./workflow-manager.js";
 import type { SavedWorkflow, WorkflowStorage } from "./workflow-saved.js";
@@ -685,7 +686,7 @@ function leftPhaseRow(
   // Fixed parts width: marker + idx + space + (space+progress if shown)
   const fixed = 2 + visibleWidth(idx) + 1 + (progress ? 1 + visibleWidth(progress) : 0);
   const nameRoom = Math.max(0, innerW - fixed);
-  const name = truncateToWidth(p.title, nameRoom, ELLIPSIS, false);
+  const name = truncateToWidth(sanitizeUiText(p.title), nameRoom, ELLIPSIS, false);
 
   const styleMain = (s: string) => (selected ? theme.fg("accent", theme.bold(s)) : hasAgents ? s : theme.fg("dim", s));
   const progStyle = (s: string) =>
@@ -707,19 +708,20 @@ function rightAgentRow(
 ): string {
   const dotColor = AGENT_DOT_COLOR[a.status] ?? "dim";
   const stats = fmtTokenSegment(tokenFigures(a.tokenUsage, a.tokens), compactTokens);
-  const model = shortModel(a.model) ?? "";
+  const model = sanitizeUiText(shortModel(a.model) ?? "");
+  const label = sanitizeUiText(a.label);
 
   // Stable 2-cell marker so columns never shift on selection: "› " | "  ".
   // Layout: <marker:2><dot><sp><name> … <model> … <stats(right-aligned)>.
   const markerW = 2;
   const statsW = visibleWidth(stats);
   const nameStart = markerW + 2; // marker + dot + space
-  let modelStart = Math.max(nameStart + visibleWidth(a.label) + GAP_NM, markerW + modelColStart);
+  let modelStart = Math.max(nameStart + visibleWidth(label) + GAP_NM, markerW + modelColStart);
   const statsStart = innerW - statsW;
 
   // Available room for the model block (between modelStart and stats, min 1 gap).
   let modelRoom = statsStart - 1 - modelStart;
-  let nameOut = a.label;
+  let nameOut = label;
   let modelOut = model;
   if (modelRoom < 0) {
     // No room for model: drop it (spec §4.4 step 1/2), possibly truncate name.
@@ -727,11 +729,11 @@ function rightAgentRow(
     modelStart = nameStart;
     modelRoom = 0;
     const nameRoom = Math.max(0, statsStart - 1 - nameStart);
-    nameOut = truncateToWidth(a.label, nameRoom, ELLIPSIS, false);
+    nameOut = truncateToWidth(label, nameRoom, ELLIPSIS, false);
   } else {
     modelOut = truncateToWidth(model, modelRoom, ELLIPSIS, false);
     const nameRoom = Math.max(0, modelStart - GAP_NM - nameStart);
-    nameOut = truncateToWidth(a.label, nameRoom, ELLIPSIS, false);
+    nameOut = truncateToWidth(label, nameRoom, ELLIPSIS, false);
   }
 
   const marker = selected ? theme.fg("accent", theme.bold(`${CARET} `)) : "  ";
@@ -1074,13 +1076,18 @@ function renderNavigatorFrame(
         const icon = STATUS_ICON[r.status] ?? "?";
         const tok = fmtTokenSegment(r, pad);
         const meta = [`${r.done}/${r.total}`, tok, r.cost > 0 ? fmtCost(r.cost) : ""].filter(Boolean).join(" · ");
-        lines.push(sel(i, `${icon} ${r.name}  ${dim(`${r.runId} · ${r.status} · ${meta}`)}`));
+        lines.push(
+          sel(
+            i,
+            `${icon} ${sanitizeUiText(r.name)}  ${dim(`${sanitizeUiText(r.runId)} · ${sanitizeUiText(r.status)} · ${meta}`)}`,
+          ),
+        );
       } else {
         const w = saved[i - runs.length];
         if (!w) continue;
         const loc = w.location === "user" ? "~" : ".";
-        const desc = w.description ? dim(`  ${w.description}`) : "";
-        lines.push(sel(i, `${w.name}${desc}  ${dim(loc)}`));
+        const desc = w.description ? dim(`  ${sanitizeUiText(w.description)}`) : "";
+        lines.push(sel(i, `${sanitizeUiText(w.name)}${desc}  ${dim(loc)}`));
       }
     }
   } else if (state.kind === "phases" && state.runId) {
@@ -1100,8 +1107,8 @@ function renderNavigatorFrame(
     lines.push(...renderPhasesAgents(state, model, state.runId, width, theme, bodyCap));
   } else if (state.kind === "detail" && state.runId && state.agentId != null) {
     const a = model.agentDetail(state.runId, state.agentId);
-    lines.push(theme.bold(a ? asText(a.label) : "agent"));
-    if (a?.callId) lines.push(dim(`ID: ${a.callId}`));
+    lines.push(theme.bold(a ? sanitizeUiText(a.label) : "agent"));
+    if (a?.callId) lines.push(dim(`ID: ${sanitizeUiText(a.callId)}`));
     if (a) {
       // Coerce every dynamic value before wrap() (#110): a non-string prompt is
       // reachable even from a LIVE run — agent(42) in a model-written script is
@@ -1109,14 +1116,14 @@ function renderNavigatorFrame(
       // error/status/history text can be non-string on a corrupt run too.
       const body: string[] = [];
       if (state.pagerOpen) {
-        body.push(dim("Status: ") + asText(a.status ?? ""));
-        if (a.model) body.push(dim("Model: ") + (shortModel(a.model) ?? ""));
-        if (a.error) body.push(dim("Error: ") + asText(a.error));
+        body.push(dim("Status: ") + sanitizeUiText(a.status ?? ""));
+        if (a.model) body.push(dim("Model: ") + sanitizeUiText(shortModel(a.model) ?? ""));
+        if (a.error) body.push(dim("Error: ") + sanitizeUiText(a.error));
         if (a.errorCode) {
-          body.push(`${dim("Error code: ")}${asText(a.errorCode)}${a.recoverable ? " (recoverable)" : ""}`);
+          body.push(`${dim("Error code: ")}${sanitizeUiText(a.errorCode)}${a.recoverable ? " (recoverable)" : ""}`);
         }
         body.push("", theme.fg("accent", theme.bold("Prompt:")));
-        body.push(...renderMarkdownLines(asText(a.prompt ?? ""), width, markdownTheme, renderCache));
+        body.push(...renderMarkdownLines(sanitizeUiText(a.prompt ?? ""), width, markdownTheme, renderCache));
         body.push("", theme.fg("accent", theme.bold("Result:")));
         body.push(...renderResultLines(a.result, a.resultPreview, width, markdownTheme, renderCache));
         if (Array.isArray(a.history) && a.history.length) {
@@ -1134,14 +1141,14 @@ function renderNavigatorFrame(
         pushCompact(body);
       } else {
         // Active/failed agents default to context plus the latest two events.
-        body.push(dim("Status: ") + asText(a.status ?? ""));
-        if (a.model) body.push(dim("Model: ") + (shortModel(a.model) ?? ""));
-        if (a.error) body.push(dim("Error: ") + asText(a.error));
+        body.push(dim("Status: ") + sanitizeUiText(a.status ?? ""));
+        if (a.model) body.push(dim("Model: ") + sanitizeUiText(shortModel(a.model) ?? ""));
+        if (a.error) body.push(dim("Error: ") + sanitizeUiText(a.error));
         if (a.errorCode) {
-          body.push(`${dim("Error code: ")}${asText(a.errorCode)}${a.recoverable ? " (recoverable)" : ""}`);
+          body.push(`${dim("Error code: ")}${sanitizeUiText(a.errorCode)}${a.recoverable ? " (recoverable)" : ""}`);
         }
         body.push("", theme.fg("accent", theme.bold("Prompt:")));
-        const promptLines = renderMarkdownLines(asText(a.prompt ?? ""), width, markdownTheme, renderCache);
+        const promptLines = renderMarkdownLines(sanitizeUiText(a.prompt ?? ""), width, markdownTheme, renderCache);
         body.push(...promptLines.slice(0, 5));
         if (promptLines.length > 5) body.push(dim("  … prompt continues in pager"));
         body.push("", theme.fg("accent", theme.bold("Recent activity:")));
@@ -1175,13 +1182,13 @@ function renderNavigatorFrame(
   } else if (state.kind === "savedDetail" && state.savedName) {
     const saved = model.saved();
     const w = saved.find((s) => s.name === state.savedName);
-    lines.push(theme.bold(w ? w.name : "saved workflow"));
+    lines.push(theme.bold(w ? sanitizeUiText(w.name) : "saved workflow"));
     if (w) {
       const body: string[] = [];
-      if (w.description) body.push(dim("Description: ") + asText(w.description));
+      if (w.description) body.push(dim("Description: ") + sanitizeUiText(w.description));
       body.push(dim("Location: ") + (w.location === "user" ? "user (~/.pi)" : "project (.pi)"));
-      body.push(dim("Saved at: ") + asText(w.savedAt));
-      if (w.parameters) body.push(dim("Parameters: ") + safeStringify(w.parameters));
+      body.push(dim("Saved at: ") + sanitizeUiText(w.savedAt));
+      if (w.parameters) body.push(dim("Parameters: ") + sanitizeUiText(safeStringify(w.parameters)));
       body.push("", theme.fg("accent", theme.bold("Script:")));
       // Coerce (#110): corrupt saved-workflow JSON can carry a non-string script.
       body.push(...renderCodeLines(asText(w.script), "javascript", width, markdownTheme, renderCache));
@@ -1208,8 +1215,8 @@ function twoPaneHeader(
   width: number,
   theme: ThemeLike,
 ): string[] {
-  const name = model.runName(runId);
-  const status = model.runStatus(runId);
+  const name = sanitizeUiText(model.runName(runId));
+  const status = sanitizeUiText(model.runStatus(runId));
   let done = 0;
   let total = 0;
   let fresh = 0;
@@ -1244,10 +1251,11 @@ function twoPaneHeader(
 }
 
 function historyLabel(entry: NonNullable<WorkflowAgentSnapshot["history"]>[number]): string {
-  if (entry.kind === "toolCall") return entry.toolName ? `assistant tool ${asText(entry.toolName)}` : "assistant tool";
-  if (entry.role === "tool") return entry.toolName ? `tool ${asText(entry.toolName)}` : "tool";
-  if (entry.kind === "error") return `${asText(entry.role)} error`;
-  return asText(entry.role);
+  if (entry.kind === "toolCall")
+    return entry.toolName ? `assistant tool ${sanitizeUiText(entry.toolName)}` : "assistant tool";
+  if (entry.role === "tool") return entry.toolName ? `tool ${sanitizeUiText(entry.toolName)}` : "tool";
+  if (entry.kind === "error") return `${sanitizeUiText(entry.role)} error`;
+  return sanitizeUiText(entry.role);
 }
 
 function toolCallArguments(
@@ -1262,18 +1270,25 @@ function toolCallArguments(
   }
 }
 
-/** Keep the useful part of a command visible without allowing common credential
- * forms to be echoed into screenshots or terminal scrollback. */
-function redactCommandSecrets(command: string): string {
-  return command
-    .replace(/\b(?:gh[opusr]_[A-Za-z0-9_]{12,}|github_pat_[A-Za-z0-9_]{12,}|sk-[A-Za-z0-9_-]{12,})\b/g, "[REDACTED]")
-    .replace(/((?:authorization|api[-_]?key|access[-_]?token|password)\s*[:=]\s*)([^\s;'"]+)/gi, "$1[REDACTED]");
+/** Sanitize untrusted values before they reach terminal-facing UI renderers. */
+function sanitizeUiText(value: unknown): string {
+  try {
+    // Terminal-bound text must not be length-capped by the model byte budget —
+    // a legitimate long script/prompt/result would otherwise render as
+    // "[truncated]" in the pager. Strip control sequences and redact secrets,
+    // but let the viewport/truncation logic (not the model cap) bound length.
+    return sanitizeForTerminal(
+      redactForModel(typeof value === "string" ? value : String(value ?? ""), Number.MAX_SAFE_INTEGER),
+    );
+  } catch {
+    return "";
+  }
 }
 
 function compactHistoryLine(entry: NonNullable<WorkflowAgentSnapshot["history"]>[number], width: number): string {
   const label = historyLabel(entry);
   if (entry.kind !== "toolCall") {
-    const text = asText(entry.text).replace(/\s+/g, " ").trim();
+    const text = sanitizeUiText(entry.text).replace(/\s+/g, " ").trim();
     return truncateToWidth(`${label}:${text ? ` ${text}` : ""}`, width, ELLIPSIS, false);
   }
 
@@ -1285,10 +1300,12 @@ function compactHistoryLine(entry: NonNullable<WorkflowAgentSnapshot["history"]>
       detail = value("command");
       if (detail)
         detail = redactCommandSecrets(
-          detail
-            .replace(/\s*\r?\n\s*/g, " ⏎ ")
-            .replace(/[ \t]+/g, " ")
-            .trim(),
+          sanitizeUiText(
+            detail
+              .replace(/\s*\r?\n\s*/g, " ⏎ ")
+              .replace(/[ \t]+/g, " ")
+              .trim(),
+          ),
         );
       break;
     case "read": {
@@ -1326,17 +1343,17 @@ function compactHistoryLine(entry: NonNullable<WorkflowAgentSnapshot["history"]>
   // pager. Fall back to the raw payload as well for legacy/invalid JSON and
   // array-shaped arguments.
   if (!detail) {
-    const raw = asText(entry.text).trim();
+    const raw = sanitizeUiText(entry.text).trim();
     if (raw) {
       try {
         const parsed = JSON.parse(raw) as unknown;
-        detail = serializeBounded(parsed, { pretty: false, maxBytes: 8_000 });
+        detail = sanitizeUiText(serializeBounded(parsed, { pretty: false, maxBytes: 8_000 }));
       } catch {
         detail = raw;
       }
     }
   }
-  return truncateToWidth(`${label}:${detail ? ` ${detail}` : ""}`, width, ELLIPSIS, false);
+  return truncateToWidth(sanitizeUiText(`${label}:${detail ? ` ${detail}` : ""}`), width, ELLIPSIS, false);
 }
 
 function editCallPath(entry: NonNullable<WorkflowAgentSnapshot["history"]>[number]): string | undefined {
@@ -1412,7 +1429,8 @@ function renderHistoryEntryLines(
   const write = writeCallSource(entry);
   const editPath = editCallPath(entry);
   const path = write?.path ?? editPath;
-  const header = dim(`${historyLabel(entry)}:${path ? ` ${path}` : ""}`);
+  const safePath = path ? sanitizeUiText(path) : "";
+  const header = dim(`${historyLabel(entry)}:${safePath ? ` ${safePath}` : ""}`);
 
   // Compact recent activity is intentionally one useful summary line per entry;
   // payload bodies stay behind the detail pager. Include the command/target so
@@ -1430,7 +1448,7 @@ function renderHistoryEntryLines(
   if (editPath) return [header];
 
   const language = historyEntryLanguage(history, index);
-  const text = write?.content ?? asText(entry.text);
+  const text = sanitizeUiText(write?.content ?? entry.text);
   return [
     header,
     ...(language
@@ -1488,7 +1506,7 @@ function renderMarkdownLines(
   markdownTheme?: MarkdownTheme,
   renderCache?: NavigatorTextRenderCache,
 ): string[] {
-  const safeText = asText(text);
+  const safeText = sanitizeUiText(text);
   if (!markdownTheme) return wrap(safeText, width);
   const renderWidth = Math.max(1, width);
   const key = `md:${renderWidth}:${safeText}`;
@@ -1501,11 +1519,12 @@ function renderMarkdownLines(
 /** Render Pi's display-oriented edit diff inside the navigator's bounded
  * viewport while preserving its ANSI colors and intra-line highlights. */
 function renderDiffLines(diff: string, width: number, renderCache?: NavigatorTextRenderCache): string[] {
+  const safeDiff = sanitizeUiText(diff);
   const renderWidth = Math.max(1, width);
-  const key = `diff:${renderWidth}:${diff}`;
+  const key = `diff:${renderWidth}:${safeDiff}`;
   const cached = renderCache?.get(key);
   if (cached) return cached;
-  const lines = renderDiff(diff)
+  const lines = renderDiff(safeDiff)
     .split("\n")
     .flatMap((line) => wrapTextWithAnsi(`  ${line}`, renderWidth));
   return renderCache?.set(key, lines, key.length + lines.reduce((sum, line) => sum + line.length, 0)) ?? lines;
@@ -1520,7 +1539,7 @@ function renderCodeLines(
   markdownTheme?: MarkdownTheme,
   renderCache?: NavigatorTextRenderCache,
 ): string[] {
-  const safeText = asText(text);
+  const safeText = sanitizeUiText(text);
   const renderWidth = Math.max(1, width);
   const key = `code:${language}:${renderWidth}:${safeText}`;
   const cached = renderCache?.get(key);
@@ -1764,11 +1783,11 @@ export function openWorkflowNavigator(
                 const item = saved[state.cursor - runCount];
                 if (item) {
                   model.deleteSaved(item.name);
-                  ui.notify(`Deleted /${item.name}`, "info");
+                  ui.notify(`Deleted /${sanitizeUiText(item.name)}`, "info");
                 }
               } else if (state.kind === "savedDetail" && state.savedName) {
                 model.deleteSaved(state.savedName);
-                ui.notify(`Deleted /${state.savedName}`, "info");
+                ui.notify(`Deleted /${sanitizeUiText(state.savedName)}`, "info");
                 state.back();
               }
               break;
@@ -1792,10 +1811,10 @@ export function openWorkflowNavigator(
               }
               try {
                 const { runId: newId } = manager.startInBackground(run.script, run.args);
-                ui.notify(`Restarted ${run.workflowName || "workflow"} as ${newId}`, "info");
+                ui.notify(`Restarted ${sanitizeUiText(run.workflowName || "workflow")} as ${newId}`, "info");
               } catch (error) {
                 ui.notify(
-                  `Failed to restart ${run.workflowName || "workflow"}: ${error instanceof Error ? error.message : error}`,
+                  `Failed to restart ${sanitizeUiText(run.workflowName || "workflow")}: ${redactForModel(error instanceof Error ? error.message : String(error))}`,
                   "error",
                 );
               }
@@ -1820,7 +1839,7 @@ export function openWorkflowNavigator(
                     location: "project",
                   });
                 } catch (error) {
-                  ui.notify(error instanceof Error ? error.message : String(error), "error");
+                  ui.notify(redactForModel(error instanceof Error ? error.message : String(error)), "error");
                   break;
                 }
                 // Match /workflows save and registerAllSavedWorkflows: live
@@ -1838,7 +1857,7 @@ export function openWorkflowNavigator(
                   () => getLiveStorage()?.load(saved.name) != null,
                   () => getLiveStorage()?.load(saved.name),
                 );
-                ui.notify(`Saved /${name}`, "info");
+                ui.notify(`Saved /${sanitizeUiText(name)}`, "info");
               }
               break;
             }
@@ -1847,7 +1866,7 @@ export function openWorkflowNavigator(
           }
         } catch (error) {
           ui.notify(
-            `Workflow action "${action.type}" failed: ${error instanceof Error ? error.message : error}`,
+            `Workflow action "${action.type}" failed: ${redactForModel(error instanceof Error ? error.message : String(error))}`,
             "error",
           );
         }

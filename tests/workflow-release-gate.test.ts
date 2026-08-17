@@ -25,7 +25,10 @@ test("npm pack parsing keeps only valid publishable file paths", () => {
 
 test("normal tests and publishing share the model-free release gate", () => {
   assert.match(packageJson.scripts.test, /release:check/);
-  assert.match(packageJson.scripts.prepublishOnly, /release:check/);
+  // prepublishOnly runs `npm test`, which runs `check` (biome + scripts tsc) and then
+  // `release:check` — so publishing cannot bypass either the lint gate or the release gate.
+  assert.match(packageJson.scripts.prepublishOnly, /npm (run )?test/);
+  assert.match(packageJson.scripts.test, /\bcheck\b/);
   assert.match(packageJson.scripts["release:check"], /docs:check/);
   assert.match(packageJson.scripts["release:check"], /context:check/);
   assert.match(packageJson.scripts["release:check"], /test:unit/);

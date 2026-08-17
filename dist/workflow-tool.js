@@ -4,10 +4,14 @@ import { Type } from "typebox";
 import { BUILTIN_WORKFLOW_NAMES, findBuiltinWorkflow, resolveWorkflowInvocation } from "./builtin-workflows.js";
 import { MAX_WORKFLOW_TIMEOUT_MS } from "./config.js";
 import { renderWorkflowText } from "./display.js";
+import { WorkflowError, WorkflowErrorCode } from "./errors.js";
 import { parseWorkflowScript } from "./workflow.js";
 import { WorkflowManager } from "./workflow-manager.js";
 import { createWorkflowStorage } from "./workflow-saved.js";
 import { loadWorkflowSettings } from "./workflow-settings.js";
+// Matches the runtime/persistence ceiling in workflow.ts and run-persistence.ts
+// (10_000_000), so the tool does not accept a script the runner will then reject.
+const MAX_WORKFLOW_SCRIPT_BYTES = 10_000_000;
 const workflowToolSchema = Type.Object({
     script: Type.Optional(Type.String({
         description: "JavaScript workflow; omitted metadata is filled in. Use await agent('task', { label: 'id' }); call agent() at least once.",
@@ -154,6 +158,12 @@ export function createWorkflowTool(options = {}) {
             let invocationToolset;
             let script;
             const invocationName = modelFacing ? params.preset : params.name;
+            if (invocationName && params.script !== undefined) {
+                if (typeof params.script !== "string") {
+                    throw new Error(`workflow's \`script\` must be a string when provided alongside \`${modelFacing ? "preset" : "name"}\``);
+                }
+                throw new Error(`workflow accepts either \`${modelFacing ? "preset" : "name"}\` or \`script\`, not both`);
+            }
             if (invocationName) {
                 if (params.resumeFromRunId) {
                     throw new Error("workflow: `name` cannot be combined with `resumeFromRunId` — resume with an edited `script` instead.");
@@ -173,6 +183,7 @@ export function createWorkflowTool(options = {}) {
                     throw new Error(`workflow requires either \`script\` or \`${modelFacing ? "preset" : "name"}\``);
                 script = normalizeWorkflowScript(params.script, modelFacing);
             }
+            assertWorkflowScriptSize(script);
             const parsed = parseWorkflowScript(script);
             // Iteration / cached-prefix reuse: resume a prior run with THIS (edited)
             // script instead of creating a brand-new run. Unchanged agent() calls
@@ -383,6 +394,10 @@ function normalizeWorkflowToolArgs(args, allowResume = true, exposeAdvancedParam
                 ...normalized,
                 ...(hasPreset ? { preset: value.preset.trim() } : {}),
                 ...(hasScript ? { script: normalizeWorkflowScript(value.script, true) } : {}),
+                // An empty/whitespace `script` is treated as "not provided" (hasScript=false);
+                // drop it so a preset-only invocation does not trip the execute-time
+                // "either preset or script" conflict on a leftover empty string.
+                ...(!hasScript ? { script: undefined } : {}),
             };
         }
         throw new Error("workflow requires either `script` or `preset` to be a string");
@@ -391,10 +406,13 @@ function normalizeWorkflowToolArgs(args, allowResume = true, exposeAdvancedParam
         if (value.script !== undefined && typeof value.script !== "string") {
             throw new Error("workflow's `script` must be a string when provided alongside `name`");
         }
+        if (value.script !== undefined) {
+            throw new Error("workflow accepts either `name` or `script`, not both");
+        }
         return {
             ...normalized,
             name: value.name.trim(),
-            script: typeof value.script === "string" ? normalizeWorkflowScript(value.script, false) : undefined,
+            script: undefined,
         };
     }
     if (typeof value.script !== "string")
@@ -412,5 +430,12 @@ function normalizeWorkflowScript(script, fillMetadata = false) {
     if (fillMetadata && !/^export\s+const\s+meta\s*=/.test(text) && !/\bexport\s+const\s+meta\s*=/.test(text)) {
         text = `export const meta = { name: "model_workflow", description: "Model-authored workflow" }\n${text}`;
     }
+    assertWorkflowScriptSize(text);
     return text;
+}
+function assertWorkflowScriptSize(script) {
+    const bytes = Buffer.byteLength(script, "utf8");
+    if (bytes > MAX_WORKFLOW_SCRIPT_BYTES) {
+        throw new WorkflowError(`Workflow script exceeds the ${MAX_WORKFLOW_SCRIPT_BYTES}-byte resource limit`, WorkflowErrorCode.RESOURCE_LIMIT_EXCEEDED, { recoverable: false });
+    }
 }

@@ -247,8 +247,9 @@ export interface WorkflowManagerOptions {
     /**
      * Named toolsets resolvable by ExecOptions.toolset — e.g.
      * `{ "web-research": () => [...createCodingTools(cwd), ...createWebTools()] }`.
-     * Called lazily per execution (including on resume). An unknown tag resolves
-     * to the default coding tools.
+     * Called lazily per execution (including on resume). An unknown persisted tag
+     * is fail-closed: resume throws rather than silently widening the run to the
+     * default coding tools.
      */
     toolsets?: Record<string, () => ToolDefinition[]>;
     /**

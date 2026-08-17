@@ -106,6 +106,25 @@ describe("renderWorkflowText", () => {
     assert.ok(text.includes("inventory"), "should contain inventory");
   });
 
+  it("sanitizes untrusted names, phases, labels, and previews at render boundaries", async () => {
+    const { createWorkflowSnapshot, renderWorkflowLines, renderWorkflowText } = await loadDisplay();
+    const control = "\x1b]52;c;clipboard\x07";
+    const snap = createWorkflowSnapshot(fakeMeta(`${control}workflow Bearer secret-token`, "d", [`${control}phase`]));
+    snap.agents = [
+      agent(1, `${control}agent`, "done", `${control}phase`, { resultPreview: `${control}preview` }),
+    ] as never[];
+
+    const terminal = renderWorkflowLines(snap, { showResultPreviews: true }).join("\\n");
+    const model = renderWorkflowText(snap, true);
+    assert.ok(
+      !terminal.includes("\x1b") && !terminal.includes("\x07"),
+      "terminal output must not contain OSC controls",
+    );
+    assert.ok(!model.includes("\x1b") && !model.includes("\x07"), "model output must not contain OSC controls");
+    assert.doesNotMatch(model, /secret-token/, "model output must redact bearer tokens");
+    assert.match(terminal, /workflow Bearer secret-token/, "terminal output preserves non-control text");
+  });
+
   it("shows agent count and done count", async () => {
     const { createWorkflowSnapshot, renderWorkflowText, recomputeWorkflowSnapshot } = await loadDisplay();
     const snap = recomputeWorkflowSnapshot(createWorkflowSnapshot(fakeMeta()));

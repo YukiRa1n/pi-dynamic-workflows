@@ -3,6 +3,7 @@ import type { AgentUsage } from "./agent.js";
 import type { AgentHistoryEntry } from "./agent-history.js";
 import type { WorkflowErrorCode } from "./errors.js";
 import { safeStringify, truncateUtf8 } from "./safe-serialize.js";
+import { redactForModel, sanitizeForTerminal } from "./sanitize.js";
 import type { WorkflowMeta } from "./workflow.js";
 
 export type WorkflowAgentStatus = "queued" | "running" | "done" | "error" | "skipped";
@@ -249,6 +250,17 @@ export interface ThemeLike {
 /** Identity passthrough for contexts where no theme is available (tool text output). */
 const NO_THEME: ThemeLike = { fg: (_c, t) => t, bold: (t) => t };
 
+function terminalText(value: unknown): string {
+  // Terminal-bound text only strips control sequences. Credential redaction is
+  // applied on provider/model-bound paths (modelText); the operator viewing the
+  // terminal is already trusted to see the run's content.
+  return sanitizeForTerminal(typeof value === "string" ? value : String(value ?? ""));
+}
+
+function modelText(value: string): string {
+  return sanitizeForTerminal(redactForModel(value, Buffer.byteLength(value, "utf8")));
+}
+
 /** The bracketed per-agent token cell (" [89 tok · 3,000 cached]"), or "" when nothing is known yet. */
 function agentTokenCell(agent: WorkflowAgentSnapshot, theme: ThemeLike): string {
   const segment = fmtTokenSegment(tokenFigures(agent.tokenUsage, agent.tokens), fmtFull);
@@ -274,7 +286,7 @@ export function renderWorkflowLines(
   const segment = fmtTokenSegment(tokenFigures(usage), fmtFull);
   const tokenInfo = `${segment ? ` · ${segment}` : ""}${costInfo}`;
   const lines = [
-    `${theme.bold(`◆ Workflow: ${snapshot.name}`)} (${snapshot.doneCount}/${snapshot.agentCount} done${state}${tokenInfo})`,
+    `${theme.bold(`◆ Workflow: ${terminalText(snapshot.name)}`)} (${snapshot.doneCount}/${snapshot.agentCount} done${state}${tokenInfo})`,
   ];
 
   const phaseNames = snapshot.phases.length
@@ -292,7 +304,7 @@ export function renderWorkflowLines(
     const complete = agents.length > 0 && done + errors + skipped === agents.length;
     const marker = running > 0 || (!complete && snapshot.currentPhase === phase) ? "▶" : complete ? "✓" : " ";
     lines.push(
-      theme.fg("accent", `  ${marker} ${phase}`) +
+      theme.fg("accent", `  ${marker} ${terminalText(phase)}`) +
         theme.fg(
           "dim",
           ` ${done}/${agents.length}${running ? ` · ${running} running` : ""}${errors ? ` · ${errors} errors` : ""}${skipped ? ` · ${skipped} skipped` : ""}`,
@@ -302,7 +314,7 @@ export function renderWorkflowLines(
     const visibleAgents = agents.slice(-maxAgents);
     for (const agent of visibleAgents) {
       const order = `[${agent.id}]`;
-      const result = showResultPreviews && agent.resultPreview ? ` — ${agent.resultPreview}` : "";
+      const result = showResultPreviews && agent.resultPreview ? ` — ${shorten(agent.resultPreview, 80)}` : "";
       lines.push(
         `    ${order} ${statusIcon(agent.status)} ${shorten(agent.label, 48)}${agentTokenCell(agent, theme)}${result}`,
       );
@@ -315,7 +327,7 @@ export function renderWorkflowLines(
   if (unphased.length) {
     lines.push(theme.fg("accent", "  Unphased"));
     for (const agent of unphased.slice(-maxAgents)) {
-      const result = showResultPreviews && agent.resultPreview ? ` — ${agent.resultPreview}` : "";
+      const result = showResultPreviews && agent.resultPreview ? ` — ${shorten(agent.resultPreview, 80)}` : "";
       lines.push(
         `    [${agent.id}] ${statusIcon(agent.status)} ${shorten(agent.label, 48)}${agentTokenCell(agent, theme)}${result}`,
       );
@@ -327,14 +339,15 @@ export function renderWorkflowLines(
 
 export function renderWorkflowText(snapshot: WorkflowSnapshot, completed = false): string {
   const header = completed ? "Workflow completed" : "Workflow running";
-  return [header, ...renderWorkflowLines(snapshot)].join("\n");
+  return modelText([header, ...renderWorkflowLines(snapshot)].join("\n"));
 }
 
 function statusLine(snapshot: WorkflowSnapshot, completed: boolean): string {
-  if (completed) return `workflow ✓ ${snapshot.name}: ${snapshot.doneCount}/${snapshot.agentCount}`;
+  const name = terminalText(snapshot.name);
+  if (completed) return `workflow ✓ ${name}: ${snapshot.doneCount}/${snapshot.agentCount}`;
   if (snapshot.runningCount > 0)
-    return `workflow ${snapshot.name}: ${snapshot.runningCount} running, ${snapshot.doneCount}/${snapshot.agentCount} done`;
-  return `workflow ${snapshot.name}: ${snapshot.doneCount}/${snapshot.agentCount} done`;
+    return `workflow ${name}: ${snapshot.runningCount} running, ${snapshot.doneCount}/${snapshot.agentCount} done`;
+  return `workflow ${name}: ${snapshot.doneCount}/${snapshot.agentCount} done`;
 }
 
 export function statusIcon(status: WorkflowAgentStatus): string {
@@ -357,13 +370,13 @@ function unique(values: string[]): string[] {
 }
 
 export function shorten(value: string, max: number): string {
-  const text = value.replace(/\s+/g, " ").trim();
+  const text = terminalText(value).replace(/\s+/g, " ").trim();
   return text.length > max ? `${text.slice(0, max - 1)}…` : text;
 }
 
 export function preview(value: unknown, max = 80): string {
   if (value === null || value === undefined) return "";
-  const text = typeof value === "string" ? value : safeStringify(value);
+  const text = terminalText(typeof value === "string" ? value : safeStringify(value));
   if (!text) return "";
   return truncateUtf8(text, max, "…");
 }

@@ -9,16 +9,16 @@ Measurements use UTF-8 bytes. `docs/workflow-context-surfaces.json` is generated
 | Surface | Current bytes | Activation |
 | --- | ---: | --- |
 | Stable workflow prompt | 0 | Every turn |
-| Stable workflow tool definitions | 1,319 | Every turn |
+| Stable workflow tool definitions | 1,529 | Every turn |
 | Explicit-request rewrite | 23 | Explicit workflow request |
 | Forced command rewrite | 61 | `/workflows run` |
-| Stable workflow-owned context | 1,319 | Stable prompt plus tool definitions |
-| Explicit workflow request context | 1,342 | Stable context plus explicit-request rewrite |
-| Ordinary workflow-family definitions | 1,319 | Stable start, active-list, and exact-ID stop tools |
+| Stable workflow-owned context | 1,529 | Stable prompt plus tool definitions |
+| Explicit workflow request context | 1,552 | Stable context plus explicit-request rewrite |
+| Ordinary workflow-family definitions | 1,529 | Stable start, active-list, and exact-ID stop tools |
 | Registered skill discovery | 453 | Ordinary Pi skill discovery |
-| Ordinary workflow-owned total | 1,772 | Stable tools plus skill discovery |
+| Ordinary workflow-owned total | 1,982 | Stable tools plus skill discovery |
 
-The authoring skill records 76,706 bytes across 28 on-demand files. Six representative authoring profiles have a median of 14,360.5 bytes. Deterministic tests cap the stable prompt contribution at 160 B and all provider-visible workflow definitions at 1,800 B. Skill discovery and representative on-demand profiles are measured separately so changes remain visible without mixing them into the tool-schema budget.
+The authoring skill records 76,722 bytes across 28 on-demand files. Six representative authoring profiles have a median of 14,360.5 bytes. Deterministic tests cap the stable prompt contribution at 160 B and all provider-visible workflow definitions at 1,800 B. Skill discovery and representative on-demand profiles are measured separately so changes remain visible without mixing them into the tool-schema budget.
 
 ## Post-tuning comprehension validation
 

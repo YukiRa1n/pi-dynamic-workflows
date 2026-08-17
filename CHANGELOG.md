@@ -14,6 +14,12 @@ All notable changes to `@quintinshaw/pi-dynamic-workflows` are documented here.
 - Fixed run deletion ordering so a primary-record unlink failure preserves its backup and live lease; worktree startup reaping now preserves a healthy checkout even when stale-marker cleanup fails.
 - Hardened IPv6 SSRF filtering with binary longest-prefix matching for special-purpose, translated, tunneled, deprecated site-local, and non-global address space.
 - Corrected the executable capability contract and generated authoring reference to describe worktree isolation as fail-closed.
+- Hardened model/provider trust boundaries with bounded output, credential and path redaction, terminal-control sanitization, provider-safe tool-call IDs, and explicit untrusted-content labels for workflow and web results.
+- Added fail-closed validation for workflow inputs, model routing, persisted toolsets, and scheduler limits; replaced workflow managers now detach delivery listeners and release lifecycle resources.
+
+### Verification
+
+- `npm run release:check` passed with 1,361 tests and zero release-gate warnings.
 
 ## [3.5.1-yuki.3] - 2026-08-16
 
