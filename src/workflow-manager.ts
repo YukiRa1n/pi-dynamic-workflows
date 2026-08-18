@@ -1110,6 +1110,29 @@ export class WorkflowManager extends EventEmitter {
     return delivery;
   }
 
+  /** Reserve a replayable usage-limit checkpoint before publishing `paused`.
+   * Unlike a terminal record it remains historical if the run later resumes. */
+  private ensurePausedDelivery(managed: ManagedRun, error: WorkflowError): PersistedDeliveryRecord | undefined {
+    if (!managed.background || managed.status !== "paused") return undefined;
+    const existing = managed.deliveryOutbox.find((item) => item.checkpoint === "paused");
+    if (existing) return existing;
+    const sequence = managed.nextDeliverySequence++;
+    const when = error.resetHint ? ` (${error.resetHint})` : "";
+    const delivery: PersistedDeliveryRecord = {
+      deliveryId: stableDeliveryId(managed.runId, sequence),
+      sequence,
+      kind: "terminal",
+      status: "pending",
+      checkpoint: "paused",
+      content:
+        `⏸ Background workflow ${managed.runId} paused: ${error.message}${when}. ` +
+        `Completed steps are saved — run /workflows resume ${managed.runId} once your usage limit resets.`,
+      createdAt: new Date().toISOString(),
+    };
+    managed.deliveryOutbox.push(delivery);
+    return delivery;
+  }
+
   private persistRunStrict(managed: ManagedRun): void {
     if (!this.isCurrent(managed))
       throw new WorkflowError("Workflow execution is stale", WorkflowErrorCode.PERSISTENCE_ERROR);
@@ -1392,19 +1415,26 @@ export class WorkflowManager extends EventEmitter {
         tools: resolvedTools,
         excludeTools: this.excludeSubagentTools,
         confirm,
-        onDeliver: ({ kind, message }) => {
+        onDeliver: async ({ kind, message }) => {
           if (!this.isCurrent(managed)) return;
           const delivery = this.admitExplicitDelivery(managed, message, kind);
           // Admission is durable before the host is allowed to submit the
           // safe-point steer message. A persistence failure rejects deliver()
           // rather than falsely reporting that it was sent.
-          return this.onDeliver?.(message, {
+          const payload = {
             runId: managed.runId,
             workflowName: managed.snapshot.name,
             alertKind: kind,
             deliveryId: delivery.deliveryId,
             sequence: delivery.sequence,
-          });
+          };
+          // A classified parent delivery is usable workflow output even while
+          // the run itself remains active. Blocking output waits subscribe to
+          // this durable post-admission boundary so they can yield to the
+          // parent model instead of accumulating findings behind a long-lived
+          // sequential tool call.
+          this.safeEmit("delivery", payload);
+          await this.onDeliver?.(message, payload);
         },
         takePendingMessages: () => (this.isCurrent(managed) ? this.takePendingMessages(managed.runId) : []),
         onAgentSession: ({ id, session, send }) => {
@@ -1669,6 +1699,7 @@ export class WorkflowManager extends EventEmitter {
       managed.error = workflowError;
       if (IN_MEMORY_TERMINAL_STATUSES.has(managed.status)) this.dropPendingMessages(managed.runId);
       const failureDelivery = this.ensureTerminalDelivery(managed);
+      const pausedDelivery = usageLimitPaused ? this.ensurePausedDelivery(managed, workflowError) : undefined;
       let terminalPersistenceError: unknown;
       if (managed.status === "failed") {
         try {
@@ -1683,12 +1714,8 @@ export class WorkflowManager extends EventEmitter {
       // Both branches gated via emitLive() (see its doc comment) — a stale
       // execution's "paused"/"error" is equally misleading once superseded.
       if (usageLimitPaused) {
-        this.emitLive(managed, "paused", {
-          runId: managed.runId,
-          reason: "usage_limit",
-          error: workflowError,
-          resetHint: workflowError.resetHint,
-        });
+        // Publish only after the checkpoint and its stable delivery ID are
+        // durably committed below.
       } else if (managed.controller.signal.aborted) {
         // Manual pause()/stop() own their explicit lifecycle events. A host
         // externalSignal abort (Esc/tool cancellation) has neither flag and is
@@ -1729,6 +1756,17 @@ export class WorkflowManager extends EventEmitter {
       } catch (error) {
         finalPersisted = false;
         terminalPersistenceError ??= error;
+      }
+      if (usageLimitPaused && this.isCurrent(managed) && finalPersisted) {
+        this.emitLive(managed, "paused", {
+          runId: managed.runId,
+          reason: "usage_limit",
+          error: workflowError,
+          resetHint: workflowError.resetHint,
+          deliveryId: pausedDelivery?.deliveryId,
+          sequence: pausedDelivery?.sequence,
+          content: pausedDelivery?.content,
+        });
       }
       if (this.isCurrent(managed) && finalPersisted) {
         // Every fully settled generation must release targeted-session

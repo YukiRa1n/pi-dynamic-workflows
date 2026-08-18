@@ -35,6 +35,8 @@ export interface PersistedDeliveryRecord {
   /** Classified reason an explicit delivery is allowed to wake the parent. */
   alertKind?: "blocker" | "critical_finding" | "decision";
   terminal?: boolean;
+  /** Durable non-terminal lifecycle checkpoint. */
+  checkpoint?: "paused";
   generation?: number;
   createdAt: string;
 }
@@ -513,6 +515,7 @@ export function createRunPersistence(
           !new Set(["blocker", "critical_finding", "decision"]).has(delivery.alertKind as string)
         )
           return null;
+        if (delivery.checkpoint !== undefined && delivery.checkpoint !== "paused") return null;
         if (
           delivery.generation !== undefined &&
           (!Number.isSafeInteger(delivery.generation) || delivery.generation < 0)

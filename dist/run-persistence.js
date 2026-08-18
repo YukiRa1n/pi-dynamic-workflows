@@ -225,6 +225,8 @@ export function createRunPersistence(cwd, fsOverride, options) {
                 if (delivery.alertKind !== undefined &&
                     !new Set(["blocker", "critical_finding", "decision"]).has(delivery.alertKind))
                     return null;
+                if (delivery.checkpoint !== undefined && delivery.checkpoint !== "paused")
+                    return null;
                 if (delivery.generation !== undefined &&
                     (!Number.isSafeInteger(delivery.generation) || delivery.generation < 0))
                     return null;

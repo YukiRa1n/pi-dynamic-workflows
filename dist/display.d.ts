@@ -128,7 +128,7 @@ export interface ThemeLike {
     bold(text: string): string;
 }
 export declare function renderWorkflowLines(snapshot: WorkflowSnapshot, options?: WorkflowDisplayOptions, theme?: ThemeLike): string[];
-export declare function renderWorkflowText(snapshot: WorkflowSnapshot, completed?: boolean): string;
+export declare function renderWorkflowText(snapshot: WorkflowSnapshot, completed?: boolean, status?: string): string;
 export declare function statusIcon(status: WorkflowAgentStatus): string;
 export declare function shorten(value: string, max: number): string;
 export declare function preview(value: unknown, max?: number): string;

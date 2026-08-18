@@ -53,13 +53,14 @@ function summarizeRun(run: PersistedRunState): string {
   return modelText(`${icon} ${run.runId}  ${workflowName} [${run.status}] ${done}/${total} agents${tokens}`);
 }
 
-function oneLineProgress(snapshot: WorkflowSnapshot): string {
+function oneLineProgress(snapshot: WorkflowSnapshot, status?: string): string {
   const total = snapshot.agents.length;
   const done = snapshot.agents.filter((a) => a.status === "done").length;
   const running = snapshot.agents.filter((a) => a.status === "running").length;
   const errs = snapshot.agents.filter((a) => a.status === "error").length;
   const phase = snapshot.currentPhase ? ` · ${terminalText(snapshot.currentPhase)}` : "";
-  return `◆ ${terminalText(snapshot.name)}: ${done}/${total} done${running ? `, ${running} running` : ""}${
+  const marker = status === "paused" ? "⏸" : "◆";
+  return `${marker} ${terminalText(snapshot.name)}: ${done}/${total} done${running ? `, ${running} running` : ""}${
     errs ? `, ${errs} err` : ""
   }${phase}`;
 }
@@ -78,19 +79,22 @@ function watchRun(
   onDispose?: () => void,
 ): (() => void) | false {
   const active = manager.getRun(id);
-  if (active?.status !== "running") return false;
+  if (active?.status !== "running" && active?.status !== "paused") return false;
 
   const key = `wf:${id}`;
   const update = () => {
     const run = manager.getRun(id);
-    if (run) ctx.ui.setStatus(key, oneLineProgress(run.snapshot));
+    if (run) ctx.ui.setStatus(key, oneLineProgress(run.snapshot, run.status));
   };
   const onEvent = (e: { runId?: string }) => {
     if (!e || e.runId === id) update();
   };
   let settled = false;
-  const progressEvents = ["agentStart", "agentEnd", "phase", "log"];
-  const finalEvents = ["complete", "error", "stopped", "paused", "deleted"];
+  // Pausing is a resumable checkpoint, not a terminal watcher state. Keep the
+  // subscription alive through pause -> resume so a later completion is still
+  // delivered exactly once.
+  const progressEvents = ["agentStart", "agentEnd", "phase", "log", "paused", "resumed"];
+  const finalEvents = ["complete", "error", "stopped", "deleted"];
   const dispose = () => {
     if (settled) return;
     settled = true;
@@ -106,11 +110,18 @@ function watchRun(
     dispose();
     if (run) {
       try {
-        const sent = pi.sendMessage({
-          customType: "workflows",
-          content: renderWorkflowText(recomputeWorkflowSnapshot(run.snapshot), true),
-          display: true,
-        });
+        const sent = pi.sendMessage(
+          {
+            customType: "workflows",
+            content: renderWorkflowText(
+              recomputeWorkflowSnapshot(run.snapshot),
+              run.status === "completed",
+              run.status,
+            ),
+            display: true,
+          },
+          { triggerTurn: false },
+        );
         void Promise.resolve(sent).catch((err: unknown) => {
           console.warn(
             `[workflows] async completion update failed: ${terminalText(err instanceof Error ? err.message : String(err))}`,
@@ -193,7 +204,8 @@ export function registerWorkflowCommands(
       const parts = args.trim().split(/\s+/).filter(Boolean);
       const sub = (parts[0] ?? "list").toLowerCase();
       const id = parts[1];
-      const print = (text: string) => pi.sendMessage({ customType: "workflows", content: text, display: true });
+      const print = (text: string) =>
+        pi.sendMessage({ customType: "workflows", content: text, display: true }, { triggerTurn: false });
 
       switch (sub) {
         case "run": {

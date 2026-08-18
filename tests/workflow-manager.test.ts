@@ -1463,8 +1463,23 @@ test(
         },
       },
     });
-    const pausedEvents: Array<{ runId: string; reason?: string; resetHint?: string }> = [];
-    manager.on("paused", (e: { runId: string; reason?: string; resetHint?: string }) => pausedEvents.push(e));
+    type PausedEvent = {
+      runId: string;
+      reason?: string;
+      resetHint?: string;
+      deliveryId?: string;
+      sequence?: number;
+      content?: string;
+    };
+    const pausedEvents: PausedEvent[] = [];
+    const pendingAtPausedEvent: Array<ReturnType<WorkflowManager["listPendingDeliveries"]>> = [];
+    manager.on("paused", (e: PausedEvent) => {
+      pausedEvents.push(e);
+      // listPendingDeliveries() reads the durable outbox. Capturing it from the
+      // synchronous event listener proves the checkpoint was persisted before
+      // the paused lifecycle event became visible to consumers.
+      pendingAtPausedEvent.push(manager.listPendingDeliveries());
+    });
 
     const twoAgentScript = `export const meta = { name: 'quota_demo', description: 'two agents' }
 const a = await agent('first', { label: 'first' })
@@ -1486,6 +1501,15 @@ return { a, b }`;
     assert.equal(pausedEvents.length, 1);
     assert.equal(pausedEvents[0].reason, "usage_limit");
     assert.equal(pausedEvents[0].resetHint, "Resets in ~3h");
+    assert.equal(pendingAtPausedEvent.length, 1);
+    const pausedDelivery = pendingAtPausedEvent[0].find(
+      (delivery) => delivery.runId === runId && delivery.checkpoint === "paused",
+    );
+    assert.ok(pausedDelivery, "paused event is published after its durable outbox record exists");
+    assert.equal(pausedDelivery?.status, "pending");
+    assert.equal(pausedEvents[0].deliveryId, pausedDelivery?.deliveryId);
+    assert.equal(pausedEvents[0].sequence, pausedDelivery?.sequence);
+    assert.equal(pausedEvents[0].content, pausedDelivery?.content);
 
     // After the budget refills, resume replays agent 1 and runs agent 2 live to completion.
     limitActive = false;

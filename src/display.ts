@@ -1,4 +1,5 @@
 import type { ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
+import { truncateToWidth } from "@earendil-works/pi-tui";
 import type { AgentUsage } from "./agent.js";
 import type { AgentHistoryEntry } from "./agent-history.js";
 import type { WorkflowErrorCode } from "./errors.js";
@@ -179,7 +180,11 @@ export function createWidgetWorkflowDisplay(
 
   // Store the factory so update()/complete() can re-register it to trigger re-render.
   const widgetFactory = (_tui: unknown, theme: Theme) => ({
-    render: () => (snapshot ? renderWorkflowLines(snapshot, options, theme) : []),
+    render: (width: number) => {
+      if (!snapshot) return [];
+      const safeWidth = Number.isFinite(width) ? Math.max(0, Math.floor(width)) : 0;
+      return renderWorkflowLines(snapshot, options, theme).map((line) => truncateToWidth(line, safeWidth));
+    },
     invalidate: () => {},
   });
 
@@ -337,8 +342,16 @@ export function renderWorkflowLines(
   return lines;
 }
 
-export function renderWorkflowText(snapshot: WorkflowSnapshot, completed = false): string {
-  const header = completed ? "Workflow completed" : "Workflow running";
+export function renderWorkflowText(snapshot: WorkflowSnapshot, completed = false, status?: string): string {
+  // Keep the historical boolean API for callers that only know running vs
+  // completed, while allowing status watchers to preserve failed/stopped/
+  // paused state instead of relabelling every terminal event as completed.
+  const normalizedStatus = typeof status === "string" ? status.trim() : "";
+  const header = normalizedStatus
+    ? `Workflow ${normalizedStatus}`
+    : completed
+      ? "Workflow completed"
+      : "Workflow running";
   return modelText([header, ...renderWorkflowLines(snapshot)].join("\n"));
 }
 
@@ -371,7 +384,8 @@ function unique(values: string[]): string[] {
 
 export function shorten(value: string, max: number): string {
   const text = terminalText(value).replace(/\s+/g, " ").trim();
-  return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+  const safeMax = Number.isFinite(max) ? Math.max(0, Math.floor(max)) : 0;
+  return truncateToWidth(text, safeMax, "…");
 }
 
 export function preview(value: unknown, max = 80): string {

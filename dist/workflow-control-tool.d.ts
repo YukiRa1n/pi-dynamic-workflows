@@ -73,6 +73,7 @@ export interface GetWorkflowOutputResultDetails extends Record<string, unknown> 
     blocked: boolean;
     timedOut?: boolean;
     interrupted?: boolean;
+    delivered?: boolean;
     resultPath?: string;
     error?: string;
     errorCode?: string;

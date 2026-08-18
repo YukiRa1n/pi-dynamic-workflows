@@ -25,9 +25,12 @@ const RUN_EVENTS = [
     "stopped",
     "paused",
     "resumed",
+    "deleted",
 ];
 /** Events after which a run is gone and its token-rate samples can be dropped. */
-const RUN_END_EVENTS = ["complete", "error", "stopped", "paused", "deleted"];
+// Pausing is a temporary state. Keep its token-rate samples so a resumed run
+// can continue the same rolling window instead of looking like a new run.
+const RUN_END_EVENTS = ["complete", "error", "stopped", "deleted"];
 const MAX_TOKEN_SAMPLES_PER_RUN = 128;
 const MAX_TOKEN_SAMPLE_RUNS = 1024;
 /** Standalone retry projections are only a cache. Durable terminal deliveries
@@ -432,7 +435,7 @@ export function installResultDelivery(pi, manager, opts = {}) {
     // user it is resumable once their budget refills, rather than letting it look dead.
     // Manual pause() also emits "paused" but with no reason — guard so only the
     // usage-limit case delivers a message.
-    const onPaused = ({ runId, reason, error, resetHint, }) => {
+    const onPaused = ({ runId, reason, error, resetHint, deliveryId, sequence, content, }) => {
         if (reason !== "usage_limit")
             return;
         if (!manager.getRun(runId)?.background)
@@ -440,14 +443,16 @@ export function installResultDelivery(pi, manager, opts = {}) {
         const when = resetHint ? ` (${resetHint})` : "";
         const cause = error?.message ?? "provider usage limit reached";
         deliver({
-            content: `⏸ Background workflow ${runId} paused: ${cause}${when}. ` +
-                `Completed steps are saved — run /workflows resume ${runId} once your usage limit resets.`,
+            content: content ??
+                `⏸ Background workflow ${runId} paused: ${cause}${when}. ` +
+                    `Completed steps are saved — run /workflows resume ${runId} once your usage limit resets.`,
             details: {
                 status: "paused",
                 isError: true,
                 notificationKind: "workflow-result",
                 runId,
-                sequence: notificationSequence++,
+                sequence: sequence ?? notificationSequence++,
+                deliveryId,
             },
         });
     };
@@ -486,7 +491,7 @@ export function renderPanel(manager, theme, width) {
     const hint = theme.fg("dim", finished > 0
         ? `  /workflows — open navigator (${finished} finished kept in history)`
         : "  /workflows — open navigator");
-    return [theme.bold(`Workflows running (${active.length}):`), ...rows, hint].map((line) => fitLine(line, width));
+    return [theme.bold(`Workflows active (${active.length}):`), ...rows, hint].map((line) => fitLine(line, width));
 }
 // ─── Detailed mode: live token rate ────────────────────────────────────────────
 /** Rolling window for the token/s rate. Older samples age out so a stall decays to 0. */
@@ -608,7 +613,7 @@ export function renderPanelDetailed(manager, theme, width, maxAgents, now) {
     if (!active.length)
         return [];
     const dim = (t) => theme.fg("dim", t);
-    const out = [theme.bold(`Workflows running (${active.length}):`)];
+    const out = [theme.bold(`Workflows active (${active.length}):`)];
     for (const r of active) {
         const live = manager.getRun(r.runId);
         const snap = live?.snapshot;

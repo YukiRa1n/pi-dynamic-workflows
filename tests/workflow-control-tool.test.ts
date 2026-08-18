@@ -216,6 +216,7 @@ test("get_workflow_output waits on lifecycle events once and removes every liste
   for (const eventName of ["complete", "error", "stopped", "paused", "deleted"]) {
     assert.equal(manager.listenerCount(eventName), 1);
   }
+  assert.equal(manager.listenerCount("delivery"), 1);
   manager.emit("complete", { runId: "other-run" });
   manager.state = { ...manager.state, status: "completed", result: "verified output" };
   manager.emit("complete", { runId: "audit-abc123" });
@@ -226,6 +227,36 @@ test("get_workflow_output waits on lifecycle events once and removes every liste
   for (const eventName of ["complete", "error", "stopped", "paused", "deleted"]) {
     assert.equal(manager.listenerCount(eventName), 0);
   }
+  assert.equal(manager.listenerCount("delivery"), 0);
+});
+
+test("get_workflow_output yields as soon as durable parent-visible output arrives", async () => {
+  const manager = outputManager({ ...run("running"), sessionId: "session-a" });
+  const pending = executeOutput(manager, { runId: "audit-abc123", block: true, timeoutMs: 500 });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  manager.emit("delivery", { runId: "other-run", deliveryId: "wf_other" });
+  manager.emit("delivery", { runId: "audit-abc123", deliveryId: "wf_finding_1" });
+
+  const response = await pending;
+  assert.equal(response.details.completed, false);
+  assert.equal(response.details.status, "running");
+  assert.equal(response.details.delivered, true);
+  assert.match(response.content[0].text, /Process the delivered workflow messages now/);
+  assert.match(response.content[0].text, /terminal result will arrive automatically/);
+  assert.equal(manager.eventNames().length, 0, "delivery wake removes terminal, delivery, timer, and abort listeners");
+});
+
+test("get_workflow_output closes the delivery subscribe/read race through the durable outbox", async () => {
+  const manager = outputManager({ ...run("running"), sessionId: "session-a" });
+  (manager as any).listPendingDeliveries = () => [
+    { runId: "audit-abc123", deliveryId: "wf_already_admitted", kind: "explicit", status: "submitted" },
+  ];
+
+  const response = await executeOutput(manager, { runId: "audit-abc123", block: true, timeoutMs: 500 });
+  assert.equal(response.details.delivered, true);
+  assert.equal(response.details.completed, false);
+  assert.equal(manager.eventNames().length, 0);
 });
 
 test("get_workflow_output closes the subscribe/read race without polling", async () => {
@@ -500,6 +531,27 @@ test("workflow_control renders cancellation tails as settling requests, not acti
   const output = renderedText(component as never);
   assert.match(output, /pausing 1 request/);
   assert.doesNotMatch(output, /1 active/);
+});
+
+test("get_workflow_output renders a yielded delivery as finished output, not ongoing work", () => {
+  const fixture = fakeManager([run()]);
+  const tool = createGetWorkflowOutputTool({ manager: fixture.manager, getSessionId: () => "session-1" });
+  const component = tool.renderResult?.(
+    {
+      content: [],
+      details: {
+        runId: "audit-abc123",
+        status: "running",
+        completed: false,
+        blocked: true,
+        delivered: true,
+      },
+    } as never,
+    { isPartial: false, expanded: false } as never,
+    renderTheme as never,
+  );
+  assert.ok(component);
+  assert.equal(renderedText(component as never), "Output delivered audit-abc123");
 });
 
 test("pause, resume, and stop call the shared manager lifecycle methods", async () => {

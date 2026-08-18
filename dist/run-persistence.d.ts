@@ -22,6 +22,8 @@ export interface PersistedDeliveryRecord {
     /** Classified reason an explicit delivery is allowed to wake the parent. */
     alertKind?: "blocker" | "critical_finding" | "decision";
     terminal?: boolean;
+    /** Durable non-terminal lifecycle checkpoint. */
+    checkpoint?: "paused";
     generation?: number;
     createdAt: string;
 }

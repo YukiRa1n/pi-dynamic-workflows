@@ -24,7 +24,7 @@ The extension uses the stock Pi extension API and keeps compact start, active-li
 ## Requirements
 
 - Node.js 20 or newer is recommended.
-- [`@earendil-works/pi-coding-agent`](https://www.npmjs.com/package/@earendil-works/pi-coding-agent) version `0.80.8` or newer.
+- [`@earendil-works/pi-coding-agent`](https://www.npmjs.com/package/@earendil-works/pi-coding-agent) version `0.84.2` or newer.
 - The extension uses Pi's public extension API; no Pi core patch or fork is required.
 - At least one authenticated model/provider configured in Pi.
 - Git is optional, but required when a workflow requests `isolation: "worktree"`.

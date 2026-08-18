@@ -474,6 +474,9 @@ export declare class WorkflowManager extends EventEmitter {
     /** Reserve one terminal record before publishing terminal state. It is
      * idempotent, so duplicate lifecycle events cannot create duplicate wakes. */
     private ensureTerminalDelivery;
+    /** Reserve a replayable usage-limit checkpoint before publishing `paused`.
+     * Unlike a terminal record it remains historical if the run later resumes. */
+    private ensurePausedDelivery;
     private persistRunStrict;
     /** Durable outbox records awaiting provider inclusion or acknowledgement.
      * This reads disk so reloads and evicted terminal runs are replayable. */

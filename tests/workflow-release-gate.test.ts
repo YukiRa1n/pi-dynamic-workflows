@@ -37,6 +37,14 @@ test("normal tests and publishing share the model-free release gate", () => {
   assert.doesNotMatch(packageJson.scripts["release:check"], /model|provider|comprehension/i);
 });
 
+test("published host requirement protects the Pi lifecycle contract", () => {
+  assert.equal(packageJson.peerDependencies["@earendil-works/pi-coding-agent"], ">=0.84.2");
+  assert.match(
+    readFileSync(new URL("../README.md", import.meta.url), "utf8"),
+    /pi-coding-agent\) version `0\.84\.2` or newer/,
+  );
+});
+
 test("release gate accepts the aligned contract, package, documentation, and measurements", () => {
   const diagnostics = checkWorkflowRelease({ root: ROOT, publishableFiles: publishableFiles() });
 

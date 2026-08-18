@@ -79,9 +79,11 @@ function testSettingsOptions(keywordTriggerEnabled = true, keywordTriggerWord?: 
 function emitSessionStart(
   handlers: Record<string, Array<(...args: any[]) => any>>,
   event: unknown,
-  context: unknown,
+  context: Record<string, unknown>,
 ): void {
-  for (const handler of handlers.session_start ?? []) handler(event, context);
+  for (const handler of handlers.session_start ?? []) {
+    handler(event, { isIdle: () => true, ...context });
+  }
 }
 
 // ---------------------------------------------------------------------------

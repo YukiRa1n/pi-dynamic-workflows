@@ -27,7 +27,8 @@
     "test:unit": "tsx --test tests/**/*.test.ts",
     "release:check": "npm run build && npm run docs:check && npm run context:check && npm run test:unit && npm run release:verify",
     "release:verify": "tsx scripts/check-workflow-release.ts",
-    "check": "biome check . && npm run check:scripts",
+    "check": "biome check . && npm run check:scripts && npm run check:extensions",
+    "check:extensions": "tsc -p tsconfig.extensions.json",
     "check:scripts": "tsc -p tsconfig.scripts.json",
     "format": "biome format --write .",
     "lint": "biome lint .",
@@ -89,7 +90,7 @@
     "acorn": "^8.16.0"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": ">=0.80.8",
+    "@earendil-works/pi-coding-agent": ">=0.84.2",
     "@earendil-works/pi-tui": ">=0.80.6",
     "typebox": "*"
   },

@@ -41,7 +41,10 @@ function harness(
       sendMessageImpl ??
       (async (m, options) => {
         sent.push({ ...m, options });
-        if (!options && typeof m.content === "string") printed.push(m.content);
+        // UI-only workflow updates explicitly disable turn triggering. Keep
+        // capturing them as printed output so tests do not confuse delivery
+        // options with whether the message is visible.
+        if (m.customType === "workflows" && typeof m.content === "string") printed.push(m.content);
       }),
     getActiveTools: () => [...activeTools],
     setActiveTools: (toolNames: string[]) => {
@@ -105,6 +108,7 @@ test("/workflows list shows empty hint when no runs", async () => {
   const h = harness();
   await h.run("list");
   assert.match(h.printed[0], /No workflow runs yet/);
+  assert.equal(h.sent[0]?.options?.triggerTurn, false, "UI-only output must never trigger a turn");
 });
 
 test("/workflows (no args) defaults to list", async () => {
@@ -114,6 +118,7 @@ test("/workflows (no args) defaults to list", async () => {
   await h.run("");
   assert.match(h.printed[0], /Workflow runs:/);
   assert.match(h.printed[0], /run-1/);
+  assert.equal(h.sent[0]?.options?.triggerTurn, false, "list output must not enter the steering queue");
 });
 
 test("/workflows run without prompt warns usage", async () => {
@@ -284,6 +289,110 @@ test("/workflows status watches a running run: live status bar + prints on compl
   manager.emit("complete", { runId: "run-1" });
   assert.equal(printed.length, 1, "prints final snapshot on completion");
   assert.ok(statusLine.includes(undefined), "clears the status line");
+});
+
+test("/workflows watch preserves failed and stopped terminal states", async () => {
+  const cases = [
+    { event: "error", status: "failed", header: "Workflow failed" },
+    // stop() persists an aborted run and emits the public `stopped` event.
+    { event: "stopped", status: "aborted", header: "Workflow aborted" },
+  ] as const;
+
+  for (const [index, expected] of cases.entries()) {
+    const runId = `run-terminal-${index}`;
+    const snapshot = {
+      name: "demo",
+      phases: [],
+      logs: [],
+      agents: [{ id: 1, label: "a", status: "running", prompt: "x" }],
+      agentCount: 1,
+      runningCount: 1,
+      doneCount: 0,
+      errorCount: 0,
+    };
+    const manager: any = new EventEmitter();
+    let status = "running";
+    manager.getRun = (id: string) => (id === runId ? { runId, status, snapshot } : undefined);
+    manager.getSnapshot = () => null;
+    manager.listRuns = () => [];
+
+    const statusLine: Array<string | undefined> = [];
+    const printed: string[] = [];
+    let handler: ((a: string, c: any) => Promise<void>) | undefined;
+    const pi: any = {
+      getCommands: () => [],
+      registerCommand: (_n: string, options: any) => {
+        handler = options.handler;
+      },
+      sendMessage: async (message: any) => printed.push(message.content),
+    };
+    registerWorkflowCommands(pi as unknown as ExtensionAPI, manager as unknown as WorkflowManager);
+    const ctx = { ui: { notify: () => {}, setStatus: (_k: string, text?: string) => statusLine.push(text) } };
+
+    assert.ok(handler);
+    await handler(`watch ${runId}`, ctx);
+    status = expected.status;
+    manager.emit(expected.event, { runId });
+
+    assert.equal(printed.length, 1, `${expected.event} should print one final update`);
+    assert.match(printed[0], new RegExp(expected.header));
+    assert.doesNotMatch(printed[0], /Workflow completed/);
+    assert.ok(statusLine.includes(undefined), "terminal event clears the live status bar");
+  }
+});
+
+test("/workflows watch keeps a paused run open through resume and complete", async () => {
+  const runId = "run-pause-resume";
+  const snapshot = {
+    name: "demo",
+    phases: [],
+    logs: [],
+    agents: [{ id: 1, label: "a", status: "running", prompt: "x" }],
+    agentCount: 1,
+    runningCount: 1,
+    doneCount: 0,
+    errorCount: 0,
+  };
+  const manager: any = new EventEmitter();
+  let status: "running" | "paused" | "completed" = "paused";
+  manager.getRun = (id: string) => (id === runId ? { runId, status, snapshot } : undefined);
+  manager.getSnapshot = () => null;
+  manager.listRuns = () => [];
+
+  const statusLine: Array<string | undefined> = [];
+  const sent: Array<{ content: string; options?: { triggerTurn?: boolean } }> = [];
+  let handler: ((a: string, c: any) => Promise<void>) | undefined;
+  const pi: any = {
+    getCommands: () => [],
+    registerCommand: (_n: string, options: any) => {
+      handler = options.handler;
+    },
+    sendMessage: async (message: any, options: any) => sent.push({ content: message.content, options }),
+  };
+  registerWorkflowCommands(pi as unknown as ExtensionAPI, manager as unknown as WorkflowManager);
+  const ctx = { ui: { notify: () => {}, setStatus: (_k: string, text?: string) => statusLine.push(text) } };
+
+  assert.ok(handler);
+  await handler(`watch ${runId}`, ctx);
+  assert.ok(
+    statusLine.some((text) => typeof text === "string"),
+    "paused runs can be watched immediately",
+  );
+
+  status = "running";
+  manager.emit("resumed", { runId });
+  assert.equal(sent.length, 0, "resume is progress, not a final delivery");
+
+  status = "completed";
+  snapshot.agents[0].status = "done";
+  snapshot.runningCount = 0;
+  snapshot.doneCount = 1;
+  manager.emit("complete", { runId });
+
+  assert.equal(sent.length, 1, "completion prints exactly one final update");
+  assert.equal(sent[0].options?.triggerTurn, false, "final UI update must not trigger a turn");
+  assert.match(sent[0].content, /Workflow completed/);
+  assert.ok(statusLine.includes(undefined), "completion clears the live status bar");
 });
 
 test("/workflows status watcher sanitizes dynamic progress and completion text", async () => {

@@ -754,6 +754,32 @@ describe("installTaskPanel", () => {
       assert.ok(visibleWidth(line) <= 24, `line exceeds width: ${visibleWidth(line)} > 24`);
     }
   });
+
+  it("requests an immediate redraw when a run is deleted", () => {
+    const manager = new EventEmitter() as ReturnType<typeof EventEmitter> & {
+      getRun: (...args: unknown[]) => unknown;
+      listRuns: () => unknown[];
+    };
+    manager.getRun = () => undefined;
+    manager.listRuns = () => [];
+    let factory:
+      | ((tui: { requestRender(): void }, theme: unknown) => { render(width: number): string[]; dispose?(): void })
+      | undefined;
+    const ui = {
+      setWidget: (_name: string, registeredFactory: typeof factory) => {
+        factory = registeredFactory;
+      },
+    };
+
+    mod.installTaskPanel(null, manager, ui);
+    let redraws = 0;
+    const component = factory?.({ requestRender: () => redraws++ }, {});
+    const beforeDelete = redraws;
+    manager.emit("deleted", { runId: "gone" });
+
+    assert.equal(redraws, beforeDelete + 1, "deletion must invalidate the widget immediately");
+    component?.dispose?.();
+  });
 });
 
 describe("renderPanel", () => {
@@ -770,6 +796,7 @@ describe("renderPanel", () => {
       getRun: () => undefined,
     };
     const lines = renderPanel(manager as never, theme as never);
+    assert.ok(lines[0].includes("Workflows active (1):"), "compact panel uses active wording");
     assert.ok(
       lines.some((l) => /2 finished kept in history/.test(l)),
       "hint should report the finished-run count",
@@ -1032,6 +1059,7 @@ describe("renderPanelDetailed", () => {
     const lines = renderPanelDetailed(detailedManager(2100) as never, theme as never, undefined, 8, 1000);
     const text = lines.join("\n");
 
+    assert.match(lines[0], /Workflows active \(1\):/);
     assert.ok(/auth_audit/.test(text), "shows the run name");
     assert.ok(/1\/4 agents/.test(text), "shows done/total agents");
     assert.ok(/3\.9K tok/.test(text), "shows aggregate tokens summed from per-agent tokens");
@@ -1089,6 +1117,76 @@ describe("renderPanelDetailed", () => {
     renderPanelDetailed(detailedManager(1000, "paused") as never, theme as never, undefined, 8, 1000);
     const lines = renderPanelDetailed(detailedManager(3000, "paused") as never, theme as never, undefined, 8, 2000);
     assert.ok(!lines.some((l) => /tok\/s/.test(l)), "paused run shows no token rate");
+  });
+
+  it("keeps token-rate samples across pause and resume", async () => {
+    const { clearTokenSamples } = await import("../src/task-panel.js");
+    clearTokenSamples("r1");
+    // Drive the actual widget lifecycle: render two samples, emit the manager's
+    // paused event through installTaskPanel, then render the resumed run. If the
+    // paused handler clears samples, the resumed panel has no tok/s readout.
+    const manager = new EventEmitter() as ReturnType<typeof EventEmitter> & {
+      getRun: (id: string) => unknown;
+      listRuns: () => unknown[];
+    };
+    let status: "running" | "paused" = "running";
+    let blueTokens = 1000;
+    const snapshot = {
+      name: "auth_audit",
+      phases: ["Scan"],
+      currentPhase: "Scan",
+      logs: [],
+      agents: [
+        { id: 1, label: "discover_routes", status: "done", phase: "Scan", tokens: blueTokens },
+        { id: 2, label: "audit_auth", status: "running", phase: "Scan", tokens: 1800 },
+      ],
+      tokenUsage: { total: 0, input: 0, output: 0, cost: 0.02 },
+    };
+    manager.listRuns = () => [
+      { runId: "r1", workflowName: "auth_audit", status, agents: snapshot.agents, tokenUsage: snapshot.tokenUsage },
+    ];
+    manager.getRun = (id: string) => (id === "r1" ? { snapshot, status } : undefined);
+
+    let factory:
+      | ((tui: { requestRender(): void }, theme: unknown) => { render(width: number): string[]; dispose?(): void })
+      | undefined;
+    const ui = {
+      setWidget: (_name: string, registeredFactory: typeof factory) => {
+        factory = registeredFactory;
+      },
+    };
+    const originalNow = Date.now;
+    let now = 1000;
+    Date.now = () => now;
+    let component: { render(width: number): string[]; dispose?(): void } | undefined;
+    try {
+      mod.installTaskPanel(null, manager, ui, { loadSettings: () => ({ progressPanelMode: "detailed" }) } as never);
+      component = factory?.({ requestRender: () => {} }, theme);
+      assert.ok(component, "detailed task panel should be installed");
+
+      component.render(120);
+      blueTokens = 3000;
+      snapshot.agents[0].tokens = blueTokens;
+      now = 2000;
+      component.render(120);
+
+      status = "paused";
+      manager.emit("paused", { runId: "r1" });
+
+      status = "running";
+      blueTokens = 4000;
+      snapshot.agents[0].tokens = blueTokens;
+      now = 3000;
+      const lines = component.render(120);
+      assert.ok(
+        lines.some((line) => /1500 tok\/s/.test(line)),
+        "resumed run should retain pre-pause rate samples",
+      );
+    } finally {
+      component?.dispose?.();
+      Date.now = originalNow;
+      clearTokenSamples("r1");
+    }
   });
 });
 

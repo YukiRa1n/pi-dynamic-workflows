@@ -27,6 +27,8 @@ test("explicit delivery admission is finite while terminal delivery remains rese
   try {
     const m = manager(cwd);
     const delivered: string[] = [];
+    const deliveryEvents: Array<{ runId: string; deliveryId: string; alertKind: string }> = [];
+    m.on("delivery", (event) => deliveryEvents.push(event));
     m.onDeliver = (message) => {
       delivered.push(message);
     };
@@ -39,6 +41,9 @@ return "done"`;
     });
     const state = m.getPersistence().load(run.runId);
     assert.equal(delivered.length, MAX_EXPLICIT_DELIVERIES_PER_WINDOW);
+    assert.equal(deliveryEvents.length, MAX_EXPLICIT_DELIVERIES_PER_WINDOW);
+    assert.ok(deliveryEvents.every((event) => event.runId === run.runId));
+    assert.ok(deliveryEvents.every((event) => event.deliveryId && event.alertKind === "critical_finding"));
     assert.equal(state?.status, "failed");
     assert.equal(
       state?.deliveryOutbox?.filter((item) => item.kind === "explicit").length,

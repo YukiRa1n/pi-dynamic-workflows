@@ -13,6 +13,7 @@
 
 import assert from "node:assert/strict";
 import { describe, it, mock } from "node:test";
+import { stripTerminalSequences, visibleWidth } from "@earendil-works/pi-tui";
 import type { WorkflowMeta } from "../src/workflow.js";
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -295,6 +296,17 @@ describe("renderWorkflowText", () => {
     assert.ok(text.length < 200, "should not include the full 100-char label");
   });
 
+  it("shortens CJK and emoji by visible width without splitting graphemes", async () => {
+    const { shorten } = await loadDisplay();
+    const cjk = shorten("中文世界", 4);
+    const emoji = shorten("😀😀abc", 5);
+    assert.ok(visibleWidth(cjk) <= 4, `CJK result exceeds width: ${visibleWidth(cjk)}`);
+    assert.ok(visibleWidth(emoji) <= 5, `emoji result exceeds width: ${visibleWidth(emoji)}`);
+    assert.equal(stripTerminalSequences(cjk), "中…", "CJK truncation keeps a whole wide grapheme");
+    assert.equal(stripTerminalSequences(emoji), "😀😀…", "emoji truncation keeps whole emoji graphemes");
+    assert.ok(!/[\uD800-\uDFFF]/u.test(cjk + emoji), "must not leave a surrogate half");
+  });
+
   it("shows 'earlier agents' when more agents than maxAgents", async () => {
     const { createWorkflowSnapshot, renderWorkflowLines } = await loadDisplay();
     const snap = createWorkflowSnapshot(fakeMeta("t", "d", ["Phase"]));
@@ -491,6 +503,27 @@ describe("createWidgetWorkflowDisplay lifecycle", () => {
       lines3.some((l) => l.includes("no-status-wf")),
       "post-complete render shows workflow name",
     );
+  });
+
+  it("truncates every widget line to the render width on a narrow CJK/emoji display", async () => {
+    const { createWorkflowSnapshot, createWidgetWorkflowDisplay } = await loadDisplay();
+    const setWidget = mock.fn();
+    const ctx = { hasUI: true, ui: { setWidget, setStatus: mock.fn() } };
+    const display = createWidgetWorkflowDisplay(ctx as never, { showResultPreviews: true });
+    const snap = createWorkflowSnapshot(fakeMeta("中文😀 workflow", "d", ["阶段很长😀"]));
+    snap.agents = [
+      agent(1, "代理😀名称很长很长", "running", "阶段很长😀", { resultPreview: "结果中文😀很长" }),
+    ] as never[];
+    display.update(snap);
+
+    const [, factory] = setWidget.mock.calls.at(-1)?.arguments ?? [];
+    const component = factory(null, { fg: (_c: string, t: string) => t, bold: (t: string) => t });
+    const lines = component.render(10);
+    assert.ok(lines.length > 0);
+    for (const line of lines) {
+      assert.ok(visibleWidth(line) <= 10, `line exceeds render width: ${visibleWidth(line)}`);
+      assert.ok(!/[\uD800-\uDFFF]/u.test(line), "render must not split a surrogate pair");
+    }
   });
 });
 

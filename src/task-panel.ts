@@ -40,9 +40,12 @@ const RUN_EVENTS = [
   "stopped",
   "paused",
   "resumed",
+  "deleted",
 ];
 /** Events after which a run is gone and its token-rate samples can be dropped. */
-const RUN_END_EVENTS = ["complete", "error", "stopped", "paused", "deleted"] as const;
+// Pausing is a temporary state. Keep its token-rate samples so a resumed run
+// can continue the same rolling window instead of looking like a new run.
+const RUN_END_EVENTS = ["complete", "error", "stopped", "deleted"] as const;
 const MAX_TOKEN_SAMPLES_PER_RUN = 128;
 const MAX_TOKEN_SAMPLE_RUNS = 1024;
 
@@ -539,11 +542,17 @@ export function installResultDelivery(
     reason,
     error,
     resetHint,
+    deliveryId,
+    sequence,
+    content,
   }: {
     runId: string;
     reason?: string;
     error?: { message?: string };
     resetHint?: string;
+    deliveryId?: string;
+    sequence?: number;
+    content?: string;
   }) => {
     if (reason !== "usage_limit") return;
     if (!manager.getRun(runId)?.background) return;
@@ -551,14 +560,16 @@ export function installResultDelivery(
     const cause = error?.message ?? "provider usage limit reached";
     deliver({
       content:
+        content ??
         `⏸ Background workflow ${runId} paused: ${cause}${when}. ` +
-        `Completed steps are saved — run /workflows resume ${runId} once your usage limit resets.`,
+          `Completed steps are saved — run /workflows resume ${runId} once your usage limit resets.`,
       details: {
         status: "paused",
         isError: true,
         notificationKind: "workflow-result",
         runId,
-        sequence: notificationSequence++,
+        sequence: sequence ?? notificationSequence++,
+        deliveryId,
       },
     });
   };
@@ -600,7 +611,7 @@ export function renderPanel(manager: WorkflowManager, theme: Theme, width?: numb
       ? `  /workflows — open navigator (${finished} finished kept in history)`
       : "  /workflows — open navigator",
   );
-  return [theme.bold(`Workflows running (${active.length}):`), ...rows, hint].map((line) => fitLine(line, width));
+  return [theme.bold(`Workflows active (${active.length}):`), ...rows, hint].map((line) => fitLine(line, width));
 }
 
 // ─── Detailed mode: live token rate ────────────────────────────────────────────
@@ -728,7 +739,7 @@ export function renderPanelDetailed(
   const active = all.filter((r) => r.status === "running" || r.status === "paused");
   if (!active.length) return [];
   const dim = (t: string) => theme.fg("dim", t);
-  const out: string[] = [theme.bold(`Workflows running (${active.length}):`)];
+  const out: string[] = [theme.bold(`Workflows active (${active.length}):`)];
 
   for (const r of active) {
     const live = manager.getRun(r.runId);
