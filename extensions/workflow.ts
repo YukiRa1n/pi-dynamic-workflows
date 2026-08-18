@@ -1,4 +1,4 @@
-import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, openSync, readSync } from "node:fs";
 import { resolve } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { type ExtensionAPI, type ExtensionContext, getMarkdownTheme } from "@earendil-works/pi-coding-agent";
@@ -397,12 +397,6 @@ type WorkflowBridge = {
    * history/outbox).
    */
   visiblePending: Map<string, WorkflowBridgeVisibleDelivery>;
-  /**
-   * IDs whose content the model has provably consumed (stop + non-empty text,
-   * no tool call). Persisted in an append-only ledger so a reload does not
-   * re-project every historical finding.
-   */
-  contextConsumedIds: Set<string>;
   /** An aborted request may still report a late response. While fenced, no
    * response may acknowledge a newer request in the same generation. */
   providerAckFenceGeneration?: number;
@@ -567,60 +561,6 @@ function rememberDelivery(bridge: WorkflowBridge, id: string): void {
     if (oldest === undefined) break;
     bridge.delivered.delete(oldest);
   }
-}
-
-const WORKFLOW_CONTEXT_CONSUMED_LEDGER = "context-consumed.ndjson";
-const WORKFLOW_CONTEXT_CONSUMED_LIMIT = 4096;
-
-function workflowContextConsumedLedgerPath(bridge: WorkflowBridge): string {
-  return resolve(bridge.manager.getPersistence().getRunsDir(), "..", WORKFLOW_CONTEXT_CONSUMED_LEDGER);
-}
-
-function loadWorkflowContextConsumed(bridge: WorkflowBridge): void {
-  try {
-    const path = workflowContextConsumedLedgerPath(bridge);
-    if (!existsSync(path)) return;
-    const text = readFileSync(path, "utf8");
-    for (const line of text.split("\n")) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      try {
-        const record = JSON.parse(trimmed) as { id?: unknown };
-        if (typeof record.id === "string" && record.id) bridge.contextConsumedIds.add(record.id);
-      } catch {
-        // Skip corrupt lines; a partial ledger must not break projection.
-      }
-    }
-  } catch {
-    // Ledger is best-effort. A missing/corrupt ledger falls back to "project
-    // once more", never to silent loss.
-  }
-}
-
-function persistWorkflowContextConsumed(bridge: WorkflowBridge, id: string): void {
-  bridge.contextConsumedIds.add(id);
-  while (bridge.contextConsumedIds.size > WORKFLOW_CONTEXT_CONSUMED_LIMIT) {
-    const oldest = bridge.contextConsumedIds.values().next().value as string | undefined;
-    if (oldest === undefined) break;
-    bridge.contextConsumedIds.delete(oldest);
-  }
-  try {
-    const path = workflowContextConsumedLedgerPath(bridge);
-    mkdirSync(resolve(path, ".."), { recursive: true });
-    appendFileSync(path, `${JSON.stringify({ id })}\n`, "utf8");
-  } catch {
-    // In-memory pin still prevents re-projection this session; a ledger
-    // failure means one extra projection after reload, which is the
-    // conservative direction.
-  }
-}
-
-function clearWorkflowVisiblePending(bridge: WorkflowBridge, deliveryId?: string): void {
-  if (deliveryId === undefined) {
-    bridge.visiblePending.clear();
-    return;
-  }
-  bridge.visiblePending.delete(deliveryId);
 }
 
 function boundedWorkflowContent(content: string): string {
@@ -1808,7 +1748,6 @@ function bindDeliverBridge(manager: WorkflowManager, pi: ExtensionAPI): void {
       projectedForNextRequest: [],
       includedInProviderRequest: [],
       visiblePending: new Map<string, WorkflowBridgeVisibleDelivery>(),
-      contextConsumedIds: new Set<string>(),
       providerAckFenceGeneration: undefined,
       retryState: {
         attempt: 0,
@@ -1830,7 +1769,6 @@ function bindDeliverBridge(manager: WorkflowManager, pi: ExtensionAPI): void {
   bridge.projectedForNextRequest ??= [];
   bridge.includedInProviderRequest ??= [];
   bridge.visiblePending ??= new Map<string, WorkflowBridgeVisibleDelivery>();
-  bridge.contextConsumedIds ??= new Set<string>();
   bridge.retryState ??= {
     attempt: 0,
     inProgress: false,
@@ -2251,17 +2189,6 @@ function installWorkflowToolResultContextBridge(pi: ExtensionAPI, getManager: ()
     }
     const output: any[] = [];
     const sourceMessages = event.messages as any[];
-    const recoverableHistoryIds = new Set<string>();
-    if (bridge) {
-      for (const id of bridge.awaitingAck.keys()) recoverableHistoryIds.add(id);
-      for (const id of bridge.uncertainAck.keys()) recoverableHistoryIds.add(id);
-      for (const delivery of bridge.pending) recoverableHistoryIds.add(delivery.id);
-      try {
-        for (const record of bridge.manager.listPendingDeliveries()) recoverableHistoryIds.add(record.deliveryId);
-      } catch {
-        // In-memory bridge state still identifies current-generation entries.
-      }
-    }
     const reservedPriorityIndexes = new Set<number>();
     let reservedPriorityBytes = 0;
     let reservedPriorityCount = 0;
@@ -2275,15 +2202,6 @@ function installWorkflowToolResultContextBridge(pi: ExtensionAPI, getManager: ()
         ) as WorkflowDeliveryDetails;
         const deliveryId = typeof details.deliveryId === "string" ? details.deliveryId : undefined;
         if (!deliveryId || !priorityDeliveryIds.has(deliveryId) || reservedIds.has(deliveryId)) continue;
-        if (bridge?.contextConsumedIds.has(deliveryId)) continue;
-        if (
-          bridge &&
-          details.deliverySubmitted === true &&
-          typeof details.runId === "string" &&
-          !recoverableHistoryIds.has(deliveryId) &&
-          !bridge.visiblePending.has(deliveryId)
-        )
-          continue;
         const rawText = customMessageText(message.content) || "(empty workflow delivery)";
         const text = boundedWorkflowContent(providerWorkflowDeliveryText(message.customType, redactForModel(rawText)));
         const bytes = Buffer.byteLength(text, "utf8");
@@ -2394,24 +2312,6 @@ function installWorkflowToolResultContextBridge(pi: ExtensionAPI, getManager: ()
         message.details && typeof message.details === "object" ? message.details : {}
       ) as WorkflowDeliveryDetails;
       const sourceDeliveryId = typeof sourceDetails.deliveryId === "string" ? sourceDetails.deliveryId : undefined;
-      if (sourceDeliveryId && bridge?.contextConsumedIds.has(sourceDeliveryId)) continue;
-      if (
-        sourceDeliveryId &&
-        bridge &&
-        sourceDetails.deliverySubmitted === true &&
-        typeof sourceDetails.runId === "string" &&
-        !recoverableHistoryIds.has(sourceDeliveryId) &&
-        !bridge.visiblePending.has(sourceDeliveryId)
-      ) {
-        // Durable bridge entries without an outbox/in-memory recovery record
-        // AND without a pending context-consumption marker were acknowledged
-        // by an earlier provider response whose content the model has already
-        // consumed. Keep their UI transcript block, but never replay it into
-        // every later request (or after a process restart with the same
-        // session branch).
-        rememberDelivery(bridge, sourceDeliveryId);
-        continue;
-      }
       if (strictRecoveryDeliveryIds && (!sourceDeliveryId || !strictRecoveryDeliveryIds.has(sourceDeliveryId))) {
         // The hidden recovery turn is scoped to the exact canonical IDs that
         // existed at Esc. Older backlog and post-Esc arrivals remain passive
@@ -2733,30 +2633,6 @@ function installWorkflowToolResultContextBridge(pi: ExtensionAPI, getManager: ()
       bridge.visiblePending.set(item.id, { delivery: awaiting, generation: item.generation });
     }
     if (!deferredRetry) flushWorkflowBridge(bridge);
-  });
-  // Context-consumption boundary: a transport 2xx only proves the provider
-  // received the payload, not that the model used it. Consume exactly when a
-  // turn ends with a genuine final answer (stop + non-empty text + no tool
-  // calls). toolUse/error/aborted/length all keep the delivery in
-  // visiblePending so the next context projection still carries its content.
-  pi.on("turn_end", (event) => {
-    const bridge = ownedBridgeFor(getManager(), pi);
-    if (!bridge || bridge.visiblePending.size === 0) return;
-    const message = event?.message as
-      | { role?: unknown; stopReason?: unknown; content?: unknown }
-      | undefined;
-    if (message?.role !== "assistant" || message.stopReason !== "stop") return;
-    const content = Array.isArray(message.content) ? message.content : [];
-    const hasText = content.some(
-      (part) => part?.type === "text" && typeof part.text === "string" && part.text.trim().length > 0,
-    );
-    const hasToolCall = content.some((part) => part?.type === "toolCall");
-    if (!hasText || hasToolCall) return;
-    for (const [id, visible] of [...bridge.visiblePending.entries()]) {
-      if (visible.generation !== bridge.generation) continue;
-      persistWorkflowContextConsumed(bridge, id);
-    }
-    bridge.visiblePending.clear();
   });
 }
 
@@ -3094,7 +2970,6 @@ export default function extension(pi: ExtensionAPI) {
         // authoritative when a host does not expose the active branch.
       }
       bridge.canonicalHistoryIds = historyIds;
-      loadWorkflowContextConsumed(bridge);
       const recoverableHistoryIds = new Set<string>();
       for (const delivery of bridge.pending) recoverableHistoryIds.add(delivery.id);
       for (const id of bridge.awaitingAck.keys()) recoverableHistoryIds.add(id);
