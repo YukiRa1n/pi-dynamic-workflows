@@ -238,6 +238,20 @@ test("an aborted context preflight cannot acknowledge an omitted delivery on the
         "the omitted request must not falsely retire the delivery; it remains replayable",
       );
       for (const handler of handlers.after_provider_response ?? []) handler({ status: 200, headers: {} });
+      // Transport ack alone does not remove the payload; only a final
+      // stop+text turn (no further tool calls) marks the delivery consumed.
+      for (const handler of handlers.turn_end ?? []) {
+        handler({
+          type: "turn_end",
+          turnIndex: 0,
+          message: {
+            role: "assistant",
+            stopReason: "stop",
+            content: [{ type: "text", text: "delivery acknowledged" }],
+          },
+          toolResults: [],
+        });
+      }
 
       const acknowledged = projectMessages(handlers, history);
       assert.equal(

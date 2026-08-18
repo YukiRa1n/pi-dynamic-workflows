@@ -276,6 +276,17 @@ test("Esc recovery scope excludes post-Esc IDs through a second hidden-run provi
     assert.equal(notificationResults(firstHiddenRequest).length, 1);
     assert.doesNotMatch(JSON.stringify(firstHiddenRequest), /arrived after Esc/);
     emit(handlers, "after_provider_response", { status: 200, headers: {} });
+    // Transport ack alone does not consume; only a final stop+text turn does.
+    emit(handlers, "turn_end", {
+      type: "turn_end",
+      turnIndex: 0,
+      message: {
+        role: "assistant",
+        stopReason: "stop",
+        content: [{ type: "text", text: "already visible at Esc acknowledged" }],
+      },
+      toolResults: [],
+    });
 
     // Keep the same hidden agent run alive for another provider request. The
     // recovery scope must still exclude the post-Esc entry at this boundary.

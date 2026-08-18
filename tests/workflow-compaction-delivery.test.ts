@@ -1149,6 +1149,20 @@ test("Esc on a blocking workflow output consumes accumulated custom history exac
       );
 
       for (const handler of handlers.after_provider_response ?? []) handler({ status: 200, headers: {} });
+      // Transport ack alone does not remove the payload; only a final
+      // stop+text turn (no further tool calls) marks the delivery consumed.
+      for (const handler of handlers.turn_end ?? []) {
+        handler({
+          type: "turn_end",
+          turnIndex: 0,
+          message: {
+            role: "assistant",
+            stopReason: "stop",
+            content: [{ type: "text", text: "finding acknowledged" }],
+          },
+          toolResults: [],
+        });
+      }
       const replayed = projectMessages(handlers, [
         { role: "custom", ...sent[0]?.message, timestamp: 6 },
         { role: "custom", ...sent[1]?.message, timestamp: 7 },
@@ -1617,6 +1631,19 @@ test("a large passive workflow burst is byte-paged and never replayed after ackn
       );
       const firstIds = new Set(firstResults.map((message: any) => message.toolCallId));
       for (const handler of handlers.after_provider_response ?? []) handler({ status: 200, headers: {} });
+      // Transport ack only: the page stays eligible until a final text turn.
+      for (const handler of handlers.turn_end ?? []) {
+        handler({
+          type: "turn_end",
+          turnIndex: 0,
+          message: {
+            role: "assistant",
+            stopReason: "stop",
+            content: [{ type: "text", text: "first page consumed" }],
+          },
+          toolResults: [],
+        });
+      }
 
       hostIdle = true;
       for (const handler of handlers.agent_settled ?? []) handler({ type: "agent_settled" });
@@ -1649,6 +1676,18 @@ test("a large passive workflow burst is byte-paged and never replayed after ackn
         "only the real prompt crosses as user role",
       );
       for (const handler of handlers.after_provider_response ?? []) handler({ status: 200, headers: {} });
+      for (const handler of handlers.turn_end ?? []) {
+        handler({
+          type: "turn_end",
+          turnIndex: 1,
+          message: {
+            role: "assistant",
+            stopReason: "stop",
+            content: [{ type: "text", text: "second page consumed" }],
+          },
+          toolResults: [],
+        });
+      }
       const exhausted = projectMessages(handlers, history);
       assert.equal(
         exhausted.some((message: any) => message?.toolName === "workflow_message_notification"),
