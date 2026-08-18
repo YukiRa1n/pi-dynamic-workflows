@@ -17,13 +17,13 @@ After installation, Pi gains:
 - `/workflows-models` — configure `small`, `medium`, and `big` model tiers.
 - `/deep-research`, `/code-review`, `/codebase-audit`, `/adversarial-review`, and `/multi-perspective`.
 - Workflow-scoped Agent Teams with peer messages, inboxes, and a shared task board.
-- One bounded background workflow result is delivered to the main session using Pi's safe-point steering queue; an active provider request is not cancelled. Routine per-subagent finals stay in the run journal/pager instead of consuming parent context.
+- One bounded background workflow result is delivered to the main session as a passive custom-history entry (it never enters Pi's Steering queue, and an active provider request is not cancelled); a single empty UI-only `workflows` marker wakes the model at a verified safe point. Routine per-subagent finals stay in the run journal/pager instead of consuming parent context.
 
 The extension uses the stock Pi extension API and keeps compact start, active-list, output-wait, and exact-ID stop definitions registered. Its provider-visible prefix therefore stays stable for prompt caching; there is no per-turn tool lease or dynamic `setActiveTools` rewrite. The list returns only current-session running/paused handles. `get_workflow_output` waits on lifecycle events once (10 minutes by default); Esc cancels only that wait, not the workflow. Stop requires one exact ID. Other existing-run actions stay under `/workflows`; a new requirement is never routed into an unrelated run.
 
 ## Requirements
 
-- Node.js 20 or newer is recommended.
+- Node.js 22.19.0 or newer is recommended (matching the installed Pi's `engines` requirement).
 - [`@earendil-works/pi-coding-agent`](https://www.npmjs.com/package/@earendil-works/pi-coding-agent) version `0.84.2` or newer.
 - The extension uses Pi's public extension API; no Pi core patch or fork is required.
 - At least one authenticated model/provider configured in Pi.
@@ -210,17 +210,17 @@ skills/workflow-patterns/
 
 ## Runtime behavior
 
-- Workflow tool invocations always start in the background. Terminal results return automatically through the durable safe-point delivery queue. Use the returned run ID with `/workflows status|watch|pause|resume|stop|steer <id>` for explicit inspection and lifecycle actions. A new user requirement starts in the main session or a fresh workflow; it is never sent to an existing unrelated run.
+- Workflow tool invocations always start in the background. Terminal results normally return automatically through the durable safe-point delivery queue; if a blocking `get_workflow_output` already returned the `completed` result, the duplicate automatic terminal notification is suppressed. Use the returned run ID with `/workflows status|watch|pause|resume|stop|steer <id>` for explicit inspection and lifecycle actions. A new user requirement starts in the main session or a fresh workflow; it is never sent to an existing unrelated run.
 - `concurrency` is bounded by the runtime maximum.
 - `maxAgents`, retry counts, per-agent timeouts, and optional token budgets can be set per run. Every workflow also has a finite logical wall-clock deadline (30 minutes by default, configurable up to 24 hours with `workflowTimeoutMs`).
 - A deadline races the complete script frame, closes admission, and aborts cooperative provider attempts. It cannot interrupt a pending Promise or a microtask-starved event loop; late provider settlement is observed and bounded drain cleanup is best effort.
 - Replay identity is run-scoped: provider context such as `cwd`, instructions, tools, and session is hashed once and included in each call key. Nested and retried calls cannot collide on a bare call index. A resumed workflow replays the unchanged completed prefix and runs changed/new calls live.
 - Anthropic-compatible, non-worktree fan-out uses a short cache-warm gate: one compatible request leads, and followers are released when its first assistant response starts. Set `PI_CACHE_RETENTION=none` to disable the gate; `short` is the default and `long` keeps the warm window longer.
 - `isolation: "worktree"` is fail-closed: if a Git worktree cannot be created, that agent does not silently edit the shared checkout.
-- Explicit child-to-parent `deliver({ kind, message })` messages and the single terminal workflow result use the durable safe-point delivery path with `triggerTurn: true`. Explicit messages must be classified as `blocker`, `critical_finding`, or `decision`; progress and routine results stay in logs/finals. Delivery waits for the next safe point and does not abort an already-running provider request.
+- Explicit child-to-parent `deliver({ kind, message })` messages and the single terminal workflow result are written as passive custom-history entries with `triggerTurn: false`; the only `triggerTurn: true` send is the single empty UI-only `workflows` marker fired at a verified safe point. Explicit messages must be classified as `blocker`, `critical_finding`, or `decision`; progress and routine results stay in logs/finals. Delivery does not abort an already-running provider request.
 - Explicit delivery admission is finite per run: at most 32 messages, 256 KiB of UTF-8 payload, and 8 messages per 10-second window. A rejected delivery reports `DELIVERY_BUDGET_EXCEEDED`; terminal lifecycle delivery is reserved and is never downgraded or displaced by an explicit burst.
 - Automatic per-subagent final reports are retained in `/workflows` details and persisted run JSON, but are not injected into the parent model context by default. Execution order is not used to guess that the last agent is the final product.
-- The workflow's explicit return value is the semantic terminal product. Its provider projection prioritizes conventional `report`, `synthesis`, `summary`, or `answer` fields and is bounded to 12,000 characters; omitted content remains in the persisted run.
+- The workflow's explicit return value is the semantic terminal product. Its provider projection prioritizes conventional `report`, `synthesis`, `summary`, or `answer` fields and is bounded to 12,000 UTF-8 bytes by default (configurable via the `deliveredResultMaxChars` setting); omitted content remains in the persisted run.
 - Workflow custom messages are converted to synthetic tool-call/tool-result semantics for normal provider context. Compaction and branch-summary preparation sanitizes workflow custom entries so they do not become user-authored text.
 
 ## Persistence and privacy
@@ -241,7 +241,7 @@ This can include:
 
 Full subagent transcripts are in memory by default. Enabling `persistAgentSessions` stores full child sessions in Pi's session directory and may retain sensitive source or prompt material. Enable it only when that retention is desired. `PI_CACHE_RETENTION=none` is separate: it disables the Anthropic cache-warm gate, not durable workflow journals.
 
-Accepted explicit deliveries and terminal notifications are written to the run's durable at-least-once outbox before safe-point submission. Delivery IDs remain stable across reloads and retries; provider-context projection is acknowledged at `before_provider_request`, while transport confirmation is best effort after the provider response. This provides stable-ID projection deduplication and durable at-least-once delivery, not provider-side or end-to-end exactly-once processing. Outbox records are removed only after the generation-fenced acknowledgement; uncertain sends remain replayable from the persisted run.
+Accepted explicit deliveries and terminal notifications are written to the run's durable at-least-once outbox before safe-point submission. Delivery IDs remain stable across reloads and retries; provider-context projection is acknowledged at `before_provider_request`, while transport confirmation is best effort after the provider response. This provides stable-ID projection deduplication and durable at-least-once delivery, not provider-side or end-to-end exactly-once processing. Outbox records are removed after the generation-fenced acknowledgement on the normal provider-projection path; a terminal record already carried by a `completed` `get_workflow_output` result may be discarded explicitly instead. Uncertain sends remain replayable from the persisted run.
 
 Resource admission is finite by default: each run allows at most 1,000 logical agents and 16 concurrent agents, each `parallel()`/`pipeline()` fan-out is capped at 10,000 items, logs are capped at 10,000 entries/2 MiB, provider prompts at 512 KiB, shared-store state at 2,048 keys/4 MiB, and one durable run record at 16 MiB. Team members/tasks/messages and paused in-memory snapshots also have bounded defaults. These are admission/retention failures, not truncation: complete durable results are either committed as native JSON or publication fails observably. Paused runs evicted from memory remain resumable from disk.
 
@@ -263,18 +263,22 @@ Additional boundaries:
 
 | Command | Purpose |
 | --- | --- |
-| `/workflows` | Open the run navigator. |
+| `/workflows` | Open the run navigator (same as `/workflows ui`). |
+| `/workflows list` | Print a text list of runs. |
 | `/workflows run <prompt>` | Start a workflow explicitly. |
 | `/workflows status <id>` | Inspect one run from the command/UI path. |
 | `/workflows watch <id>` | Watch one run from the command/UI path. |
 | `/workflows pause <id>` | Pause and journal a run. |
 | `/workflows resume <id>` | Resume a paused/failed run. |
 | `/workflows stop <id>` | Stop a run. |
+| `/workflows rm <id>` | Delete a run record. |
 | `/workflows steer <id> [kind] <message>` | Send an explicit same-task update to one exact run. |
 | `/workflows save <name>` | Save the latest workflow as a reusable command. |
 | `/workflows-models` | Configure model tiers. |
-| `/workflows-progress compact\|detailed` | Configure the live panel. |
+| `/workflows-trigger on\|off\|set <word>\|reset\|status` | Configure the keyword that arms workflow intent detection. |
+| `/workflows-progress compact\|detailed\|status` / `/workflows-progress max <1-1000>` | Configure the live panel mode and per-phase agent cap. |
 | `/effort off\|high\|ultra` | Set effort guidance for an explicitly requested workflow; it does not take over ordinary messages. |
+| `/ultracode [off]` | Turn maximal-effort (ultracode) mode on, or off with `off`; alias for `/effort ultra`. |
 
 ## Package layout
 
