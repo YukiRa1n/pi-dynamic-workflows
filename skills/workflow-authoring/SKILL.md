@@ -2,7 +2,7 @@
 name: workflow-authoring
 description: Write, edit, review, or debug Workflow JavaScript; not for running an existing workflow.
 metadata:
-  version: "3.5.1-yuki.3"
+  version: "3.5.1-yuki.4"
 ---
 
 # Workflow authoring

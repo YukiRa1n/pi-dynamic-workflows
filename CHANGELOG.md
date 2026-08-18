@@ -21,6 +21,24 @@ All notable changes to `@quintinshaw/pi-dynamic-workflows` are documented here.
 
 - `npm run release:check` passed with 1,361 tests and zero release-gate warnings.
 
+## [3.5.1-yuki.4] - 2026-08-19
+
+This fork-only patch release hardens background workflow delivery against interactive aborts and provider round-trips. All changes are extension-side in `extensions/workflow.ts`; no host modifications.
+
+### Fixed
+
+- **Esc recovery preserves custom role and payload.** Pressing Esc no longer downgrades queued workflow deliveries to plain `role:"user"` text. An input interceptor matches Esc-restored editor text by content fingerprint and restores the original `custom` message with its `customType`, `details`, and `deliveryId` intact. (ff9ad8c)
+- **Stopped the Esc resend storm.** Previously a provider-error abort followed by Esc created a settled→auto-drain→abort loop that resent the same delivery on every keystroke. Settled-side fencing now classifies evidence into three buckets — seen-and-discarded (never resend), silently-dropped (recover but never auto-wake), already-projected (leave to watchdog) — and `agent_settled` no longer auto-drains. (557a05d)
+- **Batched queued deliveries into one custom message.** Multiple pending workflow completions now merge into a single `custom` batch with per-item `[run / kind / seq N]` partitions, occupying one turn instead of N. Members restore individually on abort. (557a05d)
+- **Hardened delivery across output waits and aborts.** (02a056f)
+- **Split transport ack from context consumption.** A provider `2xx` now only stops outbox resends; it no longer implies the model consumed the body. Consumption requires an actual assistant `stop` with text. (8cad36d)
+- **Removed speculative consumption.** The `stop+text` heuristic that permanently dropped delivery bodies from projection (so a model answering "the count is 6" erased the underlying findings) is gone. Bodies now project until host compaction; there is no "semantically consumed" state. (c7e9869)
+- **Gated wake behind a single safe entry with abort-epoch fencing.** One UI-only hidden marker (`customType:"workflows"`, empty content, `triggerTurn:true`) is the only automatic wake. A stable per-delivery ordinal plus an Esc abort-epoch cutoff prevent fenced IDs from waking, while still letting them project on later legitimate requests. Settle-attribution tokens stop a real run's `agent_settled` from releasing a marker's in-flight latch. Provider-consumed bodies that fail durable ack park for reconcile instead of re-waking. (a78ccc6)
+
+### Verification
+
+- `npm test` release gate passed with 1,431 tests and zero release-gate warnings.
+
 ## [3.5.1-yuki.3] - 2026-08-16
 
 ### Added

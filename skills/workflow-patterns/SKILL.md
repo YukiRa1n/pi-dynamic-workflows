@@ -2,7 +2,7 @@
 name: workflow-patterns
 description: Arguments for five built-in workflows; load only after the user selects workflow execution.
 metadata:
-  version: "3.5.1-yuki.3"
+  version: "3.5.1-yuki.4"
 ---
 
 # Built-in workflow patterns
