@@ -19,7 +19,7 @@ All notable changes to `@quintinshaw/pi-dynamic-workflows` are documented here.
 
 ### Verification
 
-- `npm run release:check` passed with 1,361 tests and zero release-gate warnings.
+- `npm test` release gate passed with 1,431 tests and zero release-gate warnings.
 
 ## [3.5.1-yuki.4] - 2026-08-19
 
