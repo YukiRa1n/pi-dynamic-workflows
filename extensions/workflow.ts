@@ -128,10 +128,10 @@ function buildManagerOptions(cwd: string, storage: WorkflowStorage) {
 /**
  * Bridge terminal results and explicit task-changing alerts into this session.
  * Routine subagent completions stay in the durable run record and UI instead of
- * consuming provider context. deliverAs "steer" lands at the next safe point of
- * an active turn, after its current tool-call batch. triggerTurn wakes an idle
- * main session. Re-bound on every generation/manager rebuild because `pi` is
- * generation-bound.
+ * consuming provider context. Workflow bodies are passive custom history and
+ * never enter Pi's Steering queue; one empty UI-only marker may start a turn at
+ * the verified safe point. Re-bound on every generation/manager rebuild because
+ * `pi` is generation-bound.
  */
 const COLLAPSED_MESSAGE_LINES = 8;
 const COLLAPSED_MESSAGE_CHARS = 1_200;
@@ -287,24 +287,15 @@ type WorkflowBridgeDelivery = {
   content: string;
   details?: WorkflowDeliveryDetails;
   wake: boolean;
-  /** This canonical entry already initiated an idle provider turn. Passive
-   * history entries omit it and may need one coalesced post-settle wake. */
-  wakeAttempted?: boolean;
 };
 
 type WorkflowBridgeUncertainDelivery = {
   delivery: WorkflowBridgeDelivery;
   generation: number;
-};
-
-/**
- * Transport-acknowledged but not yet context-consumed. Kept in memory only;
- * reload re-projects from history or the durable outbox (fail-safe: one extra
- * projection, never silent loss).
- */
-type WorkflowBridgeVisibleDelivery = {
-  delivery: WorkflowBridgeDelivery;
-  generation: number;
+  /** True when the provider already consumed this body (a 2xx) but the durable
+   * ack failed. Such entries reconcile the durable record instead of
+   * re-projecting the consumed payload. */
+  providerConsumed?: boolean;
 };
 
 type WorkflowBridgeAckWatchdog = {
@@ -322,6 +313,9 @@ type WorkflowBridgeRetryState = {
   inProgress: boolean;
   requested: boolean;
   exhaustedWarned: boolean;
+  /** Provider-consumed IDs whose durable ack still needs a bounded reconcile;
+   * their body stays out of the wake path until this settles. */
+  reconcileIds?: Set<string>;
 };
 
 type WorkflowOutputWaitState = {
@@ -333,16 +327,83 @@ type WorkflowOutputWaitState = {
   deliveryIds?: string[];
 };
 
-type WorkflowRecoveryScope = {
-  generation: number;
-  runId: string;
-  /** Exact delivery snapshot that one Esc recovery turn may observe. */
-  deliveryIds: string[];
-};
-
 type WorkflowTreeFence = {
   generation: number;
   phase: "active" | "passive";
+};
+
+/**
+ * An Esc boundary. Only deliveries already associated with the interrupted run
+ * at the abort moment are fenced; deliveries arriving afterwards get a new
+ * arrival ordinal and may trigger a fresh batched wake. The fence governs only
+ * autonomous wake eligibility, never provider-context projection.
+ */
+type WorkflowAbortEpoch = {
+  /** Monotonic abort-epoch identity; increments for each distinct Esc boundary. */
+  generation: number;
+  /** Local agent-start token used to collapse signal/agent_end duplicates. */
+  runToken?: number;
+  /** Arrivals with ordinal <= this cutoff are seen before Esc and cannot wake. */
+  cutoffOrdinal: number;
+  /** IDs associated with the interrupted request until its late responses settle. */
+  fencedIds: Set<string>;
+  /** Real user input releases wake admission for new arrivals. */
+  userReleased: boolean;
+};
+
+/**
+ * Batched autonomous-wake bookkeeping. Wake eligibility is independent from
+ * provider-context visibility: every projectable payload remains available to
+ * the context bridge even when a wake is fenced or has already been attempted.
+ */
+type WorkflowWakeState = {
+  /** Monotonic autonomous-wake batch epoch. */
+  epoch: number;
+  /** Projectable delivery IDs that still need a provider request. */
+  wakePendingIds: Set<string>;
+  /** IDs that actually entered a hidden marker request in this epoch. */
+  wakeAttemptedIds: Set<string>;
+  /** IDs included in the current provider request; only a 2xx retires them. */
+  wakeRequestIds: Set<string>;
+  /** IDs selected by the currently active hidden marker batch. */
+  activeLoopIds: Set<string>;
+  /** At most one autonomous loop may be active at a time. */
+  inFlight: boolean;
+  /** Wake epoch represented by the active hidden marker run. */
+  inFlightEpoch?: number;
+  /** Agent run token owning that marker; prevents a racing user prompt from
+   * spending hidden-wake attempts for IDs it merely happened to project. */
+  inFlightRunToken?: number;
+  /** Run tokens of extension-owned hidden marker runs observed so far. The in-flight
+   * mutual exclusion is released only when an extension-owned marker turn actually
+   * completes, detected as (a) a before_provider_request fired while that marker
+   * owned the turn (host serializes runs: a live marker's agent_start suppresses any
+   * later prompt until the marker settles), or (b) the marker failed to start and
+   * the next settle boundary arrives with the token still owned. Membership is
+   * recorded at agent_start and consumed exactly once, so the set never grows
+   * unboundedly. */
+  settledMarkerRunTokens?: Set<number>;
+};
+
+/**
+ * Transactional rotation cursor over the projected history page. `stagedCursor`
+ * is computed by the context hook only; `before_provider_request` records the
+ * association, and a successful 2xx may later commit it. A non-2xx response or
+ * abort discards the association/staged value. Cursor values are stable
+ * delivery IDs, never array indexes, so compaction/tree relocation can find the
+ * same point in a changed branch.
+ */
+type WorkflowRotationCursor = {
+  /** Stable delivery ID after which the next context page should begin. */
+  stagedCursor?: string;
+  /** Last cursor committed by a successful provider response. */
+  committedCursor?: string;
+  /** The staged cursor and IDs associated by before_provider_request. */
+  associatedRequest?: {
+    generation: number;
+    deliveryIds: string[];
+    stagedCursor?: string;
+  };
 };
 
 type WorkflowBridge = {
@@ -350,12 +411,14 @@ type WorkflowBridge = {
   pi: ExtensionAPI;
   /** Live host-idle probe captured from the current ExtensionContext. */
   isHostIdle?: () => boolean;
+  /** Live host pending-queue probe. Missing on older hosts means fail-closed. */
+  hasPendingMessages?: () => boolean;
+  /** Read-only active branch probe used to prune wake state after compaction/tree. */
+  getActiveBranch?: () => unknown[];
   /** True after real input starts but before Pi marks the agent run active. */
   promptStarting: boolean;
   /** Distinguishes an extension-owned wake from genuine user input. */
   autonomousPromptStarting: boolean;
-  /** At most one ordinary background continuation is allowed per real prompt. */
-  autonomousWakeSpent: boolean;
   /** Backstop for input consumed before agent_start (slash command/extension). */
   promptStartTimer?: ReturnType<typeof setTimeout>;
   /** Defers an agent_settled wake until the host has left its settled stack. */
@@ -389,27 +452,30 @@ type WorkflowBridge = {
   projectedForNextRequest: Array<{ id: string; generation: number }>;
   /** Included in a provider request; retained until after_provider_response. */
   includedInProviderRequest: Array<{ id: string; generation: number }>;
-  /**
-   * Transport-acknowledged (2xx) but the model has not yet produced a final
-   * text answer that consumed it. Entries here are re-projected into every
-   * subsequent provider context until `message_end` observes a genuine
-   * `stop`+text response. Cleared on reload (fail-safe: re-project from
-   * history/outbox).
-   */
-  visiblePending: Map<string, WorkflowBridgeVisibleDelivery>;
-  /** An aborted request may still report a late response. While fenced, no
-   * response may acknowledge a newer request in the same generation. */
+  /** A response from the aborted provider request may arrive after Esc. This
+   * fence protects only that old request association until agent_settled. */
   providerAckFenceGeneration?: number;
+  /** Monotonic local agent-start token; unlike bridge.generation this advances
+   * for every run and lets signal/agent_end report one abort boundary once. */
+  nextRunToken: number;
+  activeRunToken?: number;
+  /** Monotonic admission ordinal; never derived from details.sequence. */
+  lastArrivalOrdinal: number;
+  /** Stable delivery ID -> first assigned arrival ordinal. Replays reuse it. */
+  arrivalOrdinalById: Map<string, number>;
+  /** Present only after a user abort; stale generations are ignored by helpers. */
+  abortEpoch?: WorkflowAbortEpoch;
+  /** Batched wake bookkeeping; payload visibility is intentionally independent. */
+  wakeState: WorkflowWakeState;
+  /** Transactional provider-page rotation cursor. */
+  rotationCursor: WorkflowRotationCursor;
+  /** Latch set at a verified agent_settled safe point; cleared by input/mutation
+   * or while one autonomous marker loop is being started. */
+  safeWakeReady: boolean;
   /** One coalesced, exponentially backed-off retry lane for the whole bridge. */
   retryState: WorkflowBridgeRetryState;
-  /** Set after a user-aborted agent run; delivery must not wake a new run until input. */
-  abortFence: boolean;
-  /** Exact lifecycle latch for an interrupted blocking get_workflow_output.
-   * This is the only Esc path allowed to open one hidden consumption turn. */
+  /** Exact lifecycle latch for an interrupted blocking get_workflow_output. */
   outputWaitState?: WorkflowOutputWaitState;
-  /** Exact Esc snapshot retained for every provider request in the one hidden
-   * recovery run. It is independent of a later tool wait in that run. */
-  recoveryScope?: WorkflowRecoveryScope;
   /** A bounded context page left more backlog; wait for a real prompt instead
    * of turning overflow into a chain of autonomous Working continuations. */
   deferBacklogWake: boolean;
@@ -563,6 +629,157 @@ function rememberDelivery(bridge: WorkflowBridge, id: string): void {
   }
 }
 
+/**
+ * Assign (or return the existing) monotonic arrival ordinal for a delivery ID.
+ * Pre-increment so the first arrival is ordinal 1. A stable ID keeps its first
+ * ordinal across replays — never reassigned. Esc records cutoffOrdinal from
+ * lastArrivalOrdinal; only an arrival with ordinal > cutoff is new.
+ */
+function getOrAssignOrdinal(bridge: WorkflowBridge, id: string): number {
+  const existing = bridge.arrivalOrdinalById.get(id);
+  if (existing !== undefined) return existing;
+  const ordinal = ++bridge.lastArrivalOrdinal;
+  bridge.arrivalOrdinalById.set(id, ordinal);
+  return ordinal;
+}
+
+/** True when this delivery is not a genuinely new arrival after the active
+ * Esc cutoff, or when it belongs to the interrupted loop snapshot. The fenced
+ * set remains useful after a real prompt releases new-arrival admission: it is
+ * retained until the interrupted run settles and never authorizes a late old
+ * request to become a fresh autonomous wake. */
+function isFencedFromWake(bridge: WorkflowBridge, id: string): boolean {
+  const epoch = bridge.abortEpoch;
+  if (!epoch) return false;
+  if (epoch.fencedIds.has(id)) return true;
+  const ordinal = bridge.arrivalOrdinalById.get(id);
+  return ordinal === undefined || ordinal <= epoch.cutoffOrdinal;
+}
+
+function isWakeProjectableDelivery(delivery: WorkflowBridgeDelivery): boolean {
+  return delivery.wake && PROVIDER_WORKFLOW_CUSTOM_TYPES.has(delivery.customType);
+}
+
+/** Admit a stable delivery ID to the wake state exactly once. This is separate
+ * from visible-history admission: a body can be projected passively without
+ * spending a wake attempt. */
+function admitWorkflowWake(bridge: WorkflowBridge, delivery: WorkflowBridgeDelivery): void {
+  if (!isWakeProjectableDelivery(delivery)) return;
+  if (delivery.customType === "workflow-agent" || WORKFLOW_UI_ONLY_CUSTOM_TYPES.has(delivery.customType)) return;
+  // A provider-consumed body parked for reconcile already reached the provider.
+  // Re-admitting it to the wake set would let a settled safe point spend a
+  // second hidden marker on an already-consumed payload.
+  if (bridge.uncertainAck.get(delivery.id)?.providerConsumed === true) return;
+  const hadOrdinal = bridge.arrivalOrdinalById.has(delivery.id);
+  getOrAssignOrdinal(bridge, delivery.id);
+  bridge.wakeState.wakePendingIds.add(delivery.id);
+  // The latch is set only by agent_settled or another verified lifecycle safe
+  // point. A newer arrival merely releases overflow deferral; it cannot make an
+  // unsafe callback into a wake by itself.
+  if (!hadOrdinal) bridge.deferBacklogWake = false;
+}
+
+/**
+ * Keep a failed passive admission from becoming an empty autonomous wake. The
+ * stable ordinal remains reserved so a replay is still fenced consistently, but
+ * the ID must be re-admitted only when a later retry or real prompt can actually
+ * put its body in canonical history/provider context.
+ */
+function deferWorkflowWake(bridge: WorkflowBridge, deliveryId: string): void {
+  bridge.wakeState.wakePendingIds.delete(deliveryId);
+  bridge.wakeState.wakeAttemptedIds.delete(deliveryId);
+  bridge.wakeState.wakeRequestIds.delete(deliveryId);
+  bridge.deferBacklogWake = true;
+}
+
+/** A wake marker is useful only when its workflow body is already visible to the
+ * provider or is associated with an actual provider request. The dedupe ledger
+ * (`delivered`) means a prior provider turn already carried this body; such IDs
+ * never justify a fresh autonomous marker even if a durable record survives. */
+function hasWorkflowWakeBody(bridge: WorkflowBridge, deliveryId: string): boolean {
+  if (bridge.delivered.has(deliveryId)) return false;
+  return (
+    bridge.canonicalHistoryIds.has(deliveryId) ||
+    bridge.wakeState.wakeRequestIds.has(deliveryId) ||
+    bridge.projectedForNextRequest.some((item) => item.id === deliveryId && item.generation === bridge.generation) ||
+    bridge.includedInProviderRequest.some((item) => item.id === deliveryId && item.generation === bridge.generation)
+  );
+}
+
+/** True only while the current generation has transport evidence for a body.
+ * A custom history entry by itself is deliberately not transport evidence: its
+ * provider projection must not recreate an acknowledgement/watchdog after the
+ * durable record and the bounded delivered ledger have both disappeared. */
+function hasCurrentWorkflowTransportTracking(bridge: WorkflowBridge, deliveryId: string): boolean {
+  const generation = bridge.generation;
+  return (
+    bridge.awaitingAck.get(deliveryId)?.details?.deliveryGeneration === generation ||
+    bridge.uncertainAck.get(deliveryId)?.generation === generation ||
+    bridge.projectedForNextRequest.some((item) => item.id === deliveryId && item.generation === generation) ||
+    bridge.includedInProviderRequest.some((item) => item.id === deliveryId && item.generation === generation)
+  );
+}
+
+function hasWorkflowOutboxRecord(bridge: WorkflowBridge, deliveryId: string): boolean {
+  try {
+    return bridge.manager.listPendingDeliveries().some((record) => record.deliveryId === deliveryId);
+  } catch {
+    return false;
+  }
+}
+
+type WorkflowWakeContext = Pick<ExtensionContext, "isIdle" | "hasPendingMessages">;
+
+/**
+ * Non-negotiable safe-wake gate. Missing hasPendingMessages is fail-closed:
+ * an older host may still project passive history, but it may not be
+ * auto-woken. No isIdle-only degradation is allowed. `requireLatch` is false
+ * only while arming the latch from a verified agent_settled event.
+ */
+function workflowSafeWakeReady(bridge: WorkflowBridge, ctx?: WorkflowWakeContext, requireLatch = true): boolean {
+  // A supplied host context is authoritative. Do not silently fall back to a
+  // bridge-only idle probe when that context lacks its pending-queue method.
+  const isIdle = ctx ? ctx.isIdle : bridge.isHostIdle;
+  const hasPendingMessages = ctx ? ctx.hasPendingMessages : bridge.hasPendingMessages;
+  if (
+    bridge.suspended ||
+    bridge.compacting ||
+    bridge.treeFence ||
+    bridge.hostMutationWakeFence ||
+    bridge.promptStarting ||
+    bridge.deferBacklogWake ||
+    bridge.wakeState.inFlight ||
+    (requireLatch && !bridge.safeWakeReady) ||
+    typeof isIdle !== "function" ||
+    typeof hasPendingMessages !== "function"
+  ) {
+    // A transient structural block (deferBacklogWake) preserves the latch: the
+    // settled boundary it was armed on has not passed, and releasing the defer
+    // may consume it while still in that safe window. Hard failure modes
+    // (in-flight wake, host mutation, missing probes) invalidate it outright.
+    if (!bridge.deferBacklogWake) bridge.safeWakeReady = false;
+    return false;
+  }
+  try {
+    if (isIdle() !== true || hasPendingMessages() !== false) {
+      bridge.safeWakeReady = false;
+      return false;
+    }
+  } catch {
+    bridge.safeWakeReady = false;
+    return false;
+  }
+  return true;
+}
+
+function queueWorkflowWakeCheck(bridge: WorkflowBridge, ctx?: WorkflowWakeContext): void {
+  const generation = bridge.generation;
+  queueMicrotask(() => {
+    if (bridge.generation !== generation) return;
+    tryWorkflowWakeAtSafePoint(bridge, ctx);
+  });
+}
+
 function boundedWorkflowContent(content: string): string {
   if (Buffer.byteLength(content, "utf8") <= WORKFLOW_BRIDGE_PAYLOAD_LIMIT) return content;
   const marker =
@@ -629,8 +846,9 @@ function startWorkflowAckWatchdog(
     bridge.awaitingAck.delete(delivery.id);
     clearWorkflowProviderTracking(bridge, delivery.id, generation);
     bridge.uncertainAck.set(delivery.id, { delivery: awaiting, generation });
+    bridge.deferBacklogWake = true;
     console.warn("[workflow-delivery] acknowledgement timed out; deferred until the next session generation");
-    if (!bridge.abortFence) flushWorkflowBridge(bridge);
+    flushWorkflowBridge(bridge);
   }, timeoutMs);
   timer.unref?.();
   watchdog.timer = timer;
@@ -651,7 +869,7 @@ function pauseWorkflowAckWatchdogs(bridge: WorkflowBridge): void {
 
 /** Resume deadlines captured by pauseWorkflowAckWatchdogs(). */
 function resumeWorkflowAckWatchdogs(bridge: WorkflowBridge): void {
-  if (bridge.compacting || bridge.abortFence) return;
+  if (bridge.compacting) return;
   const now = Date.now();
   for (const [deliveryId, watchdog] of [...bridge.ackWatchdogs.entries()]) {
     if (watchdog.timer) continue;
@@ -674,7 +892,6 @@ function clearWorkflowPromptStarting(bridge: WorkflowBridge): void {
 function markWorkflowPromptStarting(bridge: WorkflowBridge, autonomous = false): void {
   bridge.promptStarting = true;
   bridge.autonomousPromptStarting = autonomous;
-  if (autonomous) bridge.autonomousWakeSpent = true;
   if (bridge.promptStartTimer) clearTimeout(bridge.promptStartTimer);
   const generation = bridge.generation;
   const timer = setTimeout(() => {
@@ -682,22 +899,15 @@ function markWorkflowPromptStarting(bridge: WorkflowBridge, autonomous = false):
     bridge.promptStartTimer = undefined;
     bridge.promptStarting = false;
     bridge.autonomousPromptStarting = false;
-    // The input may have been consumed by a command or another extension. Only
-    // the live idle probe can now authorize a pending background wake.
+    // The input may have been consumed by a command or another extension. This
+    // timer only retries passive history admission; it never starts a turn.
     flushWorkflowBridge(bridge);
   }, WORKFLOW_PROMPT_START_TIMEOUT_MS);
   timer.unref?.();
   bridge.promptStartTimer = timer;
 }
 
-function currentWorkflowRecoveryScope(bridge: WorkflowBridge): WorkflowRecoveryScope | undefined {
-  const scope = bridge.recoveryScope;
-  return scope?.generation === bridge.generation ? scope : undefined;
-}
-
 function currentWorkflowPriorityIds(bridge: WorkflowBridge): ReadonlySet<string> | undefined {
-  const recovery = currentWorkflowRecoveryScope(bridge);
-  if (recovery) return new Set(recovery.deliveryIds);
   const outputWait = bridge.outputWaitState;
   if (
     !outputWait ||
@@ -719,9 +929,8 @@ function isCurrentOutputWaitPriorityDelivery(bridge: WorkflowBridge, delivery: W
   return Boolean(outputWait.deliveryIds?.includes(delivery.id));
 }
 
-/** Capture a bounded, exact run snapshot before request-association arrays are
- * cleared. Projected-but-not-requested entries remain eligible; entries already
- * included in a provider request do not reopen an ordinary Esc. */
+/** Capture a bounded, exact run snapshot for priority ordering. This does not
+ * authorize a wake; the safe gate below remains the only trigger entry. */
 function snapshotWorkflowOutputWaitDeliveries(bridge: WorkflowBridge, runId: string): WorkflowBridgeDelivery[] {
   const included = new Set(
     bridge.includedInProviderRequest.filter((item) => item.generation === bridge.generation).map((item) => item.id),
@@ -767,144 +976,96 @@ function snapshotWorkflowOutputWaitDeliveries(bridge: WorkflowBridge, runId: str
   return selected;
 }
 
-function unprojectedWorkflowHistory(
-  bridge: WorkflowBridge,
-  runId?: string,
-  deliveryIds?: ReadonlySet<string>,
-): WorkflowBridgeDelivery[] {
-  const associated = new Set(
-    [...bridge.projectedForNextRequest, ...bridge.includedInProviderRequest]
-      .filter((item) => item.generation === bridge.generation)
-      .map((item) => item.id),
-  );
-  return [...bridge.awaitingAck.values()].filter(
-    (delivery) =>
-      delivery.wake &&
-      delivery.details?.deliveryGeneration === bridge.generation &&
-      delivery.wakeAttempted !== true &&
-      !associated.has(delivery.id) &&
-      (runId === undefined || delivery.details?.runId === runId) &&
-      (deliveryIds === undefined || deliveryIds.has(delivery.id)),
-  );
-}
-
 /**
- * Busy-path notifications already exist as canonical role=custom history.
- * Start one invisible idle turn to consume those entries; never resend their
- * (potentially large) payloads and never put them in Pi's busy Steering queue.
+ * The only function allowed to start an autonomous provider loop. It sends an
+ * empty UI-only custom marker; workflow bodies are always admitted separately
+ * with triggerTurn:false. IDs are marked attempted only when the marker's
+ * provider request actually includes them, not when a byte/count-limited page
+ * leaves them out.
  */
-function wakeUnprojectedWorkflowHistory(bridge: WorkflowBridge): void {
-  const armed =
-    bridge.outputWaitState?.phase === "armed" && bridge.outputWaitState.generation === bridge.generation
-      ? bridge.outputWaitState
-      : undefined;
-  if (
-    bridge.suspended ||
-    bridge.compacting ||
-    bridge.treeFence ||
-    bridge.hostMutationWakeFence ||
-    bridge.promptStarting ||
-    (bridge.deferBacklogWake && !armed) ||
-    (bridge.autonomousWakeSpent && !armed)
-  )
-    return;
-  if (bridge.abortFence && !armed) return;
+function tryWorkflowWakeAtSafePoint(bridge: WorkflowBridge, ctx?: WorkflowWakeContext): boolean {
+  if (!workflowSafeWakeReady(bridge, ctx)) return false;
+  const cutoffOrdinal = bridge.abortEpoch?.cutoffOrdinal ?? 0;
+  const candidates = [...bridge.wakeState.wakePendingIds].filter((id) => {
+    const ordinal = bridge.arrivalOrdinalById.get(id);
+    return (
+      ordinal !== undefined &&
+      ordinal > cutoffOrdinal &&
+      !bridge.wakeState.wakeAttemptedIds.has(id) &&
+      !isFencedFromWake(bridge, id) &&
+      hasWorkflowWakeBody(bridge, id)
+    );
+  });
+  // No eligible arrival is not a failed safe gate. Keep the settled latch armed
+  // so a delivery that arrives after the settled boundary can use it.
+  if (candidates.length === 0) return false;
 
-  let hostIdle = false;
-  try {
-    hostIdle = bridge.isHostIdle?.() === true;
-  } catch {
-    hostIdle = false;
-  }
-  if (!hostIdle) return;
-
-  const frozenDeliveryIds = armed?.deliveryIds ? new Set(armed.deliveryIds) : undefined;
-  if (armed && frozenDeliveryIds) {
-    // Capacity pressure can leave part of the exact Esc snapshot only in the
-    // bridge queue/durable outbox. Admit at least one matching canonical entry
-    // before starting the hidden turn; the context bridge recovers the rest by
-    // the same frozen IDs without opening the abort fence.
-    for (const delivery of snapshotWorkflowOutputWaitDeliveries(bridge, armed.runId)) {
-      if (!frozenDeliveryIds.has(delivery.id) || bridge.awaitingAck.has(delivery.id)) continue;
-      sendWorkflowDeliveryToHistory(bridge, delivery);
-      if (bridge.awaitingAck.has(delivery.id)) break;
-    }
-  }
-  const waiting = unprojectedWorkflowHistory(bridge, armed?.runId, frozenDeliveryIds);
-  if (waiting.length === 0) {
-    // Esc before any matching output is an ordinary stop. Consume the
-    // interrupted-wait latch, but keep the abort fence closed so a later
-    // workflow completion cannot restart the dismissed parent turn.
-    if (armed) bridge.outputWaitState = undefined;
-    return;
-  }
-  if (armed) {
-    // Keep the abort fence closed throughout the one recovery turn. The
-    // canonical entries that existed at Esc are consumed now; later arrivals
-    // stay passive until genuine input instead of chaining N Working turns.
-    bridge.outputWaitState = { ...armed, phase: "resuming" };
-    bridge.recoveryScope = {
-      generation: bridge.generation,
-      runId: armed.runId,
-      deliveryIds: [...(armed.deliveryIds ?? [])],
-    };
-  }
-
-  const previousAutonomousWakeSpent = bridge.autonomousWakeSpent;
-  for (const delivery of waiting) {
-    bridge.awaitingAck.set(delivery.id, { ...delivery, wakeAttempted: true });
-  }
   const generation = bridge.generation;
-  let rolledBack = false;
-  const rollbackWake = (err: unknown, force: boolean): void => {
-    if (rolledBack || bridge.generation !== generation || (!force && !bridge.autonomousPromptStarting)) return;
-    rolledBack = true;
+  bridge.wakeState.inFlight = true;
+  bridge.wakeState.epoch += 1;
+  bridge.wakeState.inFlightEpoch = bridge.wakeState.epoch;
+  // Until the marker emits agent_start, retain the previous token. A real
+  // prompt racing this send advances activeRunToken and therefore cannot spend
+  // hidden-wake attempts; hosts that omit agent_start keep the legacy undefined
+  // fallback used by the test/compatibility harness.
+  bridge.wakeState.inFlightRunToken = bridge.activeRunToken;
+  bridge.wakeState.activeLoopIds = new Set(candidates);
+  bridge.safeWakeReady = false;
+  markWorkflowPromptStarting(bridge, true);
+  const rollback = (error: unknown): void => {
+    if (bridge.generation !== generation || !bridge.wakeState.inFlight) return;
+    const failedRunToken = bridge.wakeState.inFlightRunToken;
+    bridge.wakeState.inFlight = false;
+    bridge.wakeState.inFlightEpoch = undefined;
+    bridge.wakeState.inFlightRunToken = undefined;
+    bridge.wakeState.activeLoopIds.clear();
     clearWorkflowPromptStarting(bridge);
     bridge.autonomousPromptStarting = false;
-    bridge.autonomousWakeSpent = previousAutonomousWakeSpent;
-    for (const delivery of waiting) {
-      bridge.awaitingAck.set(delivery.id, { ...delivery, wakeAttempted: false });
-    }
-    if (armed) {
-      bridge.outputWaitState = armed;
-      bridge.recoveryScope = undefined;
+    // A failed marker did not enter a provider request. Leave every ID
+    // unattempted; the next verified lifecycle safe point may retry it.
+    bridge.safeWakeReady = false;
+    if (failedRunToken !== undefined) {
+      if (!bridge.wakeState.settledMarkerRunTokens) bridge.wakeState.settledMarkerRunTokens = new Set<number>();
+      bridge.wakeState.settledMarkerRunTokens.add(failedRunToken);
     }
     console.warn(
-      `[workflow-delivery] hidden consumption wake failed; history remains pending: ${err instanceof Error ? err.message : String(err)}`,
+      `[workflow-delivery] safe-point wake failed; history remains pending: ${error instanceof Error ? error.message : String(error)}`,
     );
   };
-  markWorkflowPromptStarting(bridge, true);
   try {
     const sent: unknown = bridge.pi.sendMessage(
       {
-        // The current supported generation filters this UI-only marker before
-        // provider conversion. It contains no workflow payload.
         customType: "workflows",
         content: "",
         display: false,
-        details: { source: "workflow-bridge", count: waiting.length },
+        details: { source: "workflow-bridge", count: candidates.length },
       },
-      { triggerTurn: true, deliverAs: "steer" },
+      { triggerTurn: true },
     );
     if (sent && typeof (sent as PromiseLike<void>).then === "function") {
-      void Promise.resolve(sent).catch((err: unknown) => rollbackWake(err, false));
+      void Promise.resolve(sent).catch(rollback);
     }
-  } catch (err) {
-    rollbackWake(err, true);
+    return true;
+  } catch (error) {
+    rollback(error);
+    return false;
   }
 }
 
-/** AgentSession marks itself idle before awaiting agent_settled handlers. Start
- * an allowed wake synchronously in that handler so a concurrent compact/tree
- * command cannot claim the same idle boundary first. */
-function flushWorkflowBridgeAtSettled(bridge: WorkflowBridge): void {
+/** AgentSession marks itself idle before awaiting agent_settled handlers. */
+function flushWorkflowBridgeAtSettled(bridge: WorkflowBridge, ctx?: WorkflowWakeContext): void {
   if (bridge.settledFlushTimer) clearTimeout(bridge.settledFlushTimer);
   bridge.settledFlushTimer = undefined;
-  const startedWake = flushWorkflowBridge(bridge);
-  if (!startedWake) wakeUnprojectedWorkflowHistory(bridge);
+  flushWorkflowBridge(bridge);
+  // agent_settled is itself the verified safe-point trigger. Passive admission
+  // schedules its own microtask path; this direct call preserves the settled
+  // boundary before a later compaction/tree callback can claim the host.
+  tryWorkflowWakeAtSafePoint(bridge, ctx);
 }
 
 function queueWorkflowDelivery(bridge: WorkflowBridge, rawDelivery: WorkflowBridgeDelivery): void {
+  // Legacy automatic-agent reports are persistence/UI-only and must never enter
+  // either wakePendingIds or the provider-facing custom-history bridge.
   if (rawDelivery.customType === "workflow-agent") return;
   const delivery = normalizedWorkflowDelivery(rawDelivery);
   if (
@@ -914,6 +1075,7 @@ function queueWorkflowDelivery(bridge: WorkflowBridge, rawDelivery: WorkflowBrid
     bridge.pending.some((item) => item.id === delivery.id)
   )
     return;
+  admitWorkflowWake(bridge, delivery);
   if (bridge.pending.length >= WORKFLOW_BRIDGE_QUEUE_LIMIT) {
     const terminals = bridge.pending.filter((item) => item.customType === "workflow-result");
     // Terminal lifecycle records are never shifted or folded into ordinary
@@ -956,10 +1118,14 @@ function resetWorkflowDeliveryRetry(bridge: WorkflowBridge): void {
   retry.inProgress = false;
   retry.requested = false;
   retry.exhaustedWarned = false;
+  // Unreconciled provider-consumed parks survive a retry-lane reset: they are
+  // still waiting on a durable ack, so keep reconcileIds intact. A bare clear
+  // here would leave the durable record unreachable by both the retry timer
+  // and the outbox replay, leaking it until a generation bump.
 }
 
 function scheduleWorkflowDeliveryRetry(bridge: WorkflowBridge, deliveryId: string, generation: number): void {
-  if (bridge.abortFence || bridge.suspended || bridge.compacting || bridge.generation !== generation) return;
+  if (bridge.suspended || bridge.compacting || bridge.generation !== generation) return;
   const retry = bridge.retryState;
   if (retry.timer) {
     // Multiple records can fail in the same flush. They share one timer; only
@@ -968,6 +1134,10 @@ function scheduleWorkflowDeliveryRetry(bridge: WorkflowBridge, deliveryId: strin
     return;
   }
   if (retry.attempt >= WORKFLOW_DELIVERY_RETRY_MAX_ATTEMPTS) {
+    // A retry budget can also be reached from a persistence path that did not
+    // establish canonical history. Freeze that ID before returning so a later
+    // settled callback cannot spend another marker on an empty context.
+    if (!hasWorkflowWakeBody(bridge, deliveryId)) deferWorkflowWake(bridge, deliveryId);
     if (!retry.exhaustedWarned) {
       retry.exhaustedWarned = true;
       console.warn(
@@ -985,6 +1155,38 @@ function scheduleWorkflowDeliveryRetry(bridge: WorkflowBridge, deliveryId: strin
     if (bridge.retryState.timer !== timer) return;
     bridge.retryState.inProgress = true;
     bridge.retryState.requested = false;
+    // Reconcile durable acks for provider-consumed bodies parked in the
+    // uncertain set. This retires the durable record without re-projecting the
+    // already-consumed body or spending another autonomous marker. A reconcile
+    // that succeeds (or a reconcile that fails and stays pending) must not hold
+    // deferBacklogWake: that latch only belongs to a *visible* backlog that
+    // genuinely lost its wake, not to a consumed body awaiting a durable ack.
+    let reconcileSucceeded = false;
+    const reconcileIds = bridge.retryState.reconcileIds;
+    if (reconcileIds && reconcileIds.size > 0) {
+      for (const reconcileId of [...reconcileIds]) {
+        const uncertain = bridge.uncertainAck.get(reconcileId);
+        if (!uncertain) {
+          reconcileIds.delete(reconcileId);
+          continue;
+        }
+        const runId = uncertain.delivery.details?.runId;
+        if (persistDeliveryPhase(bridgeManager(bridge), runId, reconcileId, uncertain.generation, "acknowledged")) {
+          bridge.uncertainAck.delete(reconcileId);
+          rememberDelivery(bridge, reconcileId);
+          reconcileIds.delete(reconcileId);
+          reconcileSucceeded = true;
+        }
+      }
+      // A consumed body's durable ack is transport bookkeeping, never a reason
+      // to suppress an unrelated pending wake. Release the backlog latch that
+      // requeue set, whether or not the durable record retired this pass.
+      if (reconcileSucceeded || reconcileIds.size === 0) bridge.deferBacklogWake = false;
+      // If a reconcile is still outstanding, keep the bounded retry lane alive so
+      // the durable record eventually retires instead of waiting for a session
+      // generation bump to requeue it.
+      if (reconcileIds.size > 0) bridge.retryState.requested = true;
+    }
     if (bridge.generation === generation && !bridge.suspended && !bridge.compacting) flushWorkflowBridge(bridge);
     // Promise rejections created by flushWorkflowBridge run before this
     // microtask and set requested=true. This keeps sync and async failures on
@@ -1012,145 +1214,22 @@ function requeueWorkflowDeliveryAfterPersistenceFailure(
   clearWorkflowAckWatchdog(bridge, item.id, item.generation);
   bridge.awaitingAck.delete(item.id);
   clearWorkflowProviderTracking(bridge, item.id, item.generation);
-  queueWorkflowDelivery(bridge, {
-    ...awaiting,
-    details: { ...awaiting.details, deliveryGeneration: undefined },
-  });
-  console.warn(`[workflow-delivery] durable ${phase} transition failed; queued for safe-point retry`);
+  // The provider already returned 2xx for this request, so the body was
+  // consumed. Re-admitting it to the visible pending queue would let a settled
+  // safe point spend another hidden marker on an already-consumed payload. Park
+  // it in the generation-scoped uncertain set instead: that forbids an
+  // autonomous wake and context projection until the durable retry reconciles
+  // the record and a real prompt admits it again.
+  bridge.uncertainAck.set(item.id, { delivery: awaiting, generation: item.generation, providerConsumed: true });
+  bridge.wakeState.wakePendingIds.delete(item.id);
+  bridge.wakeState.wakeAttemptedIds.delete(item.id);
+  bridge.wakeState.wakeRequestIds.delete(item.id);
+  bridge.wakeState.activeLoopIds.delete(item.id);
+  bridge.deferBacklogWake = true;
+  bridge.retryState.reconcileIds ??= new Set<string>();
+  bridge.retryState.reconcileIds.add(item.id);
+  console.warn(`[workflow-delivery] durable ${phase} transition failed; parked as uncertain pending reconcile`);
   scheduleWorkflowDeliveryRetry(bridge, item.id, bridge.generation);
-}
-
-function sendWorkflowDeliveryNow(
-  bridge: WorkflowBridge,
-  rawDelivery: WorkflowBridgeDelivery,
-  opts?: { bypassAbortFence?: boolean },
-): void {
-  const delivery = normalizedWorkflowDelivery(rawDelivery);
-  if (
-    bridge.suspended ||
-    bridge.compacting ||
-    bridge.treeFence ||
-    bridge.hostMutationWakeFence ||
-    (bridge.abortFence && !opts?.bypassAbortFence)
-  ) {
-    queueWorkflowDelivery(bridge, delivery);
-    return;
-  }
-  if (
-    bridge.delivered.has(delivery.id) ||
-    bridge.awaitingAck.has(delivery.id) ||
-    isUncertainInCurrentGeneration(bridge, delivery.id)
-  )
-    return;
-  if (bridge.canonicalHistoryIds.has(delivery.id)) {
-    // A persistence-phase retry reuses the existing transcript entry. The
-    // context hook will re-admit its stable ID from the durable outbox; sending
-    // another custom message here would duplicate visible history.
-    return;
-  }
-  if (bridge.awaitingAck.size >= WORKFLOW_BRIDGE_IN_FLIGHT_LIMIT) {
-    queueWorkflowDelivery(bridge, delivery);
-    return;
-  }
-  const startedGeneration = bridge.generation;
-  const durable = Boolean(delivery.details?.runId && delivery.details?.deliveryId);
-  const recordedPhase = persistDeliveryPhase(
-    bridgeManager(bridge),
-    delivery.details?.runId,
-    delivery.id,
-    startedGeneration,
-    "submitted",
-  );
-  if (durable && !recordedPhase) {
-    // Durable CAS/persistence failure: keep the record out of Pi until the
-    // bounded safe-point retry succeeds (at-least-once with a stable ID).
-    queueWorkflowDelivery(bridge, delivery);
-    scheduleWorkflowDeliveryRetry(bridge, delivery.id, startedGeneration);
-    return;
-  }
-  // A fulfilled send only means Pi admitted the custom message; it is not a
-  // provider acknowledgement. For in-memory deliveries (no durable outbox)
-  // the accepted send is the best available evidence, so record it now and
-  // let the generation-fenced settled sweep tell "Pi admitted it" apart from
-  // "Pi silently dropped it on Esc". Durable records keep "submitted" from
-  // being proof of admission (same-generation retries may resume from disk).
-  const submitted = {
-    ...delivery,
-    wakeAttempted: delivery.wake,
-    details: {
-      ...delivery.details,
-      deliveryGeneration: startedGeneration,
-      deliverySubmitted: !durable || recordedPhase,
-    },
-  };
-  // A fulfilled send only means Pi admitted the custom message; it is not a
-  // provider acknowledgement. Keep the payload until the context hook observes
-  // it entering a provider-bound continuation.
-  bridge.awaitingAck.set(delivery.id, submitted);
-  // This path is idle-only, so admission should reach context promptly. Arm a
-  // deadline now because stock Pi's fire-and-forget sendMessage cannot report a
-  // rejected prompt start back to the extension. Busy/outbox injection starts
-  // its deadline later, only when context actually projects it.
-  startWorkflowAckWatchdog(bridge, submitted, startedGeneration);
-  const previousAutonomousWakeSpent = bridge.autonomousWakeSpent;
-  if (delivery.wake) markWorkflowPromptStarting(bridge, true);
-  try {
-    // flushWorkflowBridge calls this only after the live host reports idle.
-    // That invariant is critical: on a streaming Pi session triggerTurn:true
-    // enters the visible steering queue, and Esc later copies that queue into
-    // the editor as plain user text. An idle send starts directly and never
-    // touches either host queue.
-    const sent: unknown = bridge.pi.sendMessage(
-      {
-        customType: delivery.customType,
-        content: submitted.content,
-        display: true,
-        details: { ...submitted.details, deliveryId: submitted.id },
-      },
-      // Every provider-bound workflow delivery uses the safe-point steering
-      // queue. `wake` controls only whether an idle main session starts a turn.
-      { triggerTurn: delivery.wake, deliverAs: "steer" },
-    );
-    bridge.canonicalHistoryIds.add(delivery.id);
-    // Stock Pi exposes this as fire-and-forget (runtime value: void). Some
-    // compatible hosts return a Promise, so observe that optional extension
-    // without making the lifecycle depend on it.
-    if (sent && typeof (sent as PromiseLike<void>).then === "function") {
-      void Promise.resolve(sent).catch((err: unknown) => {
-        const awaiting = bridge.awaitingAck.get(delivery.id);
-        if (awaiting?.details?.deliveryGeneration !== startedGeneration) return;
-        if (delivery.wake) {
-          clearWorkflowPromptStarting(bridge);
-          bridge.autonomousPromptStarting = false;
-          bridge.autonomousWakeSpent = previousAutonomousWakeSpent;
-        }
-        clearWorkflowAckWatchdog(bridge, delivery.id, startedGeneration);
-        bridge.awaitingAck.delete(delivery.id);
-        clearWorkflowProviderTracking(bridge, delivery.id, startedGeneration);
-        bridge.canonicalHistoryIds.delete(delivery.id);
-        queueWorkflowDelivery(bridge, delivery);
-        console.warn(
-          `[workflow-delivery] async send failed; queued for retry: ${err instanceof Error ? err.message : String(err)}`,
-        );
-        if (bridge.generation !== startedGeneration && !bridge.suspended) flushWorkflowBridge(bridge);
-        else scheduleWorkflowDeliveryRetry(bridge, delivery.id, startedGeneration);
-      });
-    }
-  } catch (err) {
-    if (delivery.wake) {
-      clearWorkflowPromptStarting(bridge);
-      bridge.autonomousPromptStarting = false;
-      bridge.autonomousWakeSpent = previousAutonomousWakeSpent;
-    }
-    clearWorkflowAckWatchdog(bridge, delivery.id, startedGeneration);
-    bridge.awaitingAck.delete(delivery.id);
-    clearWorkflowProviderTracking(bridge, delivery.id, startedGeneration);
-    queueWorkflowDelivery(bridge, delivery);
-    console.warn(
-      `[workflow-delivery] send failed; queued for retry: ${err instanceof Error ? err.message : String(err)}`,
-    );
-    scheduleWorkflowDeliveryRetry(bridge, delivery.id, startedGeneration);
-  }
 }
 
 /**
@@ -1160,6 +1239,9 @@ function sendWorkflowDeliveryNow(
  * entry into the editor. The normal context hook later admits/acknowledges it.
  */
 function sendWorkflowDeliveryToHistory(bridge: WorkflowBridge, rawDelivery: WorkflowBridgeDelivery): void {
+  // Keep the workflow-agent compatibility channel display-only even when a
+  // legacy outbox/reload path hands one directly to the bridge.
+  if (rawDelivery.customType === "workflow-agent") return;
   const delivery = normalizedWorkflowDelivery(rawDelivery);
   if (bridge.suspended || bridge.compacting || bridge.treeFence?.phase === "active") {
     queueWorkflowDelivery(bridge, delivery);
@@ -1169,11 +1251,15 @@ function sendWorkflowDeliveryToHistory(bridge: WorkflowBridge, rawDelivery: Work
     bridge.delivered.has(delivery.id) ||
     bridge.awaitingAck.has(delivery.id) ||
     isUncertainInCurrentGeneration(bridge, delivery.id)
-  )
+  ) {
     return;
+  }
+  admitWorkflowWake(bridge, delivery);
   if (bridge.canonicalHistoryIds.has(delivery.id)) {
     // The durable record and existing custom entry are enough for context-time
-    // re-admission. Never append a second visible copy for a phase retry.
+    // re-admission. Never append a second visible copy for a phase retry. The
+    // post-admission check still belongs to the unique wake entry.
+    queueWorkflowWakeCheck(bridge);
     return;
   }
   if (bridge.awaitingAck.size >= WORKFLOW_BRIDGE_IN_FLIGHT_LIMIT) {
@@ -1186,6 +1272,9 @@ function sendWorkflowDeliveryToHistory(bridge: WorkflowBridge, rawDelivery: Work
     // spinning even though the target message is already durable.
     if (!priority || priorityAlreadyAdmitted) {
       queueWorkflowDelivery(bridge, delivery);
+      // No canonical body was admitted. Keep this backlog passive instead of
+      // letting a settled callback start an empty marker turn.
+      deferWorkflowWake(bridge, delivery.id);
       return;
     }
   }
@@ -1200,6 +1289,7 @@ function sendWorkflowDeliveryToHistory(bridge: WorkflowBridge, rawDelivery: Work
   );
   if (durable && !recordedPhase) {
     queueWorkflowDelivery(bridge, delivery);
+    deferWorkflowWake(bridge, delivery.id);
     scheduleWorkflowDeliveryRetry(bridge, delivery.id, generation);
     return;
   }
@@ -1223,25 +1313,32 @@ function sendWorkflowDeliveryToHistory(bridge: WorkflowBridge, rawDelivery: Work
       { triggerTurn: false },
     );
     bridge.canonicalHistoryIds.add(delivery.id);
+    const queueWakeAfterAdmission = (): void => queueWorkflowWakeCheck(bridge);
     if (sent && typeof (sent as PromiseLike<void>).then === "function") {
-      void Promise.resolve(sent).catch((err: unknown) => {
-        const awaiting = bridge.awaitingAck.get(delivery.id);
-        if (awaiting?.details?.deliveryGeneration !== generation) return;
-        bridge.awaitingAck.delete(delivery.id);
-        clearWorkflowProviderTracking(bridge, delivery.id, generation);
-        bridge.canonicalHistoryIds.delete(delivery.id);
-        queueWorkflowDelivery(bridge, delivery);
-        console.warn(
-          `[workflow-delivery] async history admission failed; queued for retry: ${err instanceof Error ? err.message : String(err)}`,
-        );
-        scheduleWorkflowDeliveryRetry(bridge, delivery.id, generation);
-      });
+      void Promise.resolve(sent)
+        .then(queueWakeAfterAdmission)
+        .catch((err: unknown) => {
+          const awaiting = bridge.awaitingAck.get(delivery.id);
+          if (awaiting?.details?.deliveryGeneration !== generation) return;
+          bridge.awaitingAck.delete(delivery.id);
+          clearWorkflowProviderTracking(bridge, delivery.id, generation);
+          bridge.canonicalHistoryIds.delete(delivery.id);
+          queueWorkflowDelivery(bridge, delivery);
+          deferWorkflowWake(bridge, delivery.id);
+          console.warn(
+            `[workflow-delivery] async history admission failed; queued for retry: ${err instanceof Error ? err.message : String(err)}`,
+          );
+          scheduleWorkflowDeliveryRetry(bridge, delivery.id, generation);
+        });
+    } else {
+      queueWakeAfterAdmission();
     }
   } catch (err) {
     bridge.awaitingAck.delete(delivery.id);
     clearWorkflowProviderTracking(bridge, delivery.id, generation);
     bridge.canonicalHistoryIds.delete(delivery.id);
     queueWorkflowDelivery(bridge, delivery);
+    deferWorkflowWake(bridge, delivery.id);
     console.warn(
       `[workflow-delivery] history admission failed; queued for retry: ${err instanceof Error ? err.message : String(err)}`,
     );
@@ -1288,49 +1385,83 @@ function sendWorkflowDelivery(bridge: WorkflowBridge, delivery: WorkflowBridgeDe
  * outbox itself remains untouched and is therefore replayable after input or a
  * session replacement.
  */
-function fenceWorkflowBridgeAfterAbort(bridge: WorkflowBridge): void {
-  bridge.abortFence = true;
+function fenceWorkflowBridgeAfterAbort(bridge: WorkflowBridge, runToken?: number): void {
+  const activeRunToken = runToken ?? bridge.activeRunToken;
+  const previous = bridge.abortEpoch;
+
+  // The signal and agent_end both describe the same Esc boundary. Collapse both
+  // callbacks by the run token, even when real input has already released new
+  // arrivals. A stale signal from an older run must not fence the replacement.
+  if (runToken !== undefined && bridge.activeRunToken !== undefined && runToken !== bridge.activeRunToken) {
+    return;
+  }
+  if (previous?.runToken !== undefined && activeRunToken === previous.runToken) return;
+  if (previous?.runToken === undefined && runToken === undefined && previous) return;
+
+  const fencedIds = new Set(previous?.fencedIds ?? []);
+  // `wakeAttemptedIds` is the active hidden marker's loop membership. Keep it
+  // only while that loop is still in flight; old attempted IDs are not an Esc
+  // association for a later user run.
+  if (bridge.wakeState.inFlight) {
+    for (const id of bridge.wakeState.activeLoopIds) fencedIds.add(id);
+    for (const id of bridge.wakeState.wakeAttemptedIds) fencedIds.add(id);
+  }
+  for (const id of bridge.wakeState.wakeRequestIds) fencedIds.add(id);
+  for (const item of [...bridge.projectedForNextRequest, ...bridge.includedInProviderRequest]) {
+    if (item.generation === bridge.generation) fencedIds.add(item.id);
+  }
+  // Snapshot every history admission. A late response has no request ID, so
+  // these stable IDs must stay fenced until agent_settled.
+  for (const id of bridge.awaitingAck.keys()) fencedIds.add(id);
+
+  const epochGeneration = (previous?.generation ?? 0) + 1;
+  const retainProviderAckFence = bridge.providerAckFenceGeneration !== undefined;
+  bridge.abortEpoch = {
+    generation: epochGeneration,
+    runToken: activeRunToken,
+    cutoffOrdinal: bridge.lastArrivalOrdinal,
+    fencedIds,
+    userReleased: false,
+  };
+  // Only an actually associated provider request needs the late-ack fence. Keep
+  // an existing fence across a raced second abort until the old run settles;
+  // the ordinal fence alone governs wake eligibility for passive/new arrivals.
+  bridge.providerAckFenceGeneration =
+    bridge.includedInProviderRequest.length > 0 || retainProviderAckFence ? bridge.generation : undefined;
+  bridge.safeWakeReady = false;
   clearWorkflowPromptStarting(bridge);
   bridge.autonomousPromptStarting = false;
   resetWorkflowDeliveryRetry(bridge);
-  if (bridge.includedInProviderRequest.length > 0) {
-    bridge.providerAckFenceGeneration = bridge.generation;
-  }
   const outputWait = bridge.outputWaitState;
   if (
     outputWait &&
     outputWait.generation === bridge.generation &&
     (outputWait.phase === "waiting" || outputWait.phase === "yielded")
   ) {
-    const matchingAtAbort = currentWorkflowRecoveryScope(bridge)
-      ? []
-      : snapshotWorkflowOutputWaitDeliveries(bridge, outputWait.runId);
-    // Freeze the exact abort boundary. A delivery that arrives after Esc but
-    // before tool_execution_end must not retroactively turn an empty stop into
-    // an automatic recovery; one already present must not be stranded either.
+    const matchingAtAbort = snapshotWorkflowOutputWaitDeliveries(bridge, outputWait.runId);
+    // Freeze the exact abort boundary. A delivery that arrives after Esc gets
+    // a larger ordinal and remains a separate candidate for a later safe wake.
     bridge.outputWaitState =
       matchingAtAbort.length > 0
         ? { ...outputWait, phase: "armed", deliveryIds: matchingAtAbort.map((delivery) => delivery.id) }
         : { ...outputWait, phase: "dismissed", deliveryIds: [] };
   }
-  // A late 2xx from the aborted request must not retire its durable records.
-  // The next real prompt re-projects the same stable IDs and establishes a new
-  // request association before they can be acknowledged. Snapshot the special
-  // output-wait boundary above first: context projection is not provider entry.
+  // A late response from the interrupted provider request is fenced by the new
+  // epoch. The next real request must establish a fresh association first.
   bridge.projectedForNextRequest = [];
   bridge.includedInProviderRequest = [];
-  // Workflow messages never enter Pi's busy steering/follow-up queues, so there
-  // is nothing to clear, restore into the editor, or resend here. Keep admitted
-  // custom history and its stable acknowledgement state intact; the next real
-  // prompt projects that same entry without another UI block or wake.
+  bridge.wakeState.wakeRequestIds.clear();
+  bridge.rotationCursor.stagedCursor = undefined;
+  bridge.rotationCursor.associatedRequest = undefined;
   pauseWorkflowAckWatchdogs(bridge);
 }
 
-function flushWorkflowBridge(bridge: WorkflowBridge, opts?: { bypassAbortFence?: boolean }): boolean {
+function flushWorkflowBridge(bridge: WorkflowBridge): boolean {
   if (bridge.suspended || bridge.compacting || bridge.treeFence?.phase === "active") return false;
   // A retry sequence is sticky only until a genuine external flush (new
-  // delivery, input, provider/agent lifecycle). Automatic retry callbacks
-  // still carry a live timer and therefore cannot silently re-arm themselves.
+  // delivery, input, provider/agent lifecycle). This function only appends
+  // passive custom history; autonomous waking is delegated to the unique safe
+  // point entry below.
   if (!bridge.retryState.timer && !bridge.retryState.inProgress && bridge.retryState.attempt > 0) {
     resetWorkflowDeliveryRetry(bridge);
   }
@@ -1339,57 +1470,10 @@ function flushWorkflowBridge(bridge: WorkflowBridge, opts?: { bypassAbortFence?:
     if (!bridge.retryState.inProgress) resetWorkflowDeliveryRetry(bridge);
     return false;
   }
-  // Never call triggerTurn while Pi is executing a provider turn or a blocking
-  // tool such as get_workflow_output. Those calls become host steering entries,
-  // which drain as extra turns and are copied into the editor on Esc. Send at
-  // most one direct idle wake. Remaining durable records are projected into
-  // that wake's provider context with their own stable IDs.
-  let hostIdle = false;
-  try {
-    hostIdle = bridge.isHostIdle?.() === true;
-  } catch {
-    hostIdle = false;
-  }
-  const mayWake =
-    (!bridge.abortFence || opts?.bypassAbortFence === true) &&
-    !bridge.hostMutationWakeFence &&
-    !bridge.treeFence &&
-    !bridge.autonomousWakeSpent &&
-    !bridge.deferBacklogWake &&
-    hostIdle &&
-    !bridge.promptStarting;
-
-  if (!mayWake) {
-    // Passive admission is safe in every non-suspended state: triggerTurn:false
-    // appends visible custom history directly and never touches Pi's steering or
-    // follow-up queues. Bound the batch through awaitingAck's in-flight ceiling.
-    const pending = bridge.pending.splice(0, bridge.pending.length);
-    for (const delivery of pending) sendWorkflowDeliveryToHistory(bridge, delivery);
-    if (bridge.pending.length === 0 && !bridge.retryState.inProgress) resetWorkflowDeliveryRetry(bridge);
-    return false;
-  }
-
-  // Prefer a terminal result as the single visible wake; explicit messages in
-  // the same backlog still enter the same provider request through the outbox
-  // context projection below.
-  const terminalIndex = bridge.pending.findIndex(
-    (item) => item.wake && item.customType === "workflow-result" && !bridge.canonicalHistoryIds.has(item.id),
-  );
-  const selectedIndex =
-    terminalIndex >= 0
-      ? terminalIndex
-      : bridge.pending.findIndex((item) => item.wake && !bridge.canonicalHistoryIds.has(item.id));
-  if (selectedIndex < 0) return false;
-  const [delivery] = bridge.pending.splice(selectedIndex, 1);
-  // Admit the rest as passive history before starting the one wake, so the
-  // provider context and transcript see the complete burst without N turns.
-  // Reserve one in-flight slot for the wake selected above.
-  const passiveCapacity = Math.max(0, WORKFLOW_BRIDGE_IN_FLIGHT_LIMIT - bridge.awaitingAck.size - 1);
-  const passive = bridge.pending.splice(0, passiveCapacity);
-  for (const item of passive) sendWorkflowDeliveryToHistory(bridge, item);
-  if (delivery) sendWorkflowDeliveryNow(bridge, delivery, opts);
+  const pending = bridge.pending.splice(0, bridge.pending.length);
+  for (const delivery of pending) sendWorkflowDeliveryToHistory(bridge, delivery);
   if (bridge.pending.length === 0 && !bridge.retryState.inProgress) resetWorkflowDeliveryRetry(bridge);
-  return delivery !== undefined;
+  return false;
 }
 
 function suspendWorkflowBridge(manager: WorkflowManager): void {
@@ -1397,10 +1481,15 @@ function suspendWorkflowBridge(manager: WorkflowManager): void {
   if (!bridge) return;
   bridge.suspended = true;
   bridge.outputWaitState = undefined;
-  bridge.recoveryScope = undefined;
   bridge.treeFence = undefined;
   bridge.hostMutationWakeFence = false;
   bridge.autonomousPromptStarting = false;
+  bridge.safeWakeReady = false;
+  bridge.wakeState.inFlight = false;
+  bridge.wakeState.inFlightEpoch = undefined;
+  bridge.wakeState.inFlightRunToken = undefined;
+  bridge.wakeState.settledMarkerRunTokens?.clear();
+  bridge.wakeState.activeLoopIds.clear();
   clearWorkflowPromptStarting(bridge);
   resetWorkflowDeliveryRetry(bridge);
   if (bridge.settledFlushTimer) clearTimeout(bridge.settledFlushTimer);
@@ -1471,9 +1560,86 @@ function resumeWorkflowBridge(manager: WorkflowManager): void {
   flushWorkflowBridge(bridge);
 }
 
+function activeWorkflowBranchDeliveryIds(bridge: WorkflowBridge): Set<string> | undefined {
+  if (typeof bridge.getActiveBranch !== "function") return undefined;
+  try {
+    const entries = bridge.getActiveBranch();
+    if (!Array.isArray(entries)) return undefined;
+    const ids = new Set<string>();
+    for (const rawEntry of entries) {
+      if (!rawEntry || typeof rawEntry !== "object") continue;
+      const entry = rawEntry as { type?: unknown; customType?: unknown; details?: unknown };
+      if (entry.type !== "custom_message" || typeof entry.customType !== "string") continue;
+      if (!PROVIDER_WORKFLOW_CUSTOM_TYPES.has(entry.customType)) continue;
+      const details = entry.details && typeof entry.details === "object" ? entry.details : undefined;
+      const deliveryId = (details as { deliveryId?: unknown } | undefined)?.deliveryId;
+      if (typeof deliveryId === "string" && deliveryId) ids.add(deliveryId);
+    }
+    return ids;
+  } catch {
+    // An unavailable branch probe is not evidence that history disappeared.
+    return undefined;
+  }
+}
+
+/** Drop wake/transport bookkeeping for IDs removed by compaction/tree while
+ * retaining queued bodies themselves. A queued body is re-admitted when the
+ * passive flush places it on the new branch; only branch/outbox membership keeps
+ * wake state across the mutation. */
+function pruneWorkflowWakeStateAfterMutation(bridge: WorkflowBridge): void {
+  const branchIds = activeWorkflowBranchDeliveryIds(bridge);
+  if (!branchIds) return;
+  const outboxIds = new Set<string>();
+  try {
+    for (const record of bridge.manager.listPendingDeliveries()) outboxIds.add(record.deliveryId);
+  } catch {
+    return;
+  }
+  const keep = new Set<string>(branchIds);
+  for (const id of outboxIds) keep.add(id);
+
+  for (const id of [...bridge.awaitingAck.keys()]) {
+    if (keep.has(id)) continue;
+    clearWorkflowAckWatchdog(bridge, id);
+    bridge.awaitingAck.delete(id);
+  }
+  for (const id of [...bridge.uncertainAck.keys()]) {
+    if (keep.has(id)) continue;
+    bridge.uncertainAck.delete(id);
+  }
+  bridge.projectedForNextRequest = bridge.projectedForNextRequest.filter((item) => keep.has(item.id));
+  bridge.includedInProviderRequest = bridge.includedInProviderRequest.filter((item) => keep.has(item.id));
+  for (const id of [...bridge.wakeState.wakePendingIds]) {
+    if (!keep.has(id)) bridge.wakeState.wakePendingIds.delete(id);
+  }
+  for (const id of [...bridge.wakeState.wakeAttemptedIds]) {
+    if (!keep.has(id)) bridge.wakeState.wakeAttemptedIds.delete(id);
+  }
+  for (const id of [...bridge.wakeState.wakeRequestIds]) {
+    if (!keep.has(id)) bridge.wakeState.wakeRequestIds.delete(id);
+  }
+  for (const id of [...bridge.wakeState.activeLoopIds]) {
+    if (!keep.has(id)) bridge.wakeState.activeLoopIds.delete(id);
+  }
+  for (const id of [...bridge.arrivalOrdinalById.keys()]) {
+    if (!keep.has(id)) bridge.arrivalOrdinalById.delete(id);
+  }
+  if (bridge.abortEpoch) {
+    for (const id of [...bridge.abortEpoch.fencedIds]) {
+      if (!keep.has(id)) bridge.abortEpoch.fencedIds.delete(id);
+    }
+  }
+  for (const id of [...bridge.canonicalHistoryIds]) {
+    if (!branchIds.has(id) && !outboxIds.has(id)) bridge.canonicalHistoryIds.delete(id);
+  }
+}
+
 function completeCompactionAdmission(bridge: WorkflowBridge, generation: number): void {
   if (bridge.compactionGeneration !== generation || !bridge.compacting) return;
   bridge.compacting = false;
+  bridge.rotationCursor = {};
+  pruneWorkflowWakeStateAfterMutation(bridge);
+  bridge.safeWakeReady = false;
   // session_compact fires before the host clears its controller. The compacted
   // branch is safe for passive custom history, but no public event proves an
   // autonomous triggerTurn is safe until an agent settles or a real prompt is
@@ -1495,6 +1661,8 @@ function installWorkflowCompactionFence(pi: ExtensionAPI, getManager: () => Work
     if (!bridge) return;
     bridge.compacting = true;
     bridge.hostMutationWakeFence = true;
+    bridge.rotationCursor = {};
+    bridge.safeWakeReady = false;
     pauseWorkflowAckWatchdogs(bridge);
     ++bridge.compactionGeneration;
     // Abort/cancel/error has no post-controller extension event. Stay
@@ -1514,6 +1682,8 @@ function installWorkflowCompactionFence(pi: ExtensionAPI, getManager: () => Work
     const generation = ++bridge.treeFenceGeneration;
     bridge.treeFence = { generation, phase: "active" };
     bridge.hostMutationWakeFence = true;
+    bridge.rotationCursor = {};
+    bridge.safeWakeReady = false;
     pauseWorkflowAckWatchdogs(bridge);
     // Stock Pi has no post-finally tree event for abort/cancel/error. Keep this
     // generation fenced; a later real prompt releases it safely.
@@ -1527,6 +1697,9 @@ function installWorkflowCompactionFence(pi: ExtensionAPI, getManager: () => Work
     // belongs to that leaf, but autonomous waking remains fenced because later
     // session_tree handlers may still be running under the host controller.
     bridge.treeFence = { ...fence, phase: "passive" };
+    bridge.rotationCursor = {};
+    pruneWorkflowWakeStateAfterMutation(bridge);
+    bridge.safeWakeReady = false;
     resumeWorkflowAckWatchdogs(bridge);
     flushWorkflowBridge(bridge);
   });
@@ -1534,36 +1707,13 @@ function installWorkflowCompactionFence(pi: ExtensionAPI, getManager: () => Work
   pi.on("agent_settled", () => {
     const bridge = ownedBridgeFor(getManager(), pi);
     if (!bridge) return;
-    if (bridge.providerAckFenceGeneration === bridge.generation) {
-      // The aborted agent loop is now fully settled, so no response hook from
-      // that loop can race a later prompt. Drop its ambiguous request
-      // association and let the same stable history ID project again.
-      bridge.providerAckFenceGeneration = undefined;
-      bridge.projectedForNextRequest = [];
-      bridge.includedInProviderRequest = [];
-      if (bridge.outputWaitState?.phase !== "armed") {
-        // A request that overlapped an ordinary abort has no host request ID.
-        // Do not reinterpret its now-unassociated history as a fresh automatic
-        // wake; the next real prompt re-establishes the association safely.
-        bridge.deferBacklogWake = true;
-      }
-    }
-    if (bridge.compacting) {
-      bridge.compacting = false;
-    }
+    if (bridge.compacting) bridge.compacting = false;
     if (bridge.hostMutationWakeFence && !bridge.treeFence) {
       // Auto-compaction is now outside the agent stack. Manual compaction and
       // tree navigation have no associated settled event and remain fenced.
       bridge.hostMutationWakeFence = false;
       resumeWorkflowAckWatchdogs(bridge);
     }
-    // No autonomous drain here. A settled flush with the abort fence set stays
-    // queued; with the fence clear it only forwards genuinely new arrivals
-    // (workflow completions), which is the normal delivery path. Dropped and
-    // recovered deliveries wait for the input handler to release the fence on
-    // the next real user keystroke — never on a timer.
-    // The final lifecycle handler below performs the atomic settled flush after
-    // output-wait/recovery state has been normalized.
   });
 }
 
@@ -1632,13 +1782,50 @@ function installWorkflowAbortFence(pi: ExtensionAPI, getManager: () => WorkflowM
   pi.on("agent_start", (_event, ctx) => {
     const bridge = ownedBridgeFor(getManager(), pi);
     if (!bridge) return;
+    const runToken = ++bridge.nextRunToken;
+    bridge.activeRunToken = runToken;
+    const hiddenMarkerRun = bridge.autonomousPromptStarting;
+    // Any new run invalidates a previously settled latch, even if the host's
+    // idle probe has not flipped yet in this callback stack. Preserve the
+    // hidden marker's in-flight epoch explicitly; the marker is the only
+    // extension-owned run that may consume wakeState.inFlight.
+    bridge.safeWakeReady = false;
+    if (hiddenMarkerRun) {
+      bridge.wakeState.inFlight = true;
+      bridge.wakeState.inFlightEpoch ??= bridge.wakeState.epoch;
+      bridge.wakeState.inFlightRunToken = runToken;
+      // Record that this run token belongs to an extension-owned marker so a
+      // later agent_settled can clear the in-flight latch only for marker runs,
+      // independent of the mutable activeRunToken pointer.
+      if (!bridge.wakeState.settledMarkerRunTokens) bridge.wakeState.settledMarkerRunTokens = new Set<number>();
+      bridge.wakeState.settledMarkerRunTokens.add(runToken);
+    } else {
+      // A non-marker run starting means any previously dispatched marker is no
+      // longer the active run: the host serializes runs, so a marker that were
+      // still live could not overlap this start. Its latch ownership is stale.
+      // Releasing it here prevents a later settle (the marker's own, or this
+      // run's) from being misattributed to that dead marker and either leaking
+      // the latch or spending a second marker.
+      const staleToken = bridge.wakeState.inFlightRunToken;
+      if (staleToken !== undefined && staleToken !== runToken) {
+        bridge.wakeState.settledMarkerRunTokens?.delete(staleToken);
+        bridge.wakeState.inFlightRunToken = undefined;
+      }
+      // This run inherits an in-flight latch from a stale marker. Record its own
+      // token as settle-owned so this run's settle releases the latch; otherwise
+      // a latch orphaned by a marker that never completed would wedge forever.
+      if (bridge.wakeState.inFlight) {
+        if (!bridge.wakeState.settledMarkerRunTokens) bridge.wakeState.settledMarkerRunTokens = new Set<number>();
+        bridge.wakeState.settledMarkerRunTokens.add(runToken);
+      }
+    }
     clearWorkflowPromptStarting(bridge);
     bridge.autonomousPromptStarting = false;
     const signal = ctx.signal;
     if (!signal) return;
     const generation = bridge.generation;
     const onAbort = () => {
-      if (bridge.generation === generation) fenceWorkflowBridgeAfterAbort(bridge);
+      if (bridge.generation === generation) fenceWorkflowBridgeAfterAbort(bridge, runToken);
     };
     signal.addEventListener("abort", onAbort, { once: true });
     if (signal.aborted) onAbort();
@@ -1653,25 +1840,78 @@ function installWorkflowAbortFence(pi: ExtensionAPI, getManager: () => WorkflowM
     const messages = Array.isArray(event.messages) ? event.messages : [];
     const lastAssistant = [...messages].reverse().find((message) => message.role === "assistant");
     if (lastAssistant?.role === "assistant" && lastAssistant.stopReason === "aborted") {
-      fenceWorkflowBridgeAfterAbort(bridge);
+      fenceWorkflowBridgeAfterAbort(bridge, bridge.activeRunToken);
     }
   });
 
-  pi.on("agent_settled", () => {
+  pi.on("agent_settled", (_event, ctx) => {
     const bridge = ownedBridgeFor(getManager(), pi);
     if (!bridge) return;
-    // A special Esc scope belongs to one complete agent run, not merely its
-    // first provider request. Clear the old scope before an armed wait is
-    // allowed to create the next (single) recovery turn below.
-    bridge.recoveryScope = undefined;
+    // Clear the in-flight mutual exclusion only when the settling run is an
+    // extension-owned marker run. Host settle events carry no run id, so we key
+    // ownership off the token recorded at the marker's agent_start. A real user
+    // run's settle (or a stale settle) must not release the latch: that would
+    // let a later safe point start a second concurrent autonomous loop. The
+    // mutable activeRunToken is NOT used here because a newer run may already
+    // have overwritten it before the marker's own settle fires.
+    // The in-flight mutual exclusion is released only by an extension-owned
+    // marker turn. Host emits no run id on settle, so a marker's agent_start
+    // records its token and the settle just before before_provider_request (host
+    // serializes runs: a live marker suppresses any later prompt's agent_start)
+    // or a rollback consumes that ownership. A real user run supersedes the
+    // marker at before_agent_start/agent_start, which clears the marker's token
+    // and claims the current run's token so only a marker-owned settle releases
+    // the latch.
+    //
+    // inFlightRunToken === undefined is NOT a free pass: before_provider_request
+    // spends the token when the marker's request fires, leaving the latch held
+    // with no owner while the marker is still in flight. A settle in that window
+    // belongs to a real run and must not release the latch. Only the legacy
+    // compatibility harness (a marker that ran to completion without any
+    // agent_start, so no token was ever recorded) may use the undefined fallback.
+    const legacyMarkerWithoutToken =
+      bridge.wakeState.inFlightRunToken === undefined &&
+      (bridge.wakeState.settledMarkerRunTokens?.size ?? 0) === 0 &&
+      bridge.wakeState.inFlightEpoch !== undefined;
+    const settleIsMarkerRun =
+      legacyMarkerWithoutToken ||
+      (bridge.wakeState.inFlightRunToken !== undefined &&
+        (bridge.activeRunToken === undefined ||
+          (bridge.wakeState.settledMarkerRunTokens?.has(bridge.activeRunToken) ?? false)));
+    if (bridge.wakeState.inFlight && settleIsMarkerRun) {
+      const releasedRunToken = bridge.activeRunToken;
+      bridge.wakeState.inFlight = false;
+      bridge.wakeState.inFlightEpoch = undefined;
+      bridge.wakeState.inFlightRunToken = undefined;
+      bridge.wakeState.activeLoopIds.clear();
+      if (releasedRunToken !== undefined) bridge.wakeState.settledMarkerRunTokens?.delete(releasedRunToken);
+    }
+    const epoch = bridge.abortEpoch;
+    if (epoch) {
+      // The interrupted provider loop is fully settled. Late responses from it
+      // can no longer race a replacement request, but the ordinal cutoff stays
+      // until real input releases new wake admission. Only now can the old
+      // request association and its late-ack fence be retired.
+      if (bridge.providerAckFenceGeneration === bridge.generation) {
+        bridge.providerAckFenceGeneration = undefined;
+      }
+      epoch.fencedIds.clear();
+      bridge.projectedForNextRequest = [];
+      bridge.includedInProviderRequest = [];
+      bridge.wakeState.wakeRequestIds.clear();
+      bridge.rotationCursor.associatedRequest = undefined;
+      bridge.rotationCursor.stagedCursor = undefined;
+      resumeWorkflowAckWatchdogs(bridge);
+    }
+    // Arm the latch only after the live safe gate succeeds. A missing pending
+    // queue probe, an active host mutation, or any queued host message leaves it
+    // false and cannot be bypassed by a delivery callback.
+    bridge.safeWakeReady = workflowSafeWakeReady(bridge, ctx, false);
     const outputWait = bridge.outputWaitState;
     if (outputWait?.generation === bridge.generation && outputWait.phase !== "armed") {
-      // A yielded wait that settled without an abort needs no special fence.
-      // A recovery turn that never reached a provider fails closed: canonical
-      // history remains available to the next real prompt without a wake loop.
       bridge.outputWaitState = undefined;
     }
-    flushWorkflowBridgeAtSettled(bridge);
+    flushWorkflowBridgeAtSettled(bridge, ctx);
   });
 
   // A real user prompt is the explicit release point. Do not flush here: the
@@ -1681,21 +1921,51 @@ function installWorkflowAbortFence(pi: ExtensionAPI, getManager: () => WorkflowM
   pi.on("before_agent_start", (event) => {
     const bridge = ownedBridgeFor(getManager(), pi);
     if (!bridge) return;
+    // The host accepted a new prompt; any settled latch belongs to the prior
+    // idle boundary, including the hidden marker's empty prompt.
+    bridge.safeWakeReady = false;
     if (bridge.autonomousPromptStarting) {
-      // Extension-owned direct/hidden wakes are not genuine input and must not
-      // reset the one-wake budget or release an Esc/host-mutation fence.
+      // An extension-owned marker normally has an empty prompt. A non-empty
+      // prompt is genuine user input racing the marker and must release stale
+      // mutation state rather than leaving a backlog stranded.
       bridge.autonomousPromptStarting = false;
-      return;
+      if (typeof event.prompt !== "string" || event.prompt.trim().length === 0) {
+        // The extension's own marker is starting. Its agent_start (next) claims
+        // ownership of the latch. Any prior dead marker token is stale here: a
+        // marker that genuinely began would not need before_agent_start to
+        // recognize it. Release a stale owner so it cannot leak.
+        if (bridge.wakeState.inFlightRunToken !== undefined) {
+          bridge.wakeState.settledMarkerRunTokens?.delete(bridge.wakeState.inFlightRunToken);
+          bridge.wakeState.inFlightRunToken = undefined;
+        }
+        bridge.safeWakeReady = false;
+        return;
+      }
+      // A real prompt superseded the pending marker before its agent_start. The
+      // marker token is dead: it must not mark a later user request as
+      // hidden-marker-owned, nor let a user-run settle release the latch.
+      if (bridge.wakeState.inFlightRunToken !== undefined) {
+        bridge.wakeState.settledMarkerRunTokens?.delete(bridge.wakeState.inFlightRunToken);
+        bridge.wakeState.inFlightRunToken = undefined;
+      }
     }
     if (typeof event.prompt !== "string" || event.prompt.trim().length === 0) return;
+    // Any real prompt supersedes an already-started marker's ownership of its
+    // in-flight latch before the marker's own settle: host serialization means
+    // the marker is no longer the active run once this user prompt begins.
+    if (bridge.wakeState.inFlightRunToken !== undefined) {
+      bridge.wakeState.settledMarkerRunTokens?.delete(bridge.wakeState.inFlightRunToken);
+      bridge.wakeState.inFlightRunToken = undefined;
+    }
     bridge.treeFence = undefined;
     bridge.compacting = false;
     bridge.hostMutationWakeFence = false;
-    bridge.recoveryScope = undefined;
-    bridge.autonomousWakeSpent = false;
     markWorkflowPromptStarting(bridge);
     bridge.outputWaitState = undefined;
-    if (bridge.abortFence) bridge.abortFence = false;
+    if (bridge.abortEpoch) bridge.abortEpoch.userReleased = true;
+    bridge.wakeState.wakeAttemptedIds.clear();
+    bridge.wakeState.wakeRequestIds.clear();
+    bridge.safeWakeReady = false;
     bridge.deferBacklogWake = false;
     resumeWorkflowAckWatchdogs(bridge);
   });
@@ -1726,9 +1996,10 @@ function bindDeliverBridge(manager: WorkflowManager, pi: ExtensionAPI): void {
       manager,
       pi,
       isHostIdle: undefined,
+      hasPendingMessages: undefined,
+      getActiveBranch: undefined,
       promptStarting: false,
       autonomousPromptStarting: false,
-      autonomousWakeSpent: false,
       // The extension factory runs before bindCore. Do not call the old pi
       // during that window; session_start explicitly resumes this generation.
       suspended: true,
@@ -1747,41 +2018,75 @@ function bindDeliverBridge(manager: WorkflowManager, pi: ExtensionAPI): void {
       ackWatchdogs: new Map<string, WorkflowBridgeAckWatchdog>(),
       projectedForNextRequest: [],
       includedInProviderRequest: [],
-      visiblePending: new Map<string, WorkflowBridgeVisibleDelivery>(),
       providerAckFenceGeneration: undefined,
+      nextRunToken: 0,
+      activeRunToken: undefined,
+      lastArrivalOrdinal: 0,
+      arrivalOrdinalById: new Map<string, number>(),
+      abortEpoch: undefined,
+      wakeState: {
+        epoch: 0,
+        wakePendingIds: new Set<string>(),
+        wakeAttemptedIds: new Set<string>(),
+        wakeRequestIds: new Set<string>(),
+        activeLoopIds: new Set<string>(),
+        inFlight: false,
+        inFlightEpoch: undefined,
+        inFlightRunToken: undefined,
+      },
+      rotationCursor: {},
+      safeWakeReady: false,
       retryState: {
         attempt: 0,
         inProgress: false,
         requested: false,
         exhaustedWarned: false,
       },
-      abortFence: false,
       outputWaitState: undefined,
-      recoveryScope: undefined,
       deferBacklogWake: false,
     } satisfies WorkflowBridge);
   // Backfill fields when handing off a manager created by an older extension
   // generation that predates batching support.
   bridge.awaitingAck ??= new Map<string, WorkflowBridgeDelivery>();
+  bridge.getActiveBranch ??= undefined;
   bridge.canonicalHistoryIds ??= new Set<string>();
   bridge.uncertainAck ??= new Map<string, WorkflowBridgeUncertainDelivery>();
   bridge.ackWatchdogs ??= new Map<string, WorkflowBridgeAckWatchdog>();
   bridge.projectedForNextRequest ??= [];
   bridge.includedInProviderRequest ??= [];
-  bridge.visiblePending ??= new Map<string, WorkflowBridgeVisibleDelivery>();
+  bridge.providerAckFenceGeneration ??= undefined;
+  bridge.nextRunToken ??= 0;
+  bridge.activeRunToken ??= undefined;
+  bridge.lastArrivalOrdinal ??= 0;
+  bridge.arrivalOrdinalById ??= new Map<string, number>();
+  bridge.wakeState ??= {
+    epoch: 0,
+    wakePendingIds: new Set<string>(),
+    wakeAttemptedIds: new Set<string>(),
+    wakeRequestIds: new Set<string>(),
+    activeLoopIds: new Set<string>(),
+    inFlight: false,
+  };
+  bridge.wakeState.wakePendingIds ??= new Set<string>();
+  bridge.wakeState.wakeAttemptedIds ??= new Set<string>();
+  bridge.wakeState.wakeRequestIds ??= new Set<string>();
+  bridge.wakeState.activeLoopIds ??= new Set<string>();
+  bridge.wakeState.inFlight ??= false;
+  bridge.wakeState.inFlightEpoch ??= undefined;
+  bridge.wakeState.inFlightRunToken ??= undefined;
+  bridge.wakeState.settledMarkerRunTokens ??= new Set<number>();
+  bridge.rotationCursor ??= {};
+  bridge.safeWakeReady ??= false;
   bridge.retryState ??= {
     attempt: 0,
     inProgress: false,
     requested: false,
     exhaustedWarned: false,
   };
-  bridge.abortFence ??= false;
   bridge.outputWaitState = undefined;
-  bridge.recoveryScope = undefined;
   bridge.deferBacklogWake ??= false;
   bridge.promptStarting ??= false;
   bridge.autonomousPromptStarting ??= false;
-  bridge.autonomousWakeSpent ??= false;
   if (bridge.promptStartTimer) clearTimeout(bridge.promptStartTimer);
   bridge.promptStartTimer = undefined;
   if (bridge.settledFlushTimer) clearTimeout(bridge.settledFlushTimer);
@@ -1789,8 +2094,12 @@ function bindDeliverBridge(manager: WorkflowManager, pi: ExtensionAPI): void {
   resetWorkflowDeliveryRetry(bridge);
   requeueUnacknowledgedForNextGeneration(bridge);
   bridge.deferBacklogWake = false;
+  bridge.abortEpoch = undefined;
   bridge.providerAckFenceGeneration = undefined;
-  bridge.visiblePending.clear();
+  bridge.activeRunToken = undefined;
+  bridge.wakeState.wakeAttemptedIds.clear();
+  bridge.wakeState.wakeRequestIds.clear();
+  bridge.safeWakeReady = false;
   bridge.compacting = false;
   bridge.hostMutationWakeFence = false;
   bridge.compactionGeneration = (bridge.compactionGeneration ?? 0) + 1;
@@ -1815,6 +2124,21 @@ function bindDeliverBridge(manager: WorkflowManager, pi: ExtensionAPI): void {
   bridge.manager = manager;
   bridge.pi = pi;
   bridge.generation += 1;
+  bridge.lastArrivalOrdinal = 0;
+  bridge.arrivalOrdinalById.clear();
+  bridge.abortEpoch = undefined;
+  bridge.providerAckFenceGeneration = undefined;
+  bridge.activeRunToken = undefined;
+  bridge.wakeState.wakePendingIds.clear();
+  bridge.wakeState.wakeAttemptedIds.clear();
+  bridge.wakeState.wakeRequestIds.clear();
+  bridge.wakeState.inFlight = false;
+  bridge.wakeState.inFlightEpoch = undefined;
+  bridge.wakeState.inFlightRunToken = undefined;
+  bridge.wakeState.settledMarkerRunTokens?.clear();
+  bridge.wakeState.activeLoopIds.clear();
+  bridge.rotationCursor = {};
+  bridge.safeWakeReady = false;
   bridge.suspended = true;
   target.__workflowBridge = bridge;
 
@@ -1968,6 +2292,30 @@ function workflowNotificationToolName(customType: string): string {
   return "workflow_message_notification";
 }
 
+/** Rotate only workflow custom entries by stable delivery ID. Non-workflow
+ * conversation/tool messages retain their original positions and pairing. */
+function rotateWorkflowHistoryMessages(messages: any[], cursor: string | undefined): any[] {
+  if (!cursor) return messages;
+  const workflowIndexes: number[] = [];
+  const workflowMessages: any[] = [];
+  for (let index = 0; index < messages.length; index++) {
+    const message = messages[index];
+    if (message?.role !== "custom" || !PROVIDER_WORKFLOW_CUSTOM_TYPES.has(message.customType)) continue;
+    const id = message.details?.deliveryId;
+    if (typeof id !== "string" || !id) continue;
+    workflowIndexes.push(index);
+    workflowMessages.push(message);
+  }
+  const cursorIndex = workflowMessages.findIndex((message) => message.details?.deliveryId === cursor);
+  if (cursorIndex < 0 || workflowMessages.length < 2) return messages;
+  const rotated = [...workflowMessages.slice(cursorIndex + 1), ...workflowMessages.slice(0, cursorIndex + 1)];
+  const output = [...messages];
+  workflowIndexes.forEach((index, offset) => {
+    output[index] = rotated[offset];
+  });
+  return output;
+}
+
 function installWorkflowToolResultContextBridge(pi: ExtensionAPI, getManager: () => WorkflowManager): void {
   pi.on("context", (event, ctx) => {
     const bridge = ownedBridgeFor(getManager(), pi);
@@ -1981,9 +2329,8 @@ function installWorkflowToolResultContextBridge(pi: ExtensionAPI, getManager: ()
       // A context-only preflight failure must not leak this request's IDs into
       // the next request and acknowledge messages that were not actually sent.
       bridge.projectedForNextRequest = [];
+      bridge.rotationCursor.stagedCursor = undefined;
     }
-    const recoveryScope = bridge ? currentWorkflowRecoveryScope(bridge) : undefined;
-    const strictRecoveryDeliveryIds = recoveryScope ? new Set(recoveryScope.deliveryIds) : undefined;
     const priorityDeliveryIds = bridge ? currentWorkflowPriorityIds(bridge) : undefined;
     // Busy-path delivery never enters Pi's steering/follow-up queues. Instead,
     // admit durable outbox records directly into this provider-context copy.
@@ -1995,7 +2342,6 @@ function installWorkflowToolResultContextBridge(pi: ExtensionAPI, getManager: ()
       !bridge.compacting &&
       bridge.treeFence?.phase !== "active" &&
       !providerSignalAborted &&
-      (!bridge.abortFence || Boolean(recoveryScope)) &&
       typeof bridge.manager.listPendingDeliveries === "function"
     ) {
       try {
@@ -2052,6 +2398,27 @@ function installWorkflowToolResultContextBridge(pi: ExtensionAPI, getManager: ()
           bridge.pending = bridge.pending.filter((item) => item.id !== deliveryId);
           bridge.projectedForNextRequest = bridge.projectedForNextRequest.filter((item) => item.id !== deliveryId);
           bridge.includedInProviderRequest = bridge.includedInProviderRequest.filter((item) => item.id !== deliveryId);
+          bridge.wakeState.wakePendingIds.delete(deliveryId);
+          bridge.wakeState.wakeAttemptedIds.delete(deliveryId);
+          bridge.wakeState.wakeRequestIds.delete(deliveryId);
+          bridge.wakeState.activeLoopIds.delete(deliveryId);
+          bridge.arrivalOrdinalById.delete(deliveryId);
+          if (bridge.abortEpoch) bridge.abortEpoch.fencedIds.delete(deliveryId);
+          if (bridge.rotationCursor.committedCursor === deliveryId) bridge.rotationCursor.committedCursor = undefined;
+          if (bridge.rotationCursor.stagedCursor === deliveryId) bridge.rotationCursor.stagedCursor = undefined;
+          if (bridge.rotationCursor.associatedRequest) {
+            bridge.rotationCursor.associatedRequest.deliveryIds =
+              bridge.rotationCursor.associatedRequest.deliveryIds.filter((id) => id !== deliveryId);
+            if (bridge.rotationCursor.associatedRequest.stagedCursor === deliveryId) {
+              bridge.rotationCursor.associatedRequest = undefined;
+              bridge.rotationCursor.stagedCursor = undefined;
+            } else if (
+              bridge.rotationCursor.associatedRequest.deliveryIds.length === 0 &&
+              bridge.rotationCursor.associatedRequest.stagedCursor === undefined
+            ) {
+              bridge.rotationCursor.associatedRequest = undefined;
+            }
+          }
           rememberDelivery(bridge, deliveryId);
         }
 
@@ -2086,29 +2453,63 @@ function installWorkflowToolResultContextBridge(pi: ExtensionAPI, getManager: ()
         >();
         for (const delivery of bridge.pending) {
           if (!suppressedTerminalIds.has(delivery.id)) {
+            admitWorkflowWake(bridge, delivery);
             candidates.set(delivery.id, { delivery, record: recordsById.get(delivery.id) });
           }
         }
         for (const record of records) {
           if (suppressedTerminalIds.has(record.deliveryId) || candidates.has(record.deliveryId)) continue;
-          candidates.set(record.deliveryId, { delivery: deliveryFromOutboxRecord(bridge.manager, record), record });
+          const delivery = deliveryFromOutboxRecord(bridge.manager, record);
+          admitWorkflowWake(bridge, delivery);
+          candidates.set(record.deliveryId, { delivery, record });
         }
 
-        const orderedCandidates = [...candidates.values()].sort((left, right) => {
-          const priorityDelta =
+        const sortedCandidates = [...candidates.values()].sort((left, right) => {
+          // A blocking output wait is the one bounded exception to the normal
+          // wake frontier: it must bypass an already-full unrelated page.
+          const outputWaitDelta =
             Number(priorityDeliveryIds?.has(right.delivery.id) === true) -
             Number(priorityDeliveryIds?.has(left.delivery.id) === true);
-          if (priorityDelta !== 0) return priorityDelta;
+          if (outputWaitDelta !== 0) return outputWaitDelta;
+          // Wake-pending bodies are the admission frontier. Keep them ahead of
+          // replay/rotation history so an explicit arrival cannot wait behind a
+          // full page of already-acknowledged custom entries.
+          const wakeDelta =
+            Number(bridge.wakeState.wakePendingIds.has(right.delivery.id)) -
+            Number(bridge.wakeState.wakePendingIds.has(left.delivery.id));
+          if (wakeDelta !== 0) return wakeDelta;
           return (
             Number(right.delivery.customType === "workflow-result") -
             Number(left.delivery.customType === "workflow-result")
           );
         });
+        const outputWaitCandidates = sortedCandidates.filter(
+          ({ delivery }) => priorityDeliveryIds?.has(delivery.id) === true,
+        );
+        const wakeCandidates = sortedCandidates.filter(
+          ({ delivery }) =>
+            priorityDeliveryIds?.has(delivery.id) !== true && bridge.wakeState.wakePendingIds.has(delivery.id),
+        );
+        const rotationCandidates = sortedCandidates.filter(
+          ({ delivery }) =>
+            priorityDeliveryIds?.has(delivery.id) !== true && !bridge.wakeState.wakePendingIds.has(delivery.id),
+        );
+        const committedCursor = bridge.rotationCursor.committedCursor;
+        const cursorIndex = committedCursor
+          ? rotationCandidates.findIndex(({ delivery }) => delivery.id === committedCursor)
+          : -1;
+        const rotatedCandidates =
+          cursorIndex >= 0
+            ? [...rotationCandidates.slice(cursorIndex + 1), ...rotationCandidates.slice(0, cursorIndex + 1)]
+            : rotationCandidates;
+        // Reserve the bounded page for the blocking wait and wake-pending IDs;
+        // only the remainder participates in stable-ID rotation. The recovery
+        // loop below stops at 64/256KB, leaving excluded IDs unattempted.
+        const orderedCandidates = [...outputWaitCandidates, ...wakeCandidates, ...rotatedCandidates];
         const recovered: any[] = [];
         let recoveredBytes = 0;
         for (const { delivery, record } of orderedCandidates) {
           if (!delivery.id || present.has(delivery.id) || bridge.delivered.has(delivery.id)) continue;
-          if (strictRecoveryDeliveryIds && !strictRecoveryDeliveryIds.has(delivery.id)) continue;
           if (isUncertainInCurrentGeneration(bridge, delivery.id)) continue;
           if (recovered.length >= WORKFLOW_BRIDGE_IN_FLIGHT_LIMIT) break;
           const payloadBytes = Buffer.byteLength(delivery.content, "utf8");
@@ -2144,12 +2545,7 @@ function installWorkflowToolResultContextBridge(pi: ExtensionAPI, getManager: ()
               },
             };
             bridge.awaitingAck.set(delivery.id, submitted);
-            // Same split as the history path: transport acknowledged is not
-            // context consumed. Keep the payload eligible until a stop+text
-            // turn actually uses it.
-            if (!bridge.visiblePending.has(delivery.id)) {
-              bridge.visiblePending.set(delivery.id, { delivery: submitted, generation });
-            }
+            admitWorkflowWake(bridge, submitted);
           }
 
           recoveredBytes += payloadBytes;
@@ -2188,20 +2584,45 @@ function installWorkflowToolResultContextBridge(pi: ExtensionAPI, getManager: ()
       }
     }
     const output: any[] = [];
-    const sourceMessages = event.messages as any[];
+    const sourceMessages = rotateWorkflowHistoryMessages(
+      event.messages as any[],
+      bridge?.rotationCursor.committedCursor,
+    );
     const reservedPriorityIndexes = new Set<number>();
     let reservedPriorityBytes = 0;
     let reservedPriorityCount = 0;
-    if (priorityDeliveryIds?.size) {
+    if (bridge && (priorityDeliveryIds?.size || bridge.wakeState.wakePendingIds.size)) {
+      const priorityIndexes = Array.from({ length: sourceMessages.length }, (_, index) => index).sort((left, right) => {
+        const leftMessage = sourceMessages[left];
+        const rightMessage = sourceMessages[right];
+        const leftDetails =
+          leftMessage?.details && typeof leftMessage.details === "object"
+            ? (leftMessage.details as WorkflowDeliveryDetails)
+            : undefined;
+        const rightDetails =
+          rightMessage?.details && typeof rightMessage.details === "object"
+            ? (rightMessage.details as WorkflowDeliveryDetails)
+            : undefined;
+        const leftId = typeof leftDetails?.deliveryId === "string" ? leftDetails.deliveryId : undefined;
+        const rightId = typeof rightDetails?.deliveryId === "string" ? rightDetails.deliveryId : undefined;
+        const leftOutputWait = Number(Boolean(leftId && priorityDeliveryIds?.has(leftId)));
+        const rightOutputWait = Number(Boolean(rightId && priorityDeliveryIds?.has(rightId)));
+        if (leftOutputWait !== rightOutputWait) return rightOutputWait - leftOutputWait;
+        const leftWake = Number(Boolean(leftId && bridge.wakeState.wakePendingIds.has(leftId)));
+        const rightWake = Number(Boolean(rightId && bridge.wakeState.wakePendingIds.has(rightId)));
+        return rightWake - leftWake;
+      });
       const reservedIds = new Set<string>();
-      for (let index = 0; index < sourceMessages.length; index++) {
+      for (const index of priorityIndexes) {
         const message = sourceMessages[index];
         if (message?.role !== "custom" || !PROVIDER_WORKFLOW_CUSTOM_TYPES.has(message.customType)) continue;
         const details = (
           message.details && typeof message.details === "object" ? message.details : {}
         ) as WorkflowDeliveryDetails;
         const deliveryId = typeof details.deliveryId === "string" ? details.deliveryId : undefined;
-        if (!deliveryId || !priorityDeliveryIds.has(deliveryId) || reservedIds.has(deliveryId)) continue;
+        const wakePending = Boolean(deliveryId && bridge.wakeState.wakePendingIds.has(deliveryId));
+        const outputWaitPriority = Boolean(deliveryId && priorityDeliveryIds?.has(deliveryId));
+        if (!deliveryId || (!wakePending && !outputWaitPriority) || reservedIds.has(deliveryId)) continue;
         const rawText = customMessageText(message.content) || "(empty workflow delivery)";
         const text = boundedWorkflowContent(providerWorkflowDeliveryText(message.customType, redactForModel(rawText)));
         const bytes = Buffer.byteLength(text, "utf8");
@@ -2221,6 +2642,7 @@ function installWorkflowToolResultContextBridge(pi: ExtensionAPI, getManager: ()
     let priorityBytesRemaining = reservedPriorityBytes;
     let priorityCountRemaining = reservedPriorityCount;
     const projectedDeliveryIds = new Set<string>();
+    const projectedPageIds: string[] = [];
     const pendingWorkflowNotifications: Array<{ toolCall: any; toolResult: any; timestamp: number }> = [];
     const outstandingSourceToolCalls = new Set<string>();
     const flushWorkflowNotifications = (assistantOverride?: any): void => {
@@ -2312,13 +2734,6 @@ function installWorkflowToolResultContextBridge(pi: ExtensionAPI, getManager: ()
         message.details && typeof message.details === "object" ? message.details : {}
       ) as WorkflowDeliveryDetails;
       const sourceDeliveryId = typeof sourceDetails.deliveryId === "string" ? sourceDetails.deliveryId : undefined;
-      if (strictRecoveryDeliveryIds && (!sourceDeliveryId || !strictRecoveryDeliveryIds.has(sourceDeliveryId))) {
-        // The hidden recovery turn is scoped to the exact canonical IDs that
-        // existed at Esc. Older backlog and post-Esc arrivals remain passive
-        // for the next genuine prompt, regardless of available context space.
-        if (bridge) bridge.deferBacklogWake = true;
-        continue;
-      }
       if (sourceDeliveryId && projectedDeliveryIds.has(sourceDeliveryId)) continue;
 
       const rawText = customMessageText(message.content) || "(empty workflow delivery)";
@@ -2344,7 +2759,22 @@ function installWorkflowToolResultContextBridge(pi: ExtensionAPI, getManager: ()
       }
       workflowContextCount += 1;
       workflowContextBytes += payloadBytes;
-      if (sourceDeliveryId) projectedDeliveryIds.add(sourceDeliveryId);
+      if (sourceDeliveryId) {
+        projectedDeliveryIds.add(sourceDeliveryId);
+        projectedPageIds.push(sourceDeliveryId);
+        // A current-generation outbox/awaiting entry already owns wake and
+        // transport state. A history-only body remains visible and participates
+        // in rotation, but must not recreate either state after acknowledgement.
+        if (bridge && hasCurrentWorkflowTransportTracking(bridge, sourceDeliveryId)) {
+          admitWorkflowWake(bridge, {
+            id: sourceDeliveryId,
+            customType: message.customType,
+            content: rawText,
+            details: sourceDetails,
+            wake: true,
+          });
+        }
+      }
       const boundedDetail = (value: unknown, bytes: number): string | undefined =>
         typeof value === "string" ? truncateUtf8(value, bytes, "…") : undefined;
       const details: WorkflowDeliveryDetails = {
@@ -2377,11 +2807,34 @@ function installWorkflowToolResultContextBridge(pi: ExtensionAPI, getManager: ()
       // batch, and after_provider_response acknowledges only a successful HTTP
       // response for that request. This fences late old-session context events
       // from acknowledging a newer generation's resend.
-      if (details.deliveryId && bridge && !providerSignalAborted && !bridge.delivered.has(details.deliveryId)) {
+      const hasRecoverableTransport = Boolean(
+        details.deliveryId &&
+          bridge &&
+          (hasWorkflowOutboxRecord(bridge, details.deliveryId) ||
+            hasCurrentWorkflowTransportTracking(bridge, details.deliveryId)),
+      );
+      if (
+        details.deliveryId &&
+        bridge &&
+        !providerSignalAborted &&
+        (!bridge.delivered.has(details.deliveryId) || hasRecoverableTransport)
+      ) {
         const generation = bridge.generation;
         let awaiting = bridge.awaitingAck.get(details.deliveryId);
         const uncertain = bridge.uncertainAck.get(details.deliveryId);
-        if (
+        // A provider-consumed body parked by an ack-failure must never be
+        // promoted back into wake/ack tracking by context re-observation. The
+        // body still projects below (Part A visibility); only the durable
+        // reconcile retires its record, without spending another marker. An
+        // awaitingAck entry is generation-pinned and would mean a duplicate
+        // current submission, so it can only come from the provider-consumed
+        // park; retire it so it cannot re-arm a wake after reconcile. The
+        // provider-consumed park also short-circuits every tracking/wake
+        // rebuild for this ID below, but never the body projection itself.
+        if (uncertain?.providerConsumed === true) {
+          bridge.awaitingAck.delete(details.deliveryId);
+          awaiting = undefined;
+        } else if (
           awaiting?.details?.deliveryGeneration !== generation &&
           uncertain?.generation === generation &&
           uncertain.delivery.details?.deliveryGeneration === generation
@@ -2394,23 +2847,26 @@ function installWorkflowToolResultContextBridge(pi: ExtensionAPI, getManager: ()
           bridge.awaitingAck.set(details.deliveryId, awaiting);
         }
 
-        if (awaiting?.details?.deliveryGeneration !== generation) {
+        if (uncertain?.providerConsumed !== true && awaiting?.details?.deliveryGeneration !== generation) {
           // A reload can leave the canonical custom entry in session history
           // while its durable outbox record is still pending under an older
-          // generation. Re-admit that same entry; never send a duplicate.
+          // generation. Re-admit that same entry; never send a duplicate. A
+          // history entry without that outbox record is intentionally passive:
+          // it is body projection only, not a new acknowledgement candidate.
           const record = bridge.manager
             .listPendingDeliveries()
             .find((candidate) => candidate.deliveryId === details.deliveryId);
-          if (persistDeliveryPhase(bridge.manager, record?.runId, details.deliveryId, generation, "submitted")) {
+          if (
+            record &&
+            persistDeliveryPhase(bridge.manager, record.runId, details.deliveryId, generation, "submitted")
+          ) {
             awaiting = {
               id: details.deliveryId,
               customType: message.customType,
               content: message.content,
               details: {
                 ...sourceDetails,
-                // Only a real outbox record is durable. Compatibility/history
-                // entries use the manager's in-memory admission marker.
-                deliveryId: record ? details.deliveryId : undefined,
+                deliveryId: details.deliveryId,
                 deliveryGeneration: generation,
                 deliverySubmitted: true,
               },
@@ -2421,15 +2877,9 @@ function installWorkflowToolResultContextBridge(pi: ExtensionAPI, getManager: ()
           }
         }
 
-        if (awaiting?.details?.deliveryGeneration === generation) {
+        if (uncertain?.providerConsumed !== true && awaiting?.details?.deliveryGeneration === generation) {
           details.deliveryGeneration = generation;
-          // Transport already acknowledged this exact entry, but the model has
-          // not yet produced a stop+text answer that consumed it. Keep the
-          // payload eligible for re-projection so a tool-only or aborted turn
-          // cannot hide the content from the model.
-          if (!bridge.visiblePending.has(details.deliveryId)) {
-            bridge.visiblePending.set(details.deliveryId, { delivery: awaiting, generation });
-          }
+          admitWorkflowWake(bridge, awaiting);
           if (
             !bridge.projectedForNextRequest.some(
               (item) => item.id === details.deliveryId && item.generation === generation,
@@ -2486,6 +2936,11 @@ function installWorkflowToolResultContextBridge(pi: ExtensionAPI, getManager: ()
         flushWorkflowNotifications(owner);
       }
     }
+    if (bridge && !providerSignalAborted && projectedPageIds.length > 0) {
+      // Context computes only a staged stable-ID cursor. before_provider_request
+      // associates it; a 2xx response is the sole commit point.
+      bridge.rotationCursor.stagedCursor = projectedPageIds.at(-1);
+    }
     return { messages: output };
   });
 
@@ -2495,14 +2950,67 @@ function installWorkflowToolResultContextBridge(pi: ExtensionAPI, getManager: ()
     try {
       if ((ctx as ExtensionContext | undefined)?.signal?.aborted === true) {
         bridge.projectedForNextRequest = [];
+        bridge.includedInProviderRequest = [];
+        bridge.wakeState.wakeRequestIds.clear();
+        bridge.rotationCursor.stagedCursor = undefined;
+        bridge.rotationCursor.associatedRequest = undefined;
         return;
       }
     } catch {
       bridge.projectedForNextRequest = [];
+      bridge.includedInProviderRequest = [];
+      bridge.wakeState.wakeRequestIds.clear();
+      bridge.rotationCursor.stagedCursor = undefined;
+      bridge.rotationCursor.associatedRequest = undefined;
       return;
     }
-    if (bridge.projectedForNextRequest.length === 0) return;
+    const stagedCursor = bridge.rotationCursor.stagedCursor;
+    if (bridge.projectedForNextRequest.length === 0 && !stagedCursor) {
+      // This is a new provider request with no workflow body. Drop every
+      // association left by an earlier failed request; otherwise an unrelated
+      // 2xx response could retire that old request's IDs and wake backlog.
+      bridge.includedInProviderRequest = [];
+      bridge.wakeState.wakeRequestIds.clear();
+      bridge.rotationCursor.stagedCursor = undefined;
+      bridge.rotationCursor.associatedRequest = undefined;
+      return;
+    }
     const batch = bridge.projectedForNextRequest.splice(0, bridge.projectedForNextRequest.length);
+    // A new provider request gets a fresh transport association. A prior
+    // non-2xx response may have retained IDs for an explicit retry; if the host
+    // starts a different request, those old IDs must not be attributed to its
+    // response or to its rotation cursor.
+    bridge.includedInProviderRequest = [];
+    bridge.wakeState.wakeRequestIds.clear();
+    bridge.rotationCursor.associatedRequest = {
+      generation: bridge.generation,
+      deliveryIds: [...new Set(batch.map((item) => item.id))],
+      stagedCursor,
+    };
+    bridge.rotationCursor.stagedCursor = undefined;
+    for (const item of batch) {
+      if (!bridge.wakeState.wakePendingIds.has(item.id)) continue;
+      bridge.wakeState.wakeRequestIds.add(item.id);
+      const hiddenMarkerOwnsRequest =
+        bridge.wakeState.inFlight &&
+        (bridge.wakeState.inFlightRunToken === undefined ||
+          bridge.wakeState.inFlightRunToken === bridge.activeRunToken);
+      if (hiddenMarkerOwnsRequest && !isFencedFromWake(bridge, item.id)) {
+        // Only IDs actually present in this hidden-marker provider request count
+        // as attempted. A racing user prompt may include the body but cannot
+        // spend the hidden wake attempt; overflow IDs remain unattempted.
+        bridge.wakeState.wakeAttemptedIds.add(item.id);
+      }
+      if (hiddenMarkerOwnsRequest && bridge.wakeState.inFlightRunToken !== undefined) {
+        // The marker's agent_start suppressed every later prompt while it was
+        // active, so a provider request under its ownership means this is still
+        // the marker turn and the marker just settled (before_provider_request
+        // fires after the prompt settles). Transfer the ownership proof: the
+        // settle already passed; the marker token is spent exactly once.
+        bridge.wakeState.settledMarkerRunTokens?.delete(bridge.wakeState.inFlightRunToken);
+        bridge.wakeState.inFlightRunToken = undefined;
+      }
+    }
     const outputWait = bridge.outputWaitState;
     const outputWaitDeliveryIds = outputWait?.deliveryIds?.length ? new Set(outputWait.deliveryIds) : undefined;
     if (
@@ -2517,8 +3025,7 @@ function installWorkflowToolResultContextBridge(pi: ExtensionAPI, getManager: ()
     ) {
       // The exact run that released the blocking tool is now part of a real
       // provider request. A later Esc belongs to that provider turn and must
-      // retain ordinary stop semantics rather than reopening the wait. A
-      // special recovery scope instead lasts through every request in its run.
+      // retain ordinary stop semantics rather than reopening the wait.
       bridge.outputWaitState = undefined;
     }
     // before_provider_request acknowledges inclusion only. Keep each stable ID
@@ -2539,14 +3046,17 @@ function installWorkflowToolResultContextBridge(pi: ExtensionAPI, getManager: ()
               // a failed acknowledgement takes the normal durable retry path.
               console.warn("[workflow-delivery] durable projected transition failed; awaiting provider response");
             }
-            if (
-              !bridge.includedInProviderRequest.some(
-                (included) => included.id === item.id && included.generation === item.generation,
-              )
-            ) {
-              bridge.includedInProviderRequest.push(item);
-            }
           }
+        }
+        if (
+          !bridge.includedInProviderRequest.some(
+            (included) => included.id === item.id && included.generation === item.generation,
+          )
+        ) {
+          // Even a legacy/in-memory custom history entry without a durable
+          // outbox record must have a request association so a 2xx can retire
+          // its wake-pending ID without a second marker loop.
+          bridge.includedInProviderRequest.push(item);
         }
         continue;
       }
@@ -2572,26 +3082,32 @@ function installWorkflowToolResultContextBridge(pi: ExtensionAPI, getManager: ()
   pi.on("after_provider_response", (event) => {
     const bridge = ownedBridgeFor(getManager(), pi);
     if (!bridge) return;
-    if (bridge.providerAckFenceGeneration === bridge.generation) {
-      // The hook API exposes no request identity. Never let a response clear
-      // its own abort fence: providers may report multiple retry responses, and
-      // a later old 2xx could otherwise acknowledge a newer request. The host's
-      // agent_settled boundary is the only proof that no old response hook can
-      // still race the next prompt.
+    const abortEpoch = bridge.abortEpoch;
+    if (
+      abortEpoch &&
+      bridge.providerAckFenceGeneration !== undefined &&
+      bridge.providerAckFenceGeneration === bridge.generation
+    ) {
+      // The hook has no request ID. Until the interrupted run settles, a late
+      // response from the aborted request must not acknowledge a replacement
+      // request. Passive/new arrivals remain projectable during this fence.
       return;
     }
-    if (bridge.includedInProviderRequest.length === 0) return;
+    const associatedCursor = bridge.rotationCursor.associatedRequest;
+    const hasCursorAssociation =
+      associatedCursor?.generation === bridge.generation && associatedCursor.stagedCursor !== undefined;
+    if (bridge.includedInProviderRequest.length === 0 && !hasCursorAssociation) return;
     const successfulResponse = Number.isInteger(event.status) && event.status >= 200 && event.status < 300;
     if (!successfulResponse) {
-      // Some providers report each HTTP retry attempt. Keep the original
-      // request association intact across 429/5xx responses: a later 2xx can
-      // acknowledge it, while agent_settled cannot create a duplicate wake.
-      // A final transport failure remains bounded by the acknowledgement
-      // watchdog and can be re-observed from the persisted custom message on a
-      // later real user turn without another sendMessage call.
+      // A failed response never commits a rotated page. Keep transport IDs for
+      // provider retry, but discard only the cursor association/staged value.
+      bridge.rotationCursor.associatedRequest = undefined;
+      bridge.rotationCursor.stagedCursor = undefined;
+      bridge.deferBacklogWake = true;
       return;
     }
     const included = bridge.includedInProviderRequest.splice(0, bridge.includedInProviderRequest.length);
+    const requestIds = new Set(bridge.wakeState.wakeRequestIds);
     let deferredRetry = false;
     for (const item of included) {
       const awaiting = bridge.awaitingAck.get(item.id);
@@ -2602,11 +3118,7 @@ function installWorkflowToolResultContextBridge(pi: ExtensionAPI, getManager: ()
           if (record) {
             if (persistDeliveryPhase(bridge.manager, record.runId, item.id, item.generation, "acknowledged")) {
               rememberDelivery(bridge, item.id);
-              // Transport acknowledged, but the model may not have consumed the
-              // content yet. Keep the payload eligible for re-projection until
-              // message_end observes a genuine stop+text answer.
-              const delivery = deliveryFromOutboxRecord(bridge.manager, record);
-              bridge.visiblePending.set(item.id, { delivery, generation: item.generation });
+              if (requestIds.has(item.id)) bridge.wakeState.wakePendingIds.delete(item.id);
             } else {
               queueWorkflowDelivery(bridge, deliveryFromOutboxRecord(bridge.manager, record));
               scheduleWorkflowDeliveryRetry(bridge, item.id, bridge.generation);
@@ -2629,9 +3141,20 @@ function installWorkflowToolResultContextBridge(pi: ExtensionAPI, getManager: ()
       bridge.awaitingAck.delete(item.id);
       clearWorkflowAckWatchdog(bridge, item.id, item.generation);
       rememberDelivery(bridge, item.id);
-      // Same split as above: transport is settled, context consumption is not.
-      bridge.visiblePending.set(item.id, { delivery: awaiting, generation: item.generation });
+      if (requestIds.has(item.id)) bridge.wakeState.wakePendingIds.delete(item.id);
     }
+    bridge.wakeState.wakeRequestIds.clear();
+    if (associatedCursor?.generation === bridge.generation && associatedCursor.stagedCursor) {
+      const associatedIds = new Set(associatedCursor.deliveryIds);
+      const responseIds = new Set(
+        included.filter((item) => item.generation === associatedCursor.generation).map((item) => item.id),
+      );
+      const associationMatches =
+        associatedIds.size === responseIds.size && [...associatedIds].every((id) => responseIds.has(id));
+      if (associationMatches && !deferredRetry) bridge.rotationCursor.committedCursor = associatedCursor.stagedCursor;
+    }
+    bridge.rotationCursor.associatedRequest = undefined;
+    bridge.rotationCursor.stagedCursor = undefined;
     if (!deferredRetry) flushWorkflowBridge(bridge);
   });
 }
@@ -2681,17 +3204,21 @@ function installWorkflowEscRecovery(pi: ExtensionAPI, getManager: () => Workflow
   pi.on("input", (event) => {
     const bridge = ownedBridgeFor(getManager(), pi);
     if (!bridge) return undefined;
+    // Any input event invalidates the settled latch, including an empty submit
+    // or an input observed while a host mutation is still unwinding.
+    bridge.safeWakeReady = false;
     if (typeof event.text !== "string" || event.text.trim().length === 0) return undefined;
     if (bridge.suspended || bridge.compacting || bridge.treeFence) return undefined;
-    // A steer/follow-up is queued into the already-running agent loop. It does
-    // not open a new prompt and must not release the abort fence or arm the
-    // idle→agent_start race latch.
+    // A steer/follow-up is queued into the already-running agent loop, so it
+    // must not release the abort fence or arm a new prompt, but it still makes
+    // the old safe point unusable.
     if (event.streamingBehavior !== undefined) return undefined;
     bridge.outputWaitState = undefined;
-    bridge.recoveryScope = undefined;
-    bridge.autonomousWakeSpent = false;
     bridge.autonomousPromptStarting = false;
-    if (bridge.abortFence) bridge.abortFence = false;
+    if (bridge.abortEpoch) bridge.abortEpoch.userReleased = true;
+    bridge.wakeState.wakeAttemptedIds.clear();
+    bridge.wakeState.wakeRequestIds.clear();
+    bridge.safeWakeReady = false;
     bridge.deferBacklogWake = false;
     markWorkflowPromptStarting(bridge);
     resumeWorkflowAckWatchdogs(bridge);
@@ -2957,6 +3484,11 @@ export default function extension(pi: ExtensionAPI) {
 
     const bridge = bridgeFor(manager);
     if (bridge) {
+      bridge.getActiveBranch = () => {
+        const branch = ctx.sessionManager?.getBranch?.();
+        if (!Array.isArray(branch)) throw new Error("active branch unavailable");
+        return branch;
+      };
       const historyIds = new Set<string>();
       try {
         const entries = ctx.sessionManager?.getBranch?.() ?? [];
@@ -2983,14 +3515,21 @@ export default function extension(pi: ExtensionAPI) {
         if (!recoverableHistoryIds.has(deliveryId)) rememberDelivery(bridge, deliveryId);
       }
       bridge.deferBacklogWake = false;
+      bridge.abortEpoch = undefined;
       bridge.providerAckFenceGeneration = undefined;
+      bridge.activeRunToken = undefined;
+      bridge.wakeState.wakeAttemptedIds.clear();
+      bridge.wakeState.wakeRequestIds.clear();
+      bridge.wakeState.inFlight = false;
+      bridge.wakeState.inFlightEpoch = undefined;
+      bridge.wakeState.inFlightRunToken = undefined;
+      bridge.wakeState.settledMarkerRunTokens?.clear();
+      bridge.wakeState.activeLoopIds.clear();
       bridge.outputWaitState = undefined;
-      bridge.recoveryScope = undefined;
       bridge.treeFence = undefined;
       bridge.compacting = false;
       bridge.hostMutationWakeFence = false;
       bridge.autonomousPromptStarting = false;
-      bridge.autonomousWakeSpent = false;
       bridge.isHostIdle = () => {
         try {
           return ctx.isIdle();
@@ -2998,6 +3537,22 @@ export default function extension(pi: ExtensionAPI) {
           return false;
         }
       };
+      const hostHasPendingMessages = (ctx as unknown as { hasPendingMessages?: () => boolean }).hasPendingMessages;
+      bridge.hasPendingMessages =
+        typeof hostHasPendingMessages === "function"
+          ? () => {
+              try {
+                // Treat any non-false/unknown result as pending.
+                return hostHasPendingMessages.call(ctx) !== false;
+              } catch {
+                // A probe failure is equivalent to an unknown pending queue:
+                // workflowSafeWakeReady() must refuse an autonomous wake.
+                return true;
+              }
+            }
+          : undefined;
+      bridge.rotationCursor = {};
+      bridge.safeWakeReady = false;
       clearWorkflowPromptStarting(bridge);
     }
 

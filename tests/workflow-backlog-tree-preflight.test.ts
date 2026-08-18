@@ -42,6 +42,7 @@ function startSession(handlers: Record<string, Handler[]>, isIdle: () => boolean
         sessionManager: { getSessionId: () => "backlog-tree-preflight", getBranch: () => branchEntries },
         ui: { setWidget: () => {}, notify: () => {} },
         isIdle,
+        hasPendingMessages: () => false,
       },
     );
   }
@@ -206,7 +207,7 @@ test("tree navigation is fail-closed until session_tree or a real prompt release
   );
 });
 
-test("an aborted context preflight cannot acknowledge an omitted delivery on the next request", async () => {
+test("an aborted context preflight cannot establish a request association", async () => {
   await withHarness(
     () => false,
     async ({ handlers, sent, manager }) => {
@@ -238,26 +239,11 @@ test("an aborted context preflight cannot acknowledge an omitted delivery on the
         "the omitted request must not falsely retire the delivery; it remains replayable",
       );
       for (const handler of handlers.after_provider_response ?? []) handler({ status: 200, headers: {} });
-      // Transport ack alone does not remove the payload; only a final
-      // stop+text turn (no further tool calls) marks the delivery consumed.
-      for (const handler of handlers.turn_end ?? []) {
-        handler({
-          type: "turn_end",
-          turnIndex: 0,
-          message: {
-            role: "assistant",
-            stopReason: "stop",
-            content: [{ type: "text", text: "delivery acknowledged" }],
-          },
-          toolResults: [],
-        });
-      }
-
       const acknowledged = projectMessages(handlers, history);
       assert.equal(
         workflowResultMessages(acknowledged).length,
-        0,
-        "only the request that actually included the delivery may acknowledge it",
+        1,
+        "transport acknowledgement does not consume the custom body; it remains projected until compaction",
       );
     },
   );

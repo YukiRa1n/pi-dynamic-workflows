@@ -52,6 +52,7 @@ function startSession(
         sessionManager: { getSessionId: () => "compaction-test", getBranch: () => branchEntries },
         ui: { setWidget: () => {}, notify: () => {} },
         isIdle,
+        hasPendingMessages: () => false,
       },
     );
   }
@@ -180,12 +181,17 @@ test("workflow deliveries stay out of Steering across compaction boundaries", as
 
       for (const handler of handlers.agent_settled ?? []) handler({ type: "agent_settled" });
       await new Promise((resolve) => setTimeout(resolve, 20));
-      assert.equal(sent.length, 1, "the queued completion must flush at the settled safe point");
+      assert.equal(sent.length, 2, "the body and one UI-only marker flush at the settled safe point");
       assert.equal(sent[0]?.message.customType, "workflow-deliver");
-      assert.deepEqual(sent[0]?.options, { triggerTurn: true, deliverAs: "steer" });
-      for (const handler of handlers.before_agent_start ?? []) handler({ prompt: "threshold completion" });
+      assert.deepEqual(sent[0]?.options, { triggerTurn: false });
+      assert.equal(sent[1]?.message.customType, "workflows");
+      assert.deepEqual(sent[1]?.options, { triggerTurn: true });
+      // The hidden marker is its own empty-prompt run; drive it to completion so
+      // its in-flight latch releases before the next prompt.
+      for (const handler of handlers.before_agent_start ?? []) handler({ prompt: "" });
       startAgent(handlers, new AbortController().signal);
       for (const handler of handlers.agent_settled ?? []) handler({ type: "agent_settled" });
+      await new Promise((resolve) => setTimeout(resolve, 10));
 
       const manual = new AbortController();
       for (const handler of handlers.session_before_compact ?? []) {
@@ -195,21 +201,24 @@ test("workflow deliveries stay out of Steering across compaction boundaries", as
       for (const handler of handlers.session_compact ?? []) {
         handler({ type: "session_compact", reason: "manual" });
       }
-      assert.equal(sent.length, 2, "the compacted branch may receive passive history immediately");
-      assert.deepEqual(sent[1]?.options, { triggerTurn: false });
+      assert.equal(sent.length, 3, "the compacted branch may receive passive history immediately");
+      // sent = [threshold body, hidden marker, manual completion body]. The marker
+      // already consumed the in-flight wake slot, so the manual completion lands
+      // as passive history without spending a second marker.
+      assert.deepEqual(sent[2]?.options, { triggerTurn: false });
 
       await new Promise((resolve) => setTimeout(resolve, 30));
-      assert.equal(sent.length, 2, "manual compaction must not guess at a timer-based autonomous safe point");
+      assert.equal(sent.length, 3, "manual compaction must not guess at a timer-based autonomous safe point");
 
       const failed = new AbortController();
       for (const handler of handlers.session_before_compact ?? []) {
         handler({ ...beforeCompactEvent(failed.signal), reason: "manual" });
       }
       staged.manager.onDeliver?.("failed compaction completion");
-      assert.equal(sent.length, 2, "a provider-side compaction failure must remain fenced while unwinding");
+      assert.equal(sent.length, 3, "a provider-side compaction failure must remain fenced while unwinding");
       failed.abort();
       await new Promise((resolve) => setTimeout(resolve, 30));
-      assert.equal(sent.length, 2, "an abort signal is not proof that the host controller has unwound");
+      assert.equal(sent.length, 3, "an abort signal is not proof that the host controller has unwound");
 
       beginRealPrompt(handlers);
       const recovered = projectProviderRequest(handlers, [
@@ -225,7 +234,7 @@ test("workflow deliveries stay out of Steering across compaction boundaries", as
         ),
         "the next genuine prompt consumes the fail-closed backlog without a separate wake",
       );
-      assert.equal(sent.length, 2, "compaction recovery never enters the host Steering queue");
+      assert.equal(sent.length, 3, "compaction recovery never enters the host Steering queue");
 
       handlers.session_shutdown?.[0]?.({ reason: "quit" });
       discardWorkflowRuntime();
@@ -274,7 +283,7 @@ test("workflow delivery retries once after Pi rejects an abort-window send", asy
       assert.equal(attempts, 2, "abort backpressure gets one safe-point retry");
       assert.equal(sent.length, 1);
       assert.equal(sent[0]?.message.content, "critical retry");
-      assert.deepEqual(sent[0]?.options, { triggerTurn: true, deliverAs: "steer" });
+      assert.deepEqual(sent[0]?.options, { triggerTurn: false });
 
       handlers.session_shutdown?.[0]?.({ reason: "quit" });
       discardWorkflowRuntime();
@@ -497,7 +506,7 @@ test("compaction pauses ack deadlines instead of making an entry permanently unc
       // The watchdog had 40ms before compaction, but compaction lasted 70ms;
       // preserving the remaining duration means it is still pending now.
       await new Promise((resolve) => setTimeout(resolve, 10));
-      assert.equal(sent.length, 1, "compaction time must not consume the ack deadline");
+      assert.equal(sent.length, 2, "compaction may open one empty marker without duplicating the body");
 
       handlers.session_shutdown?.[0]?.({ reason: "quit" });
       discardWorkflowRuntime();
@@ -542,7 +551,7 @@ test("an uncertain delivery waits for the next session generation instead of res
       assert.equal(firstGeneration.length, 1, "timeout must not resend in the same generation");
       for (const handler of handlers.agent_settled ?? []) handler({ type: "agent_settled" });
       await new Promise((resolve) => setTimeout(resolve, 20));
-      assert.equal(firstGeneration.length, 1, "later safe points must preserve the same-generation fence");
+      assert.equal(firstGeneration.length, 2, "a safe point may send only the empty marker, never the body again");
       const stableId = firstGeneration[0]?.message.details.deliveryId;
 
       handlers.session_shutdown?.[0]?.({ reason: "reload" });
@@ -889,8 +898,12 @@ test("durable phase failures retry canonical history without duplicate sends", a
       for (const handler of handlers.agent_settled ?? []) handler({ type: "agent_settled" });
       await new Promise((resolve) => setTimeout(resolve, 20));
 
-      assert.equal(submittedAttempts, 3);
-      assert.equal(projectedAttempts, 2);
+      // The body was already consumed by the first 2xx, so the failed durable
+      // ack is reconciled without re-projecting the consumed payload: no second
+      // submitted/projected transition runs, only the durable acknowledge is
+      // retried to completion. Exactly one canonical entry and no duplicate wake.
+      assert.equal(submittedAttempts, 2);
+      assert.equal(projectedAttempts, 1);
       assert.equal(acknowledgedAttempts, 2);
       assert.equal(sent.length, 1, "successful acknowledgement leaves exactly one canonical custom entry");
 
@@ -996,7 +1009,7 @@ test("an abort during tool execution fences the delivery without an ack-timeout 
   }
 });
 
-test("Esc on a blocking workflow output consumes accumulated custom history exactly once", async () => {
+test("Esc keeps pre-cutoff workflow history passive until real input", async () => {
   const fakeHome = mkdtempSync(join(tmpdir(), "pi-dw-output-esc-consume-"));
   try {
     await withFakeHomeAsync(fakeHome, async () => {
@@ -1075,15 +1088,11 @@ test("Esc on a blocking workflow output consumes accumulated custom history exac
       hostIdle = true;
       for (const handler of handlers.agent_settled ?? []) handler({ type: "agent_settled" });
       await new Promise((resolve) => setTimeout(resolve, 20));
-      assert.equal(sent.length, 3, "settled opens exactly one hidden consumption turn");
-      assert.equal(sent[2]?.message.customType, "workflows");
-      assert.equal(sent[2]?.message.display, false);
-      assert.equal(sent[2]?.message.content, "");
-      assert.deepEqual(sent[2]?.options, { triggerTurn: true, deliverAs: "steer" });
+      assert.equal(sent.length, 2, "Esc does not auto-wake pre-cutoff deliveries");
       assert.equal(
         sent.filter(({ message }) => /finding already shown/.test(String(message.content))).length,
         2,
-        "the wake never resends either large canonical payload",
+        "the wake path never resends either canonical payload",
       );
 
       const continuation = new AbortController();
@@ -1105,7 +1114,6 @@ test("Esc on a blocking workflow output consumes accumulated custom history exac
           details: { runId, blocked: true, completed: false, interrupted: true },
           timestamp: 4,
         },
-        { role: "custom", ...sent[2]?.message, timestamp: 5 },
       ]);
       const workflowResults = projected.filter(
         (message: any) => message?.role === "toolResult" && message?.toolName === "workflow_message_notification",
@@ -1149,34 +1157,19 @@ test("Esc on a blocking workflow output consumes accumulated custom history exac
       );
 
       for (const handler of handlers.after_provider_response ?? []) handler({ status: 200, headers: {} });
-      // Transport ack alone does not remove the payload; only a final
-      // stop+text turn (no further tool calls) marks the delivery consumed.
-      for (const handler of handlers.turn_end ?? []) {
-        handler({
-          type: "turn_end",
-          turnIndex: 0,
-          message: {
-            role: "assistant",
-            stopReason: "stop",
-            content: [{ type: "text", text: "finding acknowledged" }],
-          },
-          toolResults: [],
-        });
-      }
       const replayed = projectMessages(handlers, [
         { role: "custom", ...sent[0]?.message, timestamp: 6 },
         { role: "custom", ...sent[1]?.message, timestamp: 7 },
-        { role: "custom", ...sent[2]?.message, timestamp: 8 },
       ]);
       assert.equal(
-        replayed.some((message: any) => message?.toolName === "workflow_message_notification"),
-        false,
-        "acknowledged custom history remains visible in UI but leaves future provider context",
+        replayed.filter((message: any) => message?.toolName === "workflow_message_notification").length,
+        2,
+        "acknowledged transport records remain projected until compaction",
       );
       for (const handler of handlers.agent_settled ?? []) handler({ type: "agent_settled" });
       for (const handler of handlers.agent_settled ?? []) handler({ type: "agent_settled" });
       await new Promise((resolve) => setTimeout(resolve, 20));
-      assert.equal(sent.length, 3, "acknowledgement and repeated settled events cannot re-wake");
+      assert.equal(sent.length, 2, "acknowledgement and repeated settled events cannot re-wake");
 
       handlers.session_shutdown?.[0]?.({ reason: "quit" });
       discardWorkflowRuntime();
@@ -1187,7 +1180,7 @@ test("Esc on a blocking workflow output consumes accumulated custom history exac
   }
 });
 
-test("a delivered output followed by Esc before provider continuation still consumes once", async () => {
+test("a delivered output followed by Esc keeps post-cutoff bodies projected", async () => {
   const fakeHome = mkdtempSync(join(tmpdir(), "pi-dw-output-yield-esc-race-"));
   try {
     await withFakeHomeAsync(fakeHome, async () => {
@@ -1257,7 +1250,7 @@ test("a delivered output followed by Esc before provider continuation still cons
       await new Promise((resolve) => setTimeout(resolve, 20));
       assert.equal(sent.length, 3, "the delivery/tool-end/Esc race starts one hidden recovery turn");
       assert.equal(sent[2]?.message.customType, "workflows");
-      assert.deepEqual(sent[2]?.options, { triggerTurn: true, deliverAs: "steer" });
+      assert.deepEqual(sent[2]?.options, { triggerTurn: true });
 
       hostIdle = false;
       const continuation = new AbortController();
@@ -1285,12 +1278,12 @@ test("a delivered output followed by Esc before provider continuation still cons
         projected.filter(
           (message: any) => message?.role === "toolResult" && message?.toolName === "workflow_message_notification",
         ).length,
-        1,
+        2,
       );
-      assert.doesNotMatch(
+      assert.match(
         JSON.stringify(projected),
         /arrived after Esc but before settled/,
-        "the recovery request is frozen to IDs that already existed at Esc",
+        "post-Esc bodies remain projected while the ordinal fence controls wake eligibility",
       );
       assert.equal(
         projected.some((message: any) => message?.role === "user"),
@@ -1310,7 +1303,7 @@ test("a delivered output followed by Esc before provider continuation still cons
       for (const handler of handlers.agent_settled ?? []) handler({ type: "agent_settled" });
       for (const handler of handlers.agent_settled ?? []) handler({ type: "agent_settled" });
       await new Promise((resolve) => setTimeout(resolve, 20));
-      assert.equal(sent.length, 4, "recovery never chains another autonomous Working turn");
+      assert.equal(sent.length, 5, "each newer arrival gets at most one safe-point marker");
 
       handlers.session_shutdown?.[0]?.({ reason: "quit" });
       discardWorkflowRuntime();
@@ -1321,7 +1314,7 @@ test("a delivered output followed by Esc before provider continuation still cons
   }
 });
 
-test("Esc before any workflow output keeps later completion behind the ordinary abort fence", async () => {
+test("Esc before output lets post-cutoff completion reach a safe marker", async () => {
   const fakeHome = mkdtempSync(join(tmpdir(), "pi-dw-empty-output-esc-fence-"));
   try {
     await withFakeHomeAsync(fakeHome, async () => {
@@ -1361,7 +1354,7 @@ test("Esc before any workflow output keeps later completion behind the ordinary 
         alertKind: "critical_finding",
       });
       assert.equal(sent.length, 1);
-      assert.equal(sent[0]?.options?.triggerTurn, false, "post-Esc output is frozen outside special recovery");
+      assert.equal(sent[0]?.options?.triggerTurn, false, "post-Esc output is passive custom history");
       for (const handler of handlers.tool_execution_end ?? []) {
         handler({
           type: "tool_execution_end",
@@ -1375,18 +1368,19 @@ test("Esc before any workflow output keeps later completion behind the ordinary 
       hostIdle = true;
       for (const handler of handlers.agent_settled ?? []) handler({ type: "agent_settled" });
       await new Promise((resolve) => setTimeout(resolve, 20));
-      assert.equal(sent.length, 1, "tool end cannot retroactively arm output that arrived after Esc");
+      assert.equal(sent.length, 2, "the post-Esc arrival may trigger one safe-point marker after settle");
+      assert.equal(sent[1]?.message.customType, "workflows");
 
       staged.manager.onDeliver?.("completion arrived after the user stopped waiting", {
         runId,
         workflowName: "empty output Esc",
         alertKind: "critical_finding",
       });
-      assert.equal(sent.length, 2);
-      assert.equal(sent[1]?.options?.triggerTurn, false, "later output must not reopen the dismissed turn");
+      assert.equal(sent.length, 3);
+      assert.equal(sent[2]?.options?.triggerTurn, false, "later output remains passive custom history");
       for (const handler of handlers.agent_settled ?? []) handler({ type: "agent_settled" });
       await new Promise((resolve) => setTimeout(resolve, 20));
-      assert.equal(sent.length, 2, "the stale interrupted-wait latch cannot create a hidden wake later");
+      assert.equal(sent.length, 3, "the marker batch does not re-send the passive body");
 
       handlers.session_shutdown?.[0]?.({ reason: "quit" });
       discardWorkflowRuntime();
@@ -1397,7 +1391,7 @@ test("Esc before any workflow output keeps later completion behind the ordinary 
   }
 });
 
-test("special Esc recovery reserves context for its run behind an older oversized backlog", async () => {
+test("Esc overflow remains deferred behind an older oversized backlog", async () => {
   const fakeHome = mkdtempSync(join(tmpdir(), "pi-dw-output-esc-priority-page-"));
   try {
     await withFakeHomeAsync(fakeHome, async () => {
@@ -1465,12 +1459,8 @@ test("special Esc recovery reserves context for its run behind an older oversize
       hostIdle = true;
       for (const handler of handlers.agent_settled ?? []) handler({ type: "agent_settled" });
       await new Promise((resolve) => setTimeout(resolve, 20));
-      const wakeIndex = sent.length - 1;
-      assert.equal(
-        sent[wakeIndex]?.message.customType,
-        "workflows",
-        "armed recovery bypasses ordinary backlog deferral",
-      );
+      const wakeIndex = sent.findIndex(({ message }) => message?.customType === "workflows");
+      assert.equal(wakeIndex, -1, "overflow remains deferred after an Esc boundary");
 
       hostIdle = false;
       const projected = projectProviderRequest(handlers, [
@@ -1490,7 +1480,6 @@ test("special Esc recovery reserves context for its run behind an older oversize
           details: { runId, blocked: true, completed: false, interrupted: true },
           timestamp: 22,
         },
-        { role: "custom", ...sent[wakeIndex]?.message, timestamp: 23 },
       ]);
       const workflowResults = projected.filter(
         (message: any) => message?.role === "toolResult" && message?.toolName === "workflow_message_notification",
@@ -1588,7 +1577,7 @@ test("busy workflow history that misses the current request gets one idle contin
   }
 });
 
-test("a large passive workflow burst is byte-paged and never replayed after acknowledgement", async () => {
+test("a large passive workflow burst rotates pages and remains projected until compaction", async () => {
   const fakeHome = mkdtempSync(join(tmpdir(), "pi-dw-byte-paged-history-"));
   try {
     await withFakeHomeAsync(fakeHome, async () => {
@@ -1631,20 +1620,8 @@ test("a large passive workflow burst is byte-paged and never replayed after ackn
       );
       const firstIds = new Set(firstResults.map((message: any) => message.toolCallId));
       for (const handler of handlers.after_provider_response ?? []) handler({ status: 200, headers: {} });
-      // Transport ack only: the page stays eligible until a final text turn.
-      for (const handler of handlers.turn_end ?? []) {
-        handler({
-          type: "turn_end",
-          turnIndex: 0,
-          message: {
-            role: "assistant",
-            stopReason: "stop",
-            content: [{ type: "text", text: "first page consumed" }],
-          },
-          toolResults: [],
-        });
-      }
-
+      // A successful transport retires only the request IDs; the custom body
+      // remains available to the context bridge until compaction.
       hostIdle = true;
       for (const handler of handlers.agent_settled ?? []) handler({ type: "agent_settled" });
       await new Promise((resolve) => setTimeout(resolve, 20));
@@ -1665,10 +1642,10 @@ test("a large passive workflow burst is byte-paged and never replayed after ackn
         (message: any) => message?.role === "toolResult" && message?.toolName === "workflow_message_notification",
       );
       const secondIds = new Set(secondResults.map((message: any) => message.toolCallId));
-      assert.equal(firstIds.size + secondIds.size, total);
+      assert.ok(secondIds.size > 0, "the next request receives another bounded page");
       assert.ok(
-        [...firstIds].every((id) => !secondIds.has(id)),
-        "the second page contains no acknowledged replay",
+        [...secondIds].some((id) => !firstIds.has(id)),
+        "the stable-ID cursor advances beyond the first page instead of starving later deliveries",
       );
       assert.equal(
         secondPage.filter((message: any) => message?.role === "user").length,
@@ -1676,23 +1653,10 @@ test("a large passive workflow burst is byte-paged and never replayed after ackn
         "only the real prompt crosses as user role",
       );
       for (const handler of handlers.after_provider_response ?? []) handler({ status: 200, headers: {} });
-      for (const handler of handlers.turn_end ?? []) {
-        handler({
-          type: "turn_end",
-          turnIndex: 1,
-          message: {
-            role: "assistant",
-            stopReason: "stop",
-            content: [{ type: "text", text: "second page consumed" }],
-          },
-          toolResults: [],
-        });
-      }
       const exhausted = projectMessages(handlers, history);
-      assert.equal(
-        exhausted.some((message: any) => message?.toolName === "workflow_message_notification"),
-        false,
-        "both acknowledged pages are absent from later provider requests",
+      assert.ok(
+        exhausted.filter((message: any) => message?.toolName === "workflow_message_notification").length > 0,
+        "custom bodies remain projected until compaction",
       );
 
       handlers.session_shutdown?.[0]?.({ reason: "quit" });
@@ -2348,8 +2312,10 @@ test("streaming steer and follow-up input do not release an Esc abort fence", as
 
       assert.ok(attempts.length >= 2, "the settled flush retries the failed passive history append");
       assert.ok(
-        attempts.every(({ options }) => options?.triggerTurn === false),
-        "streaming input must not turn a held delivery into an autonomous wake or Steering entry",
+        attempts.every(({ message, options }) =>
+          message?.customType === "workflows" ? options?.triggerTurn === true : options?.triggerTurn === false,
+        ),
+        "streaming input never sends workflow bodies through Steering; only the empty marker may wake",
       );
 
       handlers.session_shutdown?.[0]?.({ reason: "quit" });
