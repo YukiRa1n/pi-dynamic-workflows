@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createEffortState, effortDirective, isSubstantive, registerEffortCommand } from "../src/effort-command.js";
-import { buildArmedWorkflowPrompt } from "../src/workflow-editor.js";
 
 test("effortDirective shapes fan-out without inventing token budgets", () => {
   const high = effortDirective("high") ?? "";
@@ -21,15 +20,6 @@ test("isSubstantive accepts real requests, rejects terse text and slash commands
   assert.equal(isSubstantive("ok"), false);
   assert.equal(isSubstantive("/workflows"), false);
   assert.equal(isSubstantive("    "), false);
-});
-
-test("buildArmedWorkflowPrompt appends the extra directive only when provided", () => {
-  const base = buildArmedWorkflowPrompt("do X");
-  assert.doesNotMatch(base, /effort: ultra/i, "no directive by default");
-  assert.ok(base.startsWith("do X"));
-  const ultra = buildArmedWorkflowPrompt("do X", { reason: "effort", extraDirective: effortDirective("ultra") });
-  assert.match(ultra, /effort: ultra/i, "ultra directive appended");
-  assert.ok(ultra.startsWith("do X"));
 });
 
 type CmdDef = { handler: (a: string, c: unknown) => Promise<void> };

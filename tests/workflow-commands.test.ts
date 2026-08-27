@@ -4,8 +4,10 @@ import test from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { createEffortState, effortDirective } from "../src/effort-command.js";
 import { registerWorkflowCommands } from "../src/workflow-commands.js";
-import { buildForcedWorkflowPrompt, WORKFLOW_TOOL_NAME } from "../src/workflow-editor.js";
+import { buildForcedWorkflowPrompt } from "../src/workflow-editor.js";
 import type { WorkflowManager } from "../src/workflow-manager.js";
+
+const WORKFLOW_TOOL_NAME = "start_workflow";
 
 type Handler = (args: string, ctx: any) => Promise<void>;
 

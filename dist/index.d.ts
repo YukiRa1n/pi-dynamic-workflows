@@ -42,7 +42,7 @@ export { CapabilityClassification, CapabilityOrigin, CapabilitySupport, Diagnost
 export { registerWorkflowCommands } from "./workflow-commands.js";
 export type { ActiveWorkflowHandle, GetWorkflowOutputInput, GetWorkflowOutputResultDetails, ListActiveWorkflowsInput, ListActiveWorkflowsResultDetails, StopWorkflowInput, StopWorkflowResultDetails, WorkflowControlInput, WorkflowControlRunDetails, WorkflowControlToolOptions, } from "./workflow-control-tool.js";
 export { createGetWorkflowOutputTool, createListActiveWorkflowsTool, createStopWorkflowTool, createWorkflowControlTool, } from "./workflow-control-tool.js";
-export { type ArmReason, buildArmedWorkflowPrompt, buildForcedWorkflowPrompt, endsWithTrigger, hasTrigger, hasWorkflowRequestTrigger, type InstallWorkflowKeywordArmingOptions, installWorkflowKeywordArming, registerWorkflowProgressCommands, registerWorkflowTriggerCommand, type WorkflowModeState, } from "./workflow-editor.js";
+export { buildForcedWorkflowPrompt, registerWorkflowProgressCommands, } from "./workflow-editor.js";
 export type { ManagedRun, WorkflowManagerOptions } from "./workflow-manager.js";
 export { EXPLICIT_DELIVERY_RATE_WINDOW_MS, MAX_EXPLICIT_DELIVERIES_PER_RUN, MAX_EXPLICIT_DELIVERIES_PER_WINDOW, MAX_EXPLICIT_DELIVERY_BYTES_PER_RUN, WorkflowManager, } from "./workflow-manager.js";
 export type { WorkflowProjectPaths } from "./workflow-paths.js";

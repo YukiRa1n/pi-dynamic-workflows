@@ -6,7 +6,7 @@
  */
 import { existsSync, mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { MAX_AGENT_RETRIES, MAX_CONCURRENCY, normalizeKeywordTriggerWord } from "./config.js";
+import { MAX_AGENT_RETRIES, MAX_CONCURRENCY } from "./config.js";
 import { readJsonWithBackupRecovery, resolvePersistenceFs, writeJsonAtomicWithBackup } from "./fs-persistence.js";
 import { workflowHomeDir, workflowProjectPaths } from "./workflow-paths.js";
 /** Path to the user-level workflow settings JSON file (~/.pi/workflows/settings.json). */
@@ -76,12 +76,6 @@ function normalizeSettings(value) {
     const revision = normalizeInteger(raw._workflowSettingsRevision, 0, Number.MAX_SAFE_INTEGER);
     if (revision !== undefined)
         settings.revision = revision;
-    if (typeof raw.keywordTriggerEnabled === "boolean") {
-        settings.keywordTriggerEnabled = raw.keywordTriggerEnabled;
-    }
-    const keywordTriggerWord = normalizeKeywordTriggerWord(raw.keywordTriggerWord);
-    if (keywordTriggerWord !== undefined)
-        settings.keywordTriggerWord = keywordTriggerWord;
     if (raw.defaultAgentTimeoutMs === null) {
         settings.defaultAgentTimeoutMs = null;
     }

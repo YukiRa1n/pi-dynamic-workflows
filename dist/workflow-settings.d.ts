@@ -7,9 +7,6 @@
 export interface WorkflowSettings {
     /** Opaque persisted revision, exposed only so callers can opt into CAS saves. */
     revision?: number;
-    keywordTriggerEnabled?: boolean;
-    /** Literal keyword that arms workflows mode from interactive input. */
-    keywordTriggerWord?: string;
     defaultAgentTimeoutMs?: number | null;
     /**
      * Default hard token budget applied to runs that don't pass their own

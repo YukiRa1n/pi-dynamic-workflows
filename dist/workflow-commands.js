@@ -170,7 +170,7 @@ export function registerWorkflowCommands(pi, manager, opts = {}) {
                     const extra = effort && effort.level !== "off" ? effortDirective(effort.level) : undefined;
                     // `/workflows run` is an explicit, maximal-intent command — use the
                     // forcing directive (no "if it's a question just answer" escape),
-                    // distinct from the heuristic keyword/effort arming.
+                    // distinct from ordinary model-selected workflow invocation.
                     const armed = buildForcedWorkflowPrompt(prompt, extra);
                     ctx.ui.notify(`Running workflow: ${prompt.slice(0, 60)}${prompt.length > 60 ? "…" : ""}`, "info");
                     try {

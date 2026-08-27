@@ -23,13 +23,13 @@ import {
   type EffortState,
   installResultDelivery,
   installTaskPanel,
-  installWorkflowKeywordArming,
   loadWorkflowSettings,
   registerAllSavedWorkflows,
   registerBuiltinWorkflows,
   registerEffortCommand,
   registerWorkflowCommands,
   registerWorkflowModelsCommand,
+  registerWorkflowProgressCommands,
   resumeResultDelivery,
   saveWorkflowSettingsForCwd,
   suspendResultDelivery,
@@ -3262,7 +3262,7 @@ export default function extension(pi: ExtensionAPI) {
   let manager = previousRuntime?.manager ?? new WorkflowManager({ cwd, ...managerOptions });
   if (previousRuntime) manager.reconfigureAfterReload(managerOptions);
 
-  // Stable effort object: /effort and keyword arming close over this reference.
+  // Stable effort object: /effort and explicit workflow commands close over this reference.
   // When a handoff brings a different EffortState, copy the level in place
   // rather than rebinding the local binding.
   const effort: EffortState = (previousRuntime ?? runtimeClaim.versionMismatch)?.effort ?? createEffortState();
@@ -3405,7 +3405,7 @@ export default function extension(pi: ExtensionAPI) {
   // and Pi cannot unregister/replace a command's metadata once registered.
   registerEffortCommand(pi, effort);
 
-  let armingInstalled = false;
+  let progressCommandsInstalled = false;
   let escRecoveryInstalled = false;
 
   pi.on("session_start", (_event: unknown, ctx: ExtensionContext) => {
@@ -3567,19 +3567,14 @@ export default function extension(pi: ExtensionAPI) {
       cwd,
       loadSettings: () => loadWorkflowSettings({ cwd: getCwd() }),
     });
-    if (!armingInstalled) {
-      installWorkflowKeywordArming(pi, effort, {
-        settingsStore: {
-          load: () => loadWorkflowSettings({ cwd: getCwd() }),
-          save: (nextSettings) => saveWorkflowSettingsForCwd(nextSettings, getCwd()),
-        },
+    if (!progressCommandsInstalled) {
+      registerWorkflowProgressCommands(pi, {
+        load: () => loadWorkflowSettings({ cwd: getCwd() }),
+        save: (nextSettings) => saveWorkflowSettingsForCwd(nextSettings, getCwd()),
       });
-      armingInstalled = true;
+      progressCommandsInstalled = true;
     }
-    // Esc-recovery reads the final (possibly keyword-transformed) input text, so
-    // it registers after keyword arming: a read-only matcher that runs last and
-    // never shadows the arming handler's input[0] position. Guarded because
-    // session_start fires on every reload.
+    // Guarded because session_start fires on every reload.
     if (!escRecoveryInstalled) {
       installWorkflowEscRecovery(pi, getManager);
       escRecoveryInstalled = true;

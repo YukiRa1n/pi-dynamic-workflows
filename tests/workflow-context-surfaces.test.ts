@@ -28,7 +28,7 @@ test("workflow context measurement reports Pi-rendered prompt and provider tool 
   const artifact = measureWorkflowContextSurfaces(ROOT);
   assert.deepEqual(JSON.parse(renderWorkflowContextMeasurement()), artifact);
 
-  assert.equal(artifact.formatVersion, 9);
+  assert.equal(artifact.formatVersion, 10);
   assert.equal(artifact.encoding, "utf8");
   assert.deepEqual(artifact.sources, [
     "src/workflow-tool.ts",
@@ -65,13 +65,6 @@ test("workflow context measurement reports Pi-rendered prompt and provider tool 
   for (const skill of artifact.surfaces.registeredSkillsDiscovery.skills) {
     assert.ok(skill.bytes > 0, `${skill.root} should report a positive discovery byte count`);
   }
-  assert.equal(
-    artifact.surfaces.explicitWorkflowRequestOwnedContext.bytes,
-    artifact.surfaces.permanentWorkflowPrompt.bytes +
-      artifact.surfaces.providerVisibleAlwaysOnToolDefinitions.bytes +
-      artifact.surfaces.armedWorkflowPromptRewrite.bytes,
-  );
-  assert.ok(artifact.surfaces.armedWorkflowPromptRewrite.bytes < 240);
   assert.ok(artifact.surfaces.forcedWorkflowPromptRewrite.bytes < 96);
   assert.equal(
     artifact.surfaces.stableWorkflowOwnedContext.bytes,
@@ -84,10 +77,6 @@ test("workflow context measurement reports Pi-rendered prompt and provider tool 
   assert.ok(
     artifact.surfaces.ordinaryWorkflowOwnedAlwaysOn.bytes <= 2_000,
     "ordinary turns keep the stable workflow tools and skill discovery below 2 KiB",
-  );
-  assert.ok(
-    artifact.surfaces.explicitWorkflowRequestOwnedContext.bytes <= 1_800,
-    "explicit workflow turns keep the stable tool and request suffix below 1.8 KiB",
   );
   assert.equal(artifact.surfaces.workflowAuthoringSkillCorpus.files, 28);
   assert.ok(artifact.surfaces.workflowAuthoringSkillCorpus.bytes > 0);
@@ -141,10 +130,8 @@ test("context freshness command prints stable and on-demand byte counts", () => 
 
   assert.match(output, /Stable workflow prompt: \d+ bytes/);
   assert.match(output, /Stable workflow tool definition: \d+ bytes/);
-  assert.match(output, /Explicit-request rewrite: \d+ bytes/);
   assert.match(output, /Forced command rewrite: \d+ bytes/);
   assert.match(output, /Stable workflow-owned context: \d+ bytes/);
-  assert.match(output, /Explicit workflow request context: \d+ bytes/);
   assert.match(output, /Ordinary stable workflow tool definitions: \d+ bytes/);
   assert.match(output, /- start_workflow: \d+ bytes/);
   assert.match(output, /- list_active_workflows: \d+ bytes/);

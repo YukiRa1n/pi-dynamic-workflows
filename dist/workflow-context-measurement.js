@@ -1,7 +1,7 @@
 import { readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, relative } from "node:path";
 import { createGetWorkflowOutputTool, createListActiveWorkflowsTool, createStopWorkflowTool, } from "./workflow-control-tool.js";
-import { buildArmedWorkflowPrompt, buildForcedWorkflowPrompt } from "./workflow-editor.js";
+import { buildForcedWorkflowPrompt } from "./workflow-editor.js";
 import { createWorkflowTool } from "./workflow-tool.js";
 /** Package-relative generated context-measurement artifact. */
 export const WORKFLOW_CONTEXT_MEASUREMENT_PATH = "docs/workflow-context-surfaces.json";
@@ -189,10 +189,9 @@ export function measureWorkflowContextSurfaces(root = ROOT) {
     }));
     const promptBytes = bytes(permanentWorkflowPrompt);
     const toolBytes = bytes(providerVisibleWorkflowToolDefinition);
-    const armedRewriteBytes = bytes(buildArmedWorkflowPrompt(""));
     const forcedRewriteBytes = bytes(buildForcedWorkflowPrompt(""));
     return {
-        formatVersion: 9,
+        formatVersion: 10,
         encoding: "utf8",
         sources: [
             "src/workflow-tool.ts",
@@ -215,10 +214,6 @@ export function measureWorkflowContextSurfaces(root = ROOT) {
                 bytes: alwaysOnToolBytes,
                 tools: alwaysOnToolSurfaces,
             },
-            armedWorkflowPromptRewrite: {
-                serialization: "UTF-8 bytes added by buildArmedWorkflowPrompt to an empty user message",
-                bytes: armedRewriteBytes,
-            },
             forcedWorkflowPromptRewrite: {
                 serialization: "UTF-8 bytes added by buildForcedWorkflowPrompt to an empty user message",
                 bytes: forcedRewriteBytes,
@@ -226,10 +221,6 @@ export function measureWorkflowContextSurfaces(root = ROOT) {
             stableWorkflowOwnedContext: {
                 serialization: "sum of the stable Pi prompt and provider workflow definitions",
                 bytes: promptBytes + alwaysOnToolBytes,
-            },
-            explicitWorkflowRequestOwnedContext: {
-                serialization: "stable workflow-owned context plus the explicit-request suffix",
-                bytes: promptBytes + alwaysOnToolBytes + armedRewriteBytes,
             },
             registeredSkillsDiscovery: {
                 serialization: "sum of UTF-8 bytes of normalized Pi skill XML (name + description + location) across every root in package.json's pi.skills",

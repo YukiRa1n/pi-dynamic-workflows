@@ -37,29 +37,15 @@ describe("workflow settings", () => {
     });
   });
 
-  it("saves and loads keyword trigger preferences", () => {
-    withSettingsPath((settingsPath) => {
-      saveWorkflowSettings({ keywordTriggerEnabled: false, keywordTriggerWord: "pi-workflow" }, settingsPath);
-
-      assert.ok(existsSync(settingsPath), "settings file should be created");
-      assert.deepEqual(
-        loadWorkflowSettings(settingsPath),
-        withRevision({ keywordTriggerEnabled: false, keywordTriggerWord: "pi-workflow" }, 1),
-      );
-    });
-  });
-
-  it("normalizes keyword trigger word settings", () => {
+  it("ignores retired keyword trigger settings", () => {
     withSettingsPath((settingsPath) => {
       mkdirSync(dirname(settingsPath), { recursive: true });
-
-      writeFileSync(settingsPath, JSON.stringify({ keywordTriggerWord: "  pi-workflow  " }), "utf-8");
-      assert.deepEqual(loadWorkflowSettings(settingsPath), { keywordTriggerWord: "pi-workflow" });
-
-      for (const keywordTriggerWord of ["", "   ", "/workflow", "pi workflow", 42, false]) {
-        writeFileSync(settingsPath, JSON.stringify({ keywordTriggerWord }), "utf-8");
-        assert.deepEqual(loadWorkflowSettings(settingsPath), {});
-      }
+      writeFileSync(
+        settingsPath,
+        JSON.stringify({ keywordTriggerEnabled: true, keywordTriggerWord: "pi-workflow" }),
+        "utf-8",
+      );
+      assert.deepEqual(loadWorkflowSettings(settingsPath), {});
     });
   });
 
@@ -136,16 +122,16 @@ describe("workflow settings", () => {
       withFakeHome(fakeHome, () => {
         const globalPath = getWorkflowSettingsPath();
         const projectPath = getWorkflowProjectSettingsPath(cwd);
-        saveWorkflowSettings({ keywordTriggerEnabled: true, defaultAgentTimeoutMs: 600000 }, globalPath);
-        saveWorkflowSettings({ keywordTriggerEnabled: false }, { cwd, settingsPath: globalPath, scope: "project" });
+        saveWorkflowSettings({ progressPanelMode: "compact", defaultAgentTimeoutMs: 600000 }, globalPath);
+        saveWorkflowSettings({ progressPanelMode: "detailed" }, { cwd, settingsPath: globalPath, scope: "project" });
 
         assert.deepEqual(
           loadWorkflowSettings(globalPath),
-          withRevision({ keywordTriggerEnabled: true, defaultAgentTimeoutMs: 600000 }, 1),
+          withRevision({ progressPanelMode: "compact", defaultAgentTimeoutMs: 600000 }, 1),
         );
         assert.deepEqual(
           loadWorkflowSettings({ cwd, settingsPath: globalPath, projectSettingsPath: projectPath }),
-          withRevision({ keywordTriggerEnabled: false, defaultAgentTimeoutMs: 600000 }, 1),
+          withRevision({ progressPanelMode: "detailed", defaultAgentTimeoutMs: 600000 }, 1),
         );
       });
     } finally {
@@ -159,9 +145,9 @@ describe("workflow settings", () => {
     const fakeHome = join(dir, "home");
     try {
       withFakeHome(fakeHome, () => {
-        saveWorkflowSettingsForCwd({ keywordTriggerEnabled: false }, cwd);
+        saveWorkflowSettingsForCwd({ progressPanelMode: "detailed" }, cwd);
 
-        assert.deepEqual(loadWorkflowSettings({ cwd }), withRevision({ keywordTriggerEnabled: false }, 1));
+        assert.deepEqual(loadWorkflowSettings({ cwd }), withRevision({ progressPanelMode: "detailed" }, 1));
         assert.equal(existsSync(getWorkflowProjectSettingsPath(cwd)), false);
       });
     } finally {
@@ -175,15 +161,15 @@ describe("workflow settings", () => {
     const fakeHome = join(dir, "home");
     try {
       withFakeHome(fakeHome, () => {
-        saveWorkflowSettings({ keywordTriggerEnabled: false }, { cwd, scope: "project" });
+        saveWorkflowSettings({ progressPanelMode: "compact" }, { cwd, scope: "project" });
 
-        saveWorkflowSettingsForCwd({ keywordTriggerEnabled: true }, cwd);
+        saveWorkflowSettingsForCwd({ progressPanelMode: "detailed" }, cwd);
 
-        assert.deepEqual(loadWorkflowSettings(), withRevision({ keywordTriggerEnabled: true }, 1));
-        assert.deepEqual(loadWorkflowSettings({ cwd }), withRevision({ keywordTriggerEnabled: true }, 2));
+        assert.deepEqual(loadWorkflowSettings(), withRevision({ progressPanelMode: "detailed" }, 1));
+        assert.deepEqual(loadWorkflowSettings({ cwd }), withRevision({ progressPanelMode: "detailed" }, 2));
         assert.deepEqual(
           loadWorkflowSettings({ projectSettingsPath: getWorkflowProjectSettingsPath(cwd) }),
-          withRevision({ keywordTriggerEnabled: true }, 2),
+          withRevision({ progressPanelMode: "detailed" }, 2),
         );
       });
     } finally {
@@ -193,14 +179,14 @@ describe("workflow settings", () => {
 
   it("preserves unknown settings when saving known settings", () => {
     withSettingsPath((settingsPath) => {
-      saveWorkflowSettings({ keywordTriggerEnabled: true }, settingsPath);
+      saveWorkflowSettings({ progressPanelMode: "compact" }, settingsPath);
       const current = JSON.parse(readFileSync(settingsPath, "utf-8"));
       writeFileSync(settingsPath, `${JSON.stringify({ ...current, theme: "dark" }, null, 2)}\n`, "utf-8");
 
-      saveWorkflowSettings({ keywordTriggerEnabled: false }, settingsPath);
+      saveWorkflowSettings({ progressPanelMode: "detailed" }, settingsPath);
 
       assert.deepEqual(JSON.parse(readFileSync(settingsPath, "utf-8")), {
-        keywordTriggerEnabled: false,
+        progressPanelMode: "detailed",
         _workflowSettingsRevision: 2,
         theme: "dark",
       });
@@ -209,18 +195,18 @@ describe("workflow settings", () => {
 
   it("uses the loaded revision as a compare-and-swap fence", () => {
     withSettingsPath((settingsPath) => {
-      saveWorkflowSettings({ keywordTriggerEnabled: true }, settingsPath);
+      saveWorkflowSettings({ progressPanelMode: "compact" }, settingsPath);
       const loaded = loadWorkflowSettings(settingsPath);
       assert.equal(loaded.revision, 1);
 
-      saveWorkflowSettings({ keywordTriggerEnabled: false, revision: loaded.revision }, settingsPath);
+      saveWorkflowSettings({ progressPanelMode: "detailed", revision: loaded.revision }, settingsPath);
       assert.equal(loadWorkflowSettings(settingsPath).revision, 2);
 
       assert.throws(
-        () => saveWorkflowSettings({ keywordTriggerEnabled: true, revision: loaded.revision }, settingsPath),
+        () => saveWorkflowSettings({ progressPanelMode: "compact", revision: loaded.revision }, settingsPath),
         /changed concurrently.*expected revision 1.*found 2/,
       );
-      assert.equal(loadWorkflowSettings(settingsPath).keywordTriggerEnabled, false);
+      assert.equal(loadWorkflowSettings(settingsPath).progressPanelMode, "detailed");
     });
   });
 
@@ -334,7 +320,7 @@ describe("workflow settings", () => {
       writeFileSync(settingsPath, "{not json", "utf-8");
       assert.deepEqual(loadWorkflowSettings(settingsPath), {});
 
-      writeFileSync(settingsPath, JSON.stringify({ keywordTriggerEnabled: "off" }), "utf-8");
+      writeFileSync(settingsPath, JSON.stringify({ keywordTriggerEnabled: true }), "utf-8");
       assert.deepEqual(loadWorkflowSettings(settingsPath), {});
 
       writeFileSync(settingsPath, JSON.stringify({ defaultAgentTimeoutMs: 0 }), "utf-8");

@@ -1727,7 +1727,7 @@ test("Esc does not register current-generation workflow text as editor input", a
 
       // A later unrelated user input must pass through untouched (no false positive).
       // No handler may short-circuit it with "handled"; a "continue" from the
-      // keyword-arming handler is a pass-through, not an interception.
+      // The input recovery handler is a pass-through, not an interception.
       let passthrough: any;
       for (const handler of handlers.input ?? []) {
         const result = handler({ type: "input", text: "an unrelated question", source: "interactive" });

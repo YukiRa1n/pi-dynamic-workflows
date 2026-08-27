@@ -61,10 +61,6 @@ export declare const USER_WORKFLOW_SAVED_DIR = "~/.pi/workflows/saved";
 export declare const MODEL_TIERS_FILE = ".pi/workflows/model-tiers.json";
 /** User-level workflow extension settings file, relative to the home directory. */
 export declare const WORKFLOW_SETTINGS_FILE = ".pi/workflows/settings.json";
-/** Default keyword that arms workflows mode from interactive input. */
-export declare const DEFAULT_KEYWORD_TRIGGER_WORD = "workflow";
-/** Normalize a user-configured keyword trigger word. */
-export declare function normalizeKeywordTriggerWord(value: unknown): string | undefined;
 /**
  * Named workflow subagent definitions directory. Resolved project-relative
  * (cwd/.pi/agents), plus user-level at `~/.pi/agent/agents/` (the primary

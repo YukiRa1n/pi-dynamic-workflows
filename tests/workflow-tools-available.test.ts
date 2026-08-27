@@ -1,16 +1,12 @@
 /**
- * Tests for tools availability when workflows mode is triggered.
- *
- * The workflow extension exposes stable start, active-list, and exact-ID cancellation tools. Input
- * arming only adds a compact marker to an explicit request; it never mutates
- * Pi's active tool set.
+ * Tests for the workflow extension's stable model-facing tool availability.
  */
 
 import assert from "node:assert/strict";
 import { mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { describe, it, mock } from "node:test";
+import { describe, it } from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   claimWorkflowRuntime,
@@ -18,63 +14,7 @@ import {
   handoffWorkflowRuntime,
   takeWorkflowRuntime,
 } from "../src/extension-reload.js";
-import { buildArmedWorkflowPrompt, type WorkflowModeState } from "../src/workflow-editor.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
-
-// ---------------------------------------------------------------------------
-// Default Pi tools that every Pi install provides (plugin-independent)
-// ---------------------------------------------------------------------------
-const DEFAULT_PI_TOOLS = [
-  "bash",
-  "read",
-  "edit",
-  "write",
-  "ask_user_question",
-  "todo",
-  "web_search",
-  "web_fetch",
-  "advisor",
-  "subagent",
-  "workflow",
-];
-
-// Additional tools from context-mode plugin (common but not guaranteed)
-// We do NOT include these in DEFAULT_PI_TOOLS for compatibility.
-// Tools like ctx_execute, ctx_execute_file, ctx_index, ctx_search, etc.
-// are from a plugin and may not be present.
-
-// ---------------------------------------------------------------------------
-// Mock helpers
-// ---------------------------------------------------------------------------
-
-interface MockPi {
-  on: ReturnType<typeof mock.fn>;
-  getActiveTools: ReturnType<typeof mock.fn>;
-  setActiveTools: ReturnType<typeof mock.fn>;
-  handlers: Record<string, Array<(...args: any[]) => any>>;
-}
-
-function createMockPi(initialTools: string[] = [...DEFAULT_PI_TOOLS]): MockPi {
-  const handlers: Record<string, Array<(...args: any[]) => any>> = {};
-  return {
-    on: mock.fn((event: string, handler: (...args: any[]) => any) => {
-      if (!handlers[event]) handlers[event] = [];
-      handlers[event].push(handler);
-    }),
-    getActiveTools: mock.fn(() => [...initialTools]),
-    setActiveTools: mock.fn(),
-    handlers,
-  };
-}
-
-function testSettingsOptions(keywordTriggerEnabled = true, keywordTriggerWord?: string) {
-  return {
-    settingsStore: {
-      load: () => ({ keywordTriggerEnabled, ...(keywordTriggerWord ? { keywordTriggerWord } : {}) }),
-      save: () => {},
-    },
-  };
-}
 
 function emitSessionStart(
   handlers: Record<string, Array<(...args: any[]) => any>>,
@@ -85,229 +25,6 @@ function emitSessionStart(
     handler(event, { isIdle: () => true, ...context });
   }
 }
-
-// ---------------------------------------------------------------------------
-// Test: installWorkflowKeywordArming keeps default tools available
-// ---------------------------------------------------------------------------
-
-describe("installWorkflowKeywordArming - tool availability", () => {
-  it("should transform an explicit request without changing active tools", async () => {
-    const { installWorkflowKeywordArming } = await import("../src/workflow-editor.js");
-
-    const mockPi = createMockPi([...DEFAULT_PI_TOOLS]);
-
-    installWorkflowKeywordArming(mockPi as unknown as ExtensionAPI, undefined, testSettingsOptions());
-
-    // Simulate user submitting a message with "workflow" keyword
-    const inputHandlers = mockPi.handlers.input;
-    assert.ok(inputHandlers, "input handler should be registered");
-    assert.equal(inputHandlers.length, 1);
-
-    const result = inputHandlers[0]({
-      source: "interactive",
-      text: "run a workflow to audit the repository",
-    });
-
-    // Verify transform result
-    assert.deepEqual(result, {
-      action: "transform",
-      text: buildArmedWorkflowPrompt("run a workflow to audit the repository"),
-    });
-
-    assert.equal(mockPi.getActiveTools.mock.callCount(), 0);
-    assert.equal(mockPi.setActiveTools.mock.callCount(), 0);
-  });
-
-  it("does not install an agent_settled restoration lease", async () => {
-    const { installWorkflowKeywordArming } = await import("../src/workflow-editor.js");
-
-    // Add a bonus tool to simulate a plugin adding a tool
-    const originalTools = ["bash", "read", "edit", "write", "custom-plugin-tool", "workflow", "workflow_control"];
-    const mockPi = createMockPi(originalTools);
-
-    installWorkflowKeywordArming(mockPi as unknown as ExtensionAPI, undefined, testSettingsOptions());
-
-    // Trigger an explicit request.
-    const inputHandlers = mockPi.handlers.input;
-    inputHandlers[0]({
-      source: "interactive",
-      text: "run a workflow",
-    });
-    assert.equal(mockPi.setActiveTools.mock.callCount(), 0);
-    assert.equal(mockPi.handlers.agent_settled, undefined);
-    assert.equal(mockPi.handlers.turn_end, undefined);
-  });
-
-  it("should fire for a configured trigger word but not the default word", async () => {
-    const { installWorkflowKeywordArming } = await import("../src/workflow-editor.js");
-
-    const mockPi = createMockPi();
-    installWorkflowKeywordArming(
-      mockPi as unknown as ExtensionAPI,
-      undefined,
-      testSettingsOptions(true, "pi-workflow"),
-    );
-
-    const inputHandlers = mockPi.handlers.input;
-    assert.deepEqual(inputHandlers[0]({ source: "interactive", text: "run workflow" }), { action: "continue" });
-    assert.equal(mockPi.setActiveTools.mock.callCount(), 0);
-
-    const result = inputHandlers[0]({ source: "interactive", text: "run pi-workflow" });
-    assert.equal(result.action, "transform");
-    assert.equal(mockPi.setActiveTools.mock.callCount(), 0);
-  });
-
-  it('should not fire for "/workflows" (slash command, not trigger)', async () => {
-    const { installWorkflowKeywordArming } = await import("../src/workflow-editor.js");
-
-    const mockPi = createMockPi();
-
-    installWorkflowKeywordArming(mockPi as unknown as ExtensionAPI, undefined, testSettingsOptions());
-
-    // Simulate user submitting a slash command
-    const inputHandlers = mockPi.handlers.input;
-    const result = inputHandlers[0]({
-      source: "interactive",
-      text: "/workflows list",
-    });
-
-    // Should not transform (slash commands are not triggers)
-    assert.deepEqual(result, { action: "continue" });
-
-    // Should NOT have called setActiveTools
-    assert.equal(mockPi.setActiveTools.mock.callCount(), 0);
-  });
-
-  it("should not fire for non-interactive sources", async () => {
-    const { installWorkflowKeywordArming } = await import("../src/workflow-editor.js");
-
-    const mockPi = createMockPi();
-
-    installWorkflowKeywordArming(mockPi as unknown as ExtensionAPI, undefined, testSettingsOptions());
-
-    const inputHandlers = mockPi.handlers.input;
-    const result = inputHandlers[0]({
-      source: "api", // non-interactive
-      text: "run a workflow",
-    });
-
-    assert.deepEqual(result, { action: "continue" });
-    assert.equal(mockPi.setActiveTools.mock.callCount(), 0);
-  });
-
-  it("should not fire for empty text", async () => {
-    const { installWorkflowKeywordArming } = await import("../src/workflow-editor.js");
-
-    const mockPi = createMockPi();
-
-    installWorkflowKeywordArming(mockPi as unknown as ExtensionAPI, undefined, testSettingsOptions());
-
-    const inputHandlers = mockPi.handlers.input;
-    const result = inputHandlers[0]({
-      source: "interactive",
-      text: "",
-    });
-
-    assert.deepEqual(result, { action: "continue" });
-    assert.equal(mockPi.setActiveTools.mock.callCount(), 0);
-  });
-
-  it("should handle getActiveTools returning undefined gracefully", async () => {
-    const { installWorkflowKeywordArming } = await import("../src/workflow-editor.js");
-
-    // Pi may not have getActiveTools in some hosts
-    const mockPi = createMockPi();
-    mockPi.getActiveTools = mock.fn(() => undefined as unknown as string[]);
-
-    installWorkflowKeywordArming(mockPi as unknown as ExtensionAPI, undefined, testSettingsOptions());
-
-    const inputHandlers = mockPi.handlers.input;
-    assert.doesNotThrow(() => {
-      inputHandlers[0]({
-        source: "interactive",
-        text: "test workflow",
-      });
-    });
-  });
-
-  it("does not call setActiveTools even when the host implementation throws", async () => {
-    const { installWorkflowKeywordArming } = await import("../src/workflow-editor.js");
-
-    const mockPi = createMockPi();
-    mockPi.setActiveTools = mock.fn(() => {
-      throw new Error("host rejected tool restriction");
-    });
-
-    installWorkflowKeywordArming(mockPi as unknown as ExtensionAPI, undefined, testSettingsOptions());
-
-    const inputHandlers = mockPi.handlers.input;
-    const result = inputHandlers[0]({
-      source: "interactive",
-      text: "run a workflow",
-    });
-
-    assert.equal(result.action, "transform");
-    assert.equal(mockPi.setActiveTools.mock.callCount(), 0);
-  });
-
-  it("handles repeated explicit requests without a dynamic lease", async () => {
-    const { installWorkflowKeywordArming } = await import("../src/workflow-editor.js");
-
-    const originalTools = ["bash", "read", "edit", "write"];
-    const mockPi = createMockPi(originalTools);
-
-    installWorkflowKeywordArming(mockPi as unknown as ExtensionAPI, undefined, testSettingsOptions());
-
-    const inputHandlers = mockPi.handlers.input;
-    inputHandlers[0]({
-      source: "interactive",
-      text: "run a workflow test 1",
-    });
-
-    inputHandlers[0]({
-      source: "interactive",
-      text: "run a workflow test 2",
-    });
-
-    assert.equal(mockPi.setActiveTools.mock.callCount(), 0);
-    assert.equal(mockPi.handlers.agent_settled, undefined);
-  });
-
-  it("should work with different keyword variations: 'workflow', 'workflows', 'WORKFLOW'", async () => {
-    const { installWorkflowKeywordArming } = await import("../src/workflow-editor.js");
-
-    for (const keyword of ["workflow", "workflows", "WORKFLOW", "WorkFlows"]) {
-      const mockPi = createMockPi();
-      installWorkflowKeywordArming(mockPi as unknown as ExtensionAPI, undefined, testSettingsOptions());
-
-      mockPi.setActiveTools.mock.resetCalls();
-
-      const inputHandlers = mockPi.handlers.input;
-      inputHandlers[0]({
-        source: "interactive",
-        text: `run ${keyword} test`,
-      });
-
-      assert.equal(mockPi.setActiveTools.mock.callCount(), 0);
-      assert.equal(mockPi.handlers.input.length, 1);
-    }
-  });
-
-  it("should return correct WorkflowModeState", async () => {
-    const { installWorkflowKeywordArming } = await import("../src/workflow-editor.js");
-
-    const mockPi = createMockPi();
-
-    const state: WorkflowModeState = installWorkflowKeywordArming(
-      mockPi as unknown as ExtensionAPI,
-      undefined,
-      testSettingsOptions(),
-    );
-
-    assert.equal(typeof state.active, "boolean");
-    assert.equal(state.active, false);
-  });
-});
 
 describe("workflow extension - stable tool availability", () => {
   it("keeps stable start, active-list, and exact-ID stop tools visible across reload", async () => {
@@ -366,14 +83,11 @@ describe("workflow extension - stable tool availability", () => {
         assert.equal(registeredTools.includes("workflow_control"), false);
         assert.equal(registeredTools.includes("workflow_steer"), false);
         const input = handlers.input?.[0];
-        assert.ok(input, "workflow input hook should register");
-        assert.deepEqual(input({ source: "interactive", text: "Discuss workflow status and the bug." }), {
-          action: "continue",
-        });
-        assert.deepEqual(input({ source: "interactive", text: "run a workflow to audit the repository" }), {
-          action: "transform",
-          text: buildArmedWorkflowPrompt("run a workflow to audit the repository"),
-        });
+        assert.ok(input, "workflow delivery recovery hook should register");
+        assert.equal(input({ source: "interactive", text: "Discuss workflow status and the bug." }), undefined);
+        assert.equal(input({ source: "interactive", text: "run a workflow to audit the repository" }), undefined);
+        assert.ok(commands.has("workflows-progress"));
+        assert.equal(commands.has("workflows-trigger"), false);
         await commands.get("workflows")?.handler("run audit lifecycle", {
           ui: { notify: () => {} },
         });

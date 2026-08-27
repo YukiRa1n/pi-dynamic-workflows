@@ -10,10 +10,8 @@ Measurements use UTF-8 bytes. `docs/workflow-context-surfaces.json` is generated
 | --- | ---: | --- |
 | Stable workflow prompt | 0 | Every turn |
 | Stable workflow tool definitions | 1,529 | Every turn |
-| Explicit-request rewrite | 23 | Explicit workflow request |
 | Forced command rewrite | 61 | `/workflows run` |
 | Stable workflow-owned context | 1,529 | Stable prompt plus tool definitions |
-| Explicit workflow request context | 1,552 | Stable context plus explicit-request rewrite |
 | Ordinary workflow-family definitions | 1,529 | Stable start, active-list, and exact-ID stop tools |
 | Registered skill discovery | 453 | Ordinary Pi skill discovery |
 | Ordinary workflow-owned total | 1,982 | Stable tools plus skill discovery |

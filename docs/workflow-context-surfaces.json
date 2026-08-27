@@ -1,5 +1,5 @@
 {
-  "formatVersion": 9,
+  "formatVersion": 10,
   "encoding": "utf8",
   "sources": [
     "src/workflow-tool.ts",
@@ -43,10 +43,6 @@
         }
       ]
     },
-    "armedWorkflowPromptRewrite": {
-      "serialization": "UTF-8 bytes added by buildArmedWorkflowPrompt to an empty user message",
-      "bytes": 23
-    },
     "forcedWorkflowPromptRewrite": {
       "serialization": "UTF-8 bytes added by buildForcedWorkflowPrompt to an empty user message",
       "bytes": 61
@@ -54,10 +50,6 @@
     "stableWorkflowOwnedContext": {
       "serialization": "sum of the stable Pi prompt and provider workflow definitions",
       "bytes": 1529
-    },
-    "explicitWorkflowRequestOwnedContext": {
-      "serialization": "stable workflow-owned context plus the explicit-request suffix",
-      "bytes": 1552
     },
     "registeredSkillsDiscovery": {
       "serialization": "sum of UTF-8 bytes of normalized Pi skill XML (name + description + location) across every root in package.json's pi.skills",

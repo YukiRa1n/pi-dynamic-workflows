@@ -275,7 +275,6 @@ Additional boundaries:
 | `/workflows steer <id> [kind] <message>` | Send an explicit same-task update to one exact run. |
 | `/workflows save <name>` | Save the latest workflow as a reusable command. |
 | `/workflows-models` | Configure model tiers. |
-| `/workflows-trigger on\|off\|set <word>\|reset\|status` | Configure the keyword that arms workflow intent detection. |
 | `/workflows-progress compact\|detailed\|status` / `/workflows-progress max <1-1000>` | Configure the live panel mode and per-phase agent cap. |
 | `/effort off\|high\|ultra` | Set effort guidance for an explicitly requested workflow; it does not take over ordinary messages. |
 | `/ultracode [off]` | Turn maximal-effort (ultracode) mode on, or off with `off`; alias for `/effort ultra`. |

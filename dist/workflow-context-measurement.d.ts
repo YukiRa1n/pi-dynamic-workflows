@@ -33,7 +33,7 @@ export interface ToolDefinitionSurface extends ByteSurface {
 }
 /** Versioned byte measurements for always-on, discovery, corpus, and representative authoring surfaces. */
 export interface WorkflowContextMeasurement {
-    formatVersion: 9;
+    formatVersion: 10;
     encoding: "utf8";
     sources: [
         "src/workflow-tool.ts",
@@ -51,14 +51,10 @@ export interface WorkflowContextMeasurement {
         providerVisibleAlwaysOnToolDefinitions: ByteSurface & {
             tools: ToolDefinitionSurface[];
         };
-        /** Package-owned suffix appended by heuristic workflow arming. */
-        armedWorkflowPromptRewrite: ByteSurface;
         /** Package-owned suffix appended by the explicit /workflows run command. */
         forcedWorkflowPromptRewrite: ByteSurface;
         /** Stable system-prompt and provider-tool bytes owned by the package. */
         stableWorkflowOwnedContext: ByteSurface;
-        /** Stable bytes plus the suffix for one explicit workflow request. */
-        explicitWorkflowRequestOwnedContext: ByteSurface;
         /**
          * Every skill this package registers (package.json's `pi.skills` — read
          * from disk, not hardcoded here) contributes an always-on discovery entry

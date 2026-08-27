@@ -177,17 +177,8 @@ export {
   createWorkflowControlTool,
 } from "./workflow-control-tool.js";
 export {
-  type ArmReason,
-  buildArmedWorkflowPrompt,
   buildForcedWorkflowPrompt,
-  endsWithTrigger,
-  hasTrigger,
-  hasWorkflowRequestTrigger,
-  type InstallWorkflowKeywordArmingOptions,
-  installWorkflowKeywordArming,
   registerWorkflowProgressCommands,
-  registerWorkflowTriggerCommand,
-  type WorkflowModeState,
 } from "./workflow-editor.js";
 export type { ManagedRun, WorkflowManagerOptions } from "./workflow-manager.js";
 export {
