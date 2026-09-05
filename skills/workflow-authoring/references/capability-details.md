@@ -2,7 +2,7 @@
 # Exhaustive workflow capability facts
 
 Contract format: `1.0.0`<br>
-Contract content / skill / extension: `3.5.1-yuki.5`
+Contract content / skill / extension: `3.5.1-yuki.6`
 
 Every exact fact below is projected from the installed extension's capability contract. Explanatory judgment belongs in the hand-written references next to this file.
 
@@ -302,8 +302,8 @@ Every exact fact below is projected from the installed extension's capability co
 
 - Classification: `workflow-tool-input`
 - Support: `supported`
-- Signature: `workflowTimeoutMs?: number = 30 minute default, up to 24 hours`
-- Constraint: finite logical deadline for the complete workflow frame
+- Signature: `workflowTimeoutMs?: number \| null = no deadline by default; explicit limits up to 24 hours`
+- Constraint: optional logical deadline for the complete workflow frame; null disables a configured limit
 - Constraint: cannot interrupt a pending Promise or a microtask-starved event loop
 
 <a id="tool-input-tokenbudget"></a>

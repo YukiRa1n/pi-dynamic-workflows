@@ -312,7 +312,11 @@ export async function runWorkflow(script, options = {}) {
     const routingConfig = parseModelRoutingFromMeta(meta.phases, meta.model);
     const maxAgents = normalizeMaxAgents(options.maxAgents ?? MAX_AGENTS_PER_RUN);
     const agentTimeoutMs = options.agentTimeoutMs !== undefined ? options.agentTimeoutMs : DEFAULT_AGENT_TIMEOUT_MS;
-    const workflowTimeoutMs = normalizeWorkflowTimeout(options.workflowTimeoutMs ?? options.wallClockTimeoutMs ?? DEFAULT_WORKFLOW_TIMEOUT_MS);
+    const workflowTimeoutMs = normalizeWorkflowTimeout(options.workflowTimeoutMs !== undefined
+        ? options.workflowTimeoutMs
+        : options.wallClockTimeoutMs !== undefined
+            ? options.wallClockTimeoutMs
+            : DEFAULT_WORKFLOW_TIMEOUT_MS);
     // Unique run ID even for two direct runWorkflow() calls in the same
     // millisecond (the old `run-${timestamp}` fallback collided on log filenames
     // and `${runId}:${callIndex}` identities — H-007).
@@ -2577,13 +2581,15 @@ function normalizeAgentTimeout(value) {
     return Math.min(MAX_WORKFLOW_TIMEOUT_MS, value);
 }
 function normalizeWorkflowTimeout(value) {
+    if (value === null)
+        return null;
     if (typeof value !== "number" || !Number.isFinite(value) || !Number.isInteger(value) || value < 1) {
-        throw new WorkflowError(`workflowTimeoutMs must be a finite integer between 1 and ${MAX_WORKFLOW_TIMEOUT_MS}`, WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, { recoverable: false });
+        throw new WorkflowError(`workflowTimeoutMs must be null or a finite integer between 1 and ${MAX_WORKFLOW_TIMEOUT_MS}`, WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, { recoverable: false });
     }
     return Math.min(MAX_WORKFLOW_TIMEOUT_MS, value);
 }
 /**
- * Race the complete VM frame against a finite logical deadline. The frame is
+ * Race the complete VM frame against cancellation and an optional deadline. The frame is
  * deliberately observed but not cancelled: Promise races cannot interrupt a
  * pending promise or a microtask-starved event loop. Admission and provider
  * aborts are the enforceable boundary.
@@ -2592,6 +2598,8 @@ async function withWorkflowDeadline(promise, ms, workflowName, onTimeout, signal
     let timer;
     let onSignalAbort;
     const deadline = new Promise((_, reject) => {
+        if (ms === null)
+            return;
         timer = setTimeout(() => {
             reject(new WorkflowError(`Workflow "${workflowName}" exceeded its ${ms}ms wall-clock deadline`, WorkflowErrorCode.WORKFLOW_TIMEOUT, { recoverable: false }));
             try {

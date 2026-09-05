@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { before, describe, it } from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
+import { redactAbsolutePaths } from "../src/sanitize.js";
 
 type TaskPanelModule = {
   installResultDelivery: (pi: ExtensionAPI, manager: unknown, opts?: unknown) => void;
@@ -283,7 +284,10 @@ describe("installResultDelivery", () => {
 
     const content = (pi as unknown as { _calls: { content: string }[] })._calls[0].content;
     assert.ok(content.includes("Full result and subagent reports:"), "should include the pointer label");
-    assert.ok(content.includes(join("/runs", "test-run-1.json")), "should point at <runsDir>/<runId>.json");
+    assert.ok(
+      content.includes(redactAbsolutePaths(join("/runs", "test-run-1.json"))),
+      "persisted pointer follows the platform's path redaction policy",
+    );
     // The verdict summary itself is unchanged apart from the appended pointer.
     assert.ok(content.includes("All tests passed"), "verdict text preserved");
   });
@@ -319,7 +323,10 @@ describe("installResultDelivery", () => {
       "the 50-char setting bounds a sub-default dump",
     );
     assert.ok(!content.includes("z".repeat(200)), "the body is cut at the configured threshold");
-    assert.ok(content.includes(join("/runs", "test-run-1.json")), "pointer still appended");
+    assert.ok(
+      content.includes(redactAbsolutePaths(join("/runs", "test-run-1.json"))),
+      "sanitized pointer still appended",
+    );
   });
 
   // ── installResultDelivery: guard / stale ctx ──

@@ -111,8 +111,8 @@ export interface ManagedRun {
      * CURRENT defaultAgentTimeoutMs.
      */
     agentTimeoutMs?: number | null;
-    /** Finite logical wall-clock deadline, fixed at run start and carried through resume. */
-    workflowTimeoutMs?: number;
+    /** Optional wall-clock deadline, fixed at run start and carried through resume. */
+    workflowTimeoutMs?: number | null;
     /**
      * The run's resolved concurrency (per-run value, else the manager's
      * concurrency at the time), fixed at run start/resume for the same reason
@@ -156,8 +156,8 @@ export interface ExecOptions {
     maxAgents?: number;
     /** Per-agent timeout in milliseconds. null/omitted means no per-agent hard timeout. */
     agentTimeoutMs?: number | null;
-    /** Finite logical wall-clock deadline for this execution. */
-    workflowTimeoutMs?: number;
+    /** Optional wall-clock deadline; null means unlimited. */
+    workflowTimeoutMs?: number | null;
     /** Host signal (e.g. tool/Esc) that should abort this run when fired. */
     externalSignal?: AbortSignal;
     /** Called with the live snapshot on every progress event. */
@@ -238,8 +238,8 @@ export interface WorkflowManagerOptions {
     sessionId?: string;
     /** Default per-agent timeout when a run does not pass agentTimeoutMs. null means no per-agent hard timeout. */
     defaultAgentTimeoutMs?: number | null;
-    /** Default finite logical wall-clock deadline for a workflow frame. */
-    defaultWorkflowTimeoutMs?: number;
+    /** Optional default deadline; null/omitted means unlimited. */
+    defaultWorkflowTimeoutMs?: number | null;
     /** Default retry attempts after recoverable agent failures. */
     defaultAgentRetries?: number;
     /** Default hard token budget when a run does not pass tokenBudget. null/omitted means no budget. */

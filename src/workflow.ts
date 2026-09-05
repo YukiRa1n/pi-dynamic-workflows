@@ -290,10 +290,10 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
   maxAgents?: number;
   /** Timeout per agent in milliseconds. null/omitted means no per-agent hard timeout. */
   agentTimeoutMs?: number | null;
-  /** Finite logical wall-clock deadline for this workflow frame. */
-  workflowTimeoutMs?: number;
+  /** Optional wall-clock deadline; null/omitted means no deadline. */
+  workflowTimeoutMs?: number | null;
   /** Alias accepted by direct callers for workflowTimeoutMs. */
-  wallClockTimeoutMs?: number;
+  wallClockTimeoutMs?: number | null;
   /** Whether to persist logs to disk. Default: true */
   persistLogs?: boolean;
   /** Run ID for persistence. Auto-generated if not provided. */
@@ -857,7 +857,11 @@ export async function runWorkflow<T = unknown>(
   const maxAgents = normalizeMaxAgents(options.maxAgents ?? MAX_AGENTS_PER_RUN);
   const agentTimeoutMs = options.agentTimeoutMs !== undefined ? options.agentTimeoutMs : DEFAULT_AGENT_TIMEOUT_MS;
   const workflowTimeoutMs = normalizeWorkflowTimeout(
-    options.workflowTimeoutMs ?? options.wallClockTimeoutMs ?? DEFAULT_WORKFLOW_TIMEOUT_MS,
+    options.workflowTimeoutMs !== undefined
+      ? options.workflowTimeoutMs
+      : options.wallClockTimeoutMs !== undefined
+        ? options.wallClockTimeoutMs
+        : DEFAULT_WORKFLOW_TIMEOUT_MS,
   );
   // Unique run ID even for two direct runWorkflow() calls in the same
   // millisecond (the old `run-${timestamp}` fallback collided on log filenames
@@ -3450,10 +3454,11 @@ function normalizeAgentTimeout(value: unknown): number | null {
   return Math.min(MAX_WORKFLOW_TIMEOUT_MS, value);
 }
 
-function normalizeWorkflowTimeout(value: unknown): number {
+function normalizeWorkflowTimeout(value: unknown): number | null {
+  if (value === null) return null;
   if (typeof value !== "number" || !Number.isFinite(value) || !Number.isInteger(value) || value < 1) {
     throw new WorkflowError(
-      `workflowTimeoutMs must be a finite integer between 1 and ${MAX_WORKFLOW_TIMEOUT_MS}`,
+      `workflowTimeoutMs must be null or a finite integer between 1 and ${MAX_WORKFLOW_TIMEOUT_MS}`,
       WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
       { recoverable: false },
     );
@@ -3462,14 +3467,14 @@ function normalizeWorkflowTimeout(value: unknown): number {
 }
 
 /**
- * Race the complete VM frame against a finite logical deadline. The frame is
+ * Race the complete VM frame against cancellation and an optional deadline. The frame is
  * deliberately observed but not cancelled: Promise races cannot interrupt a
  * pending promise or a microtask-starved event loop. Admission and provider
  * aborts are the enforceable boundary.
  */
 async function withWorkflowDeadline<T>(
   promise: Promise<T>,
-  ms: number,
+  ms: number | null,
   workflowName: string,
   onTimeout: () => void,
   signal?: AbortSignal,
@@ -3478,6 +3483,7 @@ async function withWorkflowDeadline<T>(
   let timer: ReturnType<typeof setTimeout> | undefined;
   let onSignalAbort: (() => void) | undefined;
   const deadline = new Promise<never>((_, reject) => {
+    if (ms === null) return;
     timer = setTimeout(() => {
       reject(
         new WorkflowError(

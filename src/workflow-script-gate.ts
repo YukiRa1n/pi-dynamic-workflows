@@ -39,7 +39,7 @@ import { parse } from "acorn";
  * Known limits (documented, not hidden): a script inside this subset can
  * still waste tokens through agent() fan-out (bounded by run resource
  * limits) or burn event-loop time from an async continuation (bounded by the
- * run wall-clock timeout). Those are resource-governance problems, not
+ * an explicitly configured run wall-clock timeout). Those are resource-governance problems, not
  * sandbox escapes, and are enforced by the manager's existing ceilings.
  */
 

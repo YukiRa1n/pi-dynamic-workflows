@@ -56,11 +56,14 @@ const workflowToolSchema = Type.Object({
         minimum: 1,
         description: "Per-call timeout (ms).",
     })),
-    workflowTimeoutMs: Type.Optional(Type.Integer({
-        minimum: 1,
-        maximum: MAX_WORKFLOW_TIMEOUT_MS,
-        description: "Workflow timeout (ms).",
-    })),
+    workflowTimeoutMs: Type.Optional(Type.Union([
+        Type.Null(),
+        Type.Integer({
+            minimum: 1,
+            maximum: MAX_WORKFLOW_TIMEOUT_MS,
+            description: "Optional workflow timeout (ms); omitted or null disables it.",
+        }),
+    ])),
     tokenBudget: Type.Optional(Type.Integer({
         minimum: 1,
         description: "User-requested soft cap; omit otherwise.",
@@ -375,7 +378,9 @@ function normalizeWorkflowToolArgs(args, allowResume = true, exposeAdvancedParam
             concurrency: validateInteger(value.concurrency, "concurrency", 1, 16),
             agentRetries: validateInteger(value.agentRetries, "agentRetries", 0, 3),
             agentTimeoutMs: validateInteger(value.agentTimeoutMs, "agentTimeoutMs", 1, MAX_WORKFLOW_TIMEOUT_MS),
-            workflowTimeoutMs: validateInteger(value.workflowTimeoutMs, "workflowTimeoutMs", 1, MAX_WORKFLOW_TIMEOUT_MS),
+            workflowTimeoutMs: value.workflowTimeoutMs === null
+                ? null
+                : validateInteger(value.workflowTimeoutMs, "workflowTimeoutMs", 1, MAX_WORKFLOW_TIMEOUT_MS),
             tokenBudget: validateInteger(value.tokenBudget, "tokenBudget", 1, Number.MAX_SAFE_INTEGER),
         });
     }

@@ -241,10 +241,10 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
     maxAgents?: number;
     /** Timeout per agent in milliseconds. null/omitted means no per-agent hard timeout. */
     agentTimeoutMs?: number | null;
-    /** Finite logical wall-clock deadline for this workflow frame. */
-    workflowTimeoutMs?: number;
+    /** Optional wall-clock deadline; null/omitted means no deadline. */
+    workflowTimeoutMs?: number | null;
     /** Alias accepted by direct callers for workflowTimeoutMs. */
-    wallClockTimeoutMs?: number;
+    wallClockTimeoutMs?: number | null;
     /** Whether to persist logs to disk. Default: true */
     persistLogs?: boolean;
     /** Run ID for persistence. Auto-generated if not provided. */

@@ -3,7 +3,7 @@ import test from "node:test";
 import { defineTool } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import type { AgentUsage } from "../src/agent.js";
-import { MAX_FANOUT_ITEMS } from "../src/config.js";
+import { DEFAULT_WORKFLOW_TIMEOUT_MS, MAX_FANOUT_ITEMS } from "../src/config.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
 import {
   formatWorkflowCoordinatorMessage,
@@ -13,6 +13,35 @@ import {
 } from "../src/workflow.js";
 import { WorkflowResourceCoordinator } from "../src/workflow-resource-coordinator.js";
 import { waitFor } from "./helpers/wait-for.js";
+
+test("default workflow has no wall-clock timer and an unlimited pending frame remains stoppable", async () => {
+  assert.equal(DEFAULT_WORKFLOW_TIMEOUT_MS, null);
+  const scheduled: number[] = [];
+  const original = globalThis.setTimeout;
+  globalThis.setTimeout = ((handler: any, delay: number, ...args: any[]) => {
+    scheduled.push(delay);
+    return original(handler, delay, ...args);
+  }) as typeof setTimeout;
+  const controller = new AbortController();
+  try {
+    const pending = runWorkflow(
+      "export const meta = {name:'unlimited',description:'unlimited'}; await agent('ready'); await new Promise(() => {});",
+      {
+        persistLogs: false,
+        signal: controller.signal,
+        agent: { run: async () => "ready" },
+      },
+    );
+    original(() => controller.abort(), 15);
+    await assert.rejects(
+      pending,
+      (error: unknown) => error instanceof WorkflowError && error.code === WorkflowErrorCode.WORKFLOW_ABORTED,
+    );
+    assert.equal(scheduled.includes(1_800_000), false, "no automatic 30-minute deadline is scheduled");
+  } finally {
+    globalThis.setTimeout = original;
+  }
+});
 
 /** Agent runner that counts real invocations and echoes a per-call result. */
 function countingAgent() {

@@ -10,7 +10,7 @@ declare const workflowToolSchema: Type.TObject<{
     concurrency: Type.TOptional<Type.TInteger>;
     agentRetries: Type.TOptional<Type.TInteger>;
     agentTimeoutMs: Type.TOptional<Type.TInteger>;
-    workflowTimeoutMs: Type.TOptional<Type.TInteger>;
+    workflowTimeoutMs: Type.TOptional<Type.TUnion<[Type.TNull, Type.TInteger]>>;
     tokenBudget: Type.TOptional<Type.TInteger>;
     resumeFromRunId: Type.TOptional<Type.TString>;
 }>;
@@ -23,7 +23,7 @@ export type WorkflowToolInput = {
     concurrency?: number;
     agentRetries?: number;
     agentTimeoutMs?: number;
-    workflowTimeoutMs?: number;
+    workflowTimeoutMs?: number | null;
     tokenBudget?: number;
     resumeFromRunId?: string;
 };

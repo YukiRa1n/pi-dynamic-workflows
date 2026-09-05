@@ -39,8 +39,8 @@ export declare const MAX_SHARED_STORE_VALUE_BYTES: number;
 export declare const MAX_SHARED_STORE_TOTAL_BYTES: number;
 /** Default timeout for a single agent in milliseconds. null means no per-agent hard timeout. */
 export declare const DEFAULT_AGENT_TIMEOUT_MS: null;
-/** Finite logical wall-clock deadline for one workflow frame (30 minutes). */
-export declare const DEFAULT_WORKFLOW_TIMEOUT_MS: number;
+/** No workflow wall-clock deadline unless explicitly configured. */
+export declare const DEFAULT_WORKFLOW_TIMEOUT_MS: null;
 /** Maximum accepted workflow/agent deadline (24 hours). */
 export declare const MAX_WORKFLOW_TIMEOUT_MS: number;
 /** Maximum time spent draining cooperative provider attempts after logical close. */

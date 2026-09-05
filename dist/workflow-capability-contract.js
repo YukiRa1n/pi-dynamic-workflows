@@ -305,8 +305,8 @@ const capabilities = [
     toolInput("concurrency", "concurrency?: number", ["runtime clamps to 1..16"]),
     toolInput("agentRetries", "agentRetries?: number = configured value or 0", ["floored and clamped to 0..3"]),
     toolInput("agentTimeoutMs", "agentTimeoutMs?: number = configured default or no per-agent limit"),
-    toolInput("workflowTimeoutMs", "workflowTimeoutMs?: number = 30 minute default, up to 24 hours", [
-        "finite logical deadline for the complete workflow frame",
+    toolInput("workflowTimeoutMs", "workflowTimeoutMs?: number | null = no deadline by default; explicit limits up to 24 hours", [
+        "optional logical deadline for the complete workflow frame; null disables a configured limit",
         "cannot interrupt a pending Promise or a microtask-starved event loop",
     ]),
     toolInput("tokenBudget", "tokenBudget?: number = configured default or unlimited", [

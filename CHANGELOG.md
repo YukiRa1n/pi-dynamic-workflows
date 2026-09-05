@@ -2,7 +2,7 @@
 
 All notable changes to `@quintinshaw/pi-dynamic-workflows` are documented here.
 
-## [3.5.1-yuki.5] - 2026-09-06
+## [3.5.1-yuki.6] - 2026-09-06
 
 ### Added
 
@@ -11,6 +11,7 @@ All notable changes to `@quintinshaw/pi-dynamic-workflows` are documented here.
 
 ### Changed
 
+- Removed the default 30-minute workflow deadline. New workflows run without a wall-clock limit unless explicitly configured; manual cancellation and opt-in limits remain supported.
 - Subagents can publish noncritical `finding` updates with evidence, conditions, uncertainty, and task implications before completion. Wait/status-only calls no longer retire a new report's temporary review notice; the main model may still remain silent for non-actionable findings.
 - Background subagent finals now use the same durable outbox, acknowledgement, reload replay, purple custom-message rendering, and safe-point wake lane as workflow terminal results. Automatic delivery is the default and can be disabled with `streamAgentResults: false`; the legacy output-tool fallback remains exactly-once. Exhausted all-agent runs are persisted as failed with a recoverable diagnostic, while mixed outcomes remain partial in the runtime result.
 

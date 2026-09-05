@@ -131,9 +131,12 @@ test("tool-input contract records configured omission defaults and soft budget a
   const workflowTimeoutMs = WORKFLOW_CAPABILITY_DEFINITION.capabilities.find(
     ({ id }) => id === "workflow.tool-input.workflowTimeoutMs",
   );
-  assert.equal(workflowTimeoutMs?.signature, "workflowTimeoutMs?: number = 30 minute default, up to 24 hours");
+  assert.equal(
+    workflowTimeoutMs?.signature,
+    "workflowTimeoutMs?: number | null = no deadline by default; explicit limits up to 24 hours",
+  );
   assert.deepEqual(workflowTimeoutMs?.constraints, [
-    "finite logical deadline for the complete workflow frame",
+    "optional logical deadline for the complete workflow frame; null disables a configured limit",
     "cannot interrupt a pending Promise or a microtask-starved event loop",
   ]);
   assert.equal(tokenBudget?.signature, "tokenBudget?: number = configured default or unlimited");

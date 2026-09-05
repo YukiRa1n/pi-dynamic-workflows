@@ -4059,6 +4059,38 @@ test(
   }),
 );
 
+test("manager persists unlimited default and explicit null overrides a configured workflow deadline", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "workflow-unlimited-"));
+  try {
+    const manager = new WorkflowManager({
+      cwd,
+      defaultWorkflowTimeoutMs: 10,
+      agent: {
+        run: async () => {
+          await new Promise((resolve) => setTimeout(resolve, 30));
+          return "done";
+        },
+      },
+    });
+    const run = manager.startInBackground(
+      "export const meta = {name:'unlimited',description:'unlimited'}; return await agent('ready');",
+      undefined,
+      { workflowTimeoutMs: null },
+    );
+    assert.equal(manager.getPersistence().load(run.runId)?.workflowTimeoutMs, null);
+    await run.promise;
+    assert.equal(manager.getRun(run.runId)?.status, "completed");
+    const defaultManager = new WorkflowManager({ cwd, agent: { run: async () => "done" } });
+    const defaultRun = defaultManager.startInBackground(
+      "export const meta = {name:'default-unlimited',description:'unlimited'}; return await agent('ready');",
+    );
+    await defaultRun.promise;
+    assert.equal(defaultManager.getPersistence().load(defaultRun.runId)?.workflowTimeoutMs, null);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 test("manager applies and persists the finite workflow wall-clock deadline", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "workflow-manager-deadline-"));
   try {

@@ -74,11 +74,14 @@ const workflowToolSchema = Type.Object(
       }),
     ),
     workflowTimeoutMs: Type.Optional(
-      Type.Integer({
-        minimum: 1,
-        maximum: MAX_WORKFLOW_TIMEOUT_MS,
-        description: "Workflow timeout (ms).",
-      }),
+      Type.Union([
+        Type.Null(),
+        Type.Integer({
+          minimum: 1,
+          maximum: MAX_WORKFLOW_TIMEOUT_MS,
+          description: "Optional workflow timeout (ms); omitted or null disables it.",
+        }),
+      ]),
     ),
     tokenBudget: Type.Optional(
       Type.Integer({
@@ -163,7 +166,7 @@ export type WorkflowToolInput = {
   concurrency?: number;
   agentRetries?: number;
   agentTimeoutMs?: number;
-  workflowTimeoutMs?: number;
+  workflowTimeoutMs?: number | null;
   tokenBudget?: number;
   resumeFromRunId?: string;
 };
@@ -494,7 +497,10 @@ function normalizeWorkflowToolArgs(
       concurrency: validateInteger(value.concurrency, "concurrency", 1, 16),
       agentRetries: validateInteger(value.agentRetries, "agentRetries", 0, 3),
       agentTimeoutMs: validateInteger(value.agentTimeoutMs, "agentTimeoutMs", 1, MAX_WORKFLOW_TIMEOUT_MS),
-      workflowTimeoutMs: validateInteger(value.workflowTimeoutMs, "workflowTimeoutMs", 1, MAX_WORKFLOW_TIMEOUT_MS),
+      workflowTimeoutMs:
+        value.workflowTimeoutMs === null
+          ? null
+          : validateInteger(value.workflowTimeoutMs, "workflowTimeoutMs", 1, MAX_WORKFLOW_TIMEOUT_MS),
       tokenBudget: validateInteger(value.tokenBudget, "tokenBudget", 1, Number.MAX_SAFE_INTEGER),
     });
   }

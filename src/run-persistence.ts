@@ -168,7 +168,7 @@ export interface PersistedRunState {
    * The run's finite logical wall-clock deadline, fixed at start. Legacy
    * records without this field resume with the manager's current default.
    */
-  workflowTimeoutMs?: number;
+  workflowTimeoutMs?: number | null;
   /**
    * The run's resolved concurrency, fixed at start (per-run value, else the
    * manager's concurrency at the time). Same rationale as tokenBudget.

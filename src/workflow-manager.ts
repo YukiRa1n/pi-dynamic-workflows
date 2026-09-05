@@ -150,8 +150,8 @@ export interface ManagedRun {
    * CURRENT defaultAgentTimeoutMs.
    */
   agentTimeoutMs?: number | null;
-  /** Finite logical wall-clock deadline, fixed at run start and carried through resume. */
-  workflowTimeoutMs?: number;
+  /** Optional wall-clock deadline, fixed at run start and carried through resume. */
+  workflowTimeoutMs?: number | null;
   /**
    * The run's resolved concurrency (per-run value, else the manager's
    * concurrency at the time), fixed at run start/resume for the same reason
@@ -196,8 +196,8 @@ export interface ExecOptions {
   maxAgents?: number;
   /** Per-agent timeout in milliseconds. null/omitted means no per-agent hard timeout. */
   agentTimeoutMs?: number | null;
-  /** Finite logical wall-clock deadline for this execution. */
-  workflowTimeoutMs?: number;
+  /** Optional wall-clock deadline; null means unlimited. */
+  workflowTimeoutMs?: number | null;
   /** Host signal (e.g. tool/Esc) that should abort this run when fired. */
   externalSignal?: AbortSignal;
   /** Called with the live snapshot on every progress event. */
@@ -279,8 +279,8 @@ export interface WorkflowManagerOptions {
   sessionId?: string;
   /** Default per-agent timeout when a run does not pass agentTimeoutMs. null means no per-agent hard timeout. */
   defaultAgentTimeoutMs?: number | null;
-  /** Default finite logical wall-clock deadline for a workflow frame. */
-  defaultWorkflowTimeoutMs?: number;
+  /** Optional default deadline; null/omitted means unlimited. */
+  defaultWorkflowTimeoutMs?: number | null;
   /** Default retry attempts after recoverable agent failures. */
   defaultAgentRetries?: number;
   /** Default hard token budget when a run does not pass tokenBudget. null/omitted means no budget. */
@@ -486,7 +486,7 @@ export class WorkflowManager extends EventEmitter {
   /** The current pi session id; runs are stamped with it and listRuns() filters by it. */
   private sessionId?: string;
   private defaultAgentTimeoutMs: number | null;
-  private defaultWorkflowTimeoutMs: number;
+  private defaultWorkflowTimeoutMs: number | null;
   private defaultAgentRetries: number;
   private defaultTokenBudget: number | null;
   private toolsets?: Record<string, () => ToolDefinition[]>;
@@ -830,7 +830,7 @@ export class WorkflowManager extends EventEmitter {
       // manager's current defaults (see ManagedRun doc comments).
       maxAgents: exec.maxAgents,
       agentTimeoutMs: exec.agentTimeoutMs !== undefined ? exec.agentTimeoutMs : this.defaultAgentTimeoutMs,
-      workflowTimeoutMs: exec.workflowTimeoutMs ?? this.defaultWorkflowTimeoutMs,
+      workflowTimeoutMs: exec.workflowTimeoutMs !== undefined ? exec.workflowTimeoutMs : this.defaultWorkflowTimeoutMs,
       concurrency: exec.concurrency !== undefined ? exec.concurrency : this.concurrency,
       agentRetries: exec.agentRetries !== undefined ? exec.agentRetries : this.defaultAgentRetries,
       activitySeq: ++this.activitySeq,
@@ -945,7 +945,8 @@ export class WorkflowManager extends EventEmitter {
     // Same freeze-at-start pattern as tokenBudget (see startInBackground/ManagedRun).
     managed.maxAgents = exec.maxAgents;
     managed.agentTimeoutMs = exec.agentTimeoutMs !== undefined ? exec.agentTimeoutMs : this.defaultAgentTimeoutMs;
-    managed.workflowTimeoutMs = exec.workflowTimeoutMs ?? this.defaultWorkflowTimeoutMs;
+    managed.workflowTimeoutMs =
+      exec.workflowTimeoutMs !== undefined ? exec.workflowTimeoutMs : this.defaultWorkflowTimeoutMs;
     managed.concurrency = exec.concurrency !== undefined ? exec.concurrency : this.concurrency;
     managed.agentRetries = exec.agentRetries !== undefined ? exec.agentRetries : this.defaultAgentRetries;
     this.runs.set(managed.runId, managed);
@@ -1388,7 +1389,12 @@ export class WorkflowManager extends EventEmitter {
       managed.concurrency !== undefined ? managed.concurrency : (concurrency ?? this.concurrency);
     const resolvedAgentRetries =
       managed.agentRetries !== undefined ? managed.agentRetries : (agentRetries ?? this.defaultAgentRetries);
-    const resolvedWorkflowTimeoutMs = managed.workflowTimeoutMs ?? workflowTimeoutMs ?? this.defaultWorkflowTimeoutMs;
+    const resolvedWorkflowTimeoutMs =
+      managed.workflowTimeoutMs !== undefined
+        ? managed.workflowTimeoutMs
+        : workflowTimeoutMs !== undefined
+          ? workflowTimeoutMs
+          : this.defaultWorkflowTimeoutMs;
     // The budget was resolved (per-run value, else defaultTokenBudget) and frozen
     // on the managed run at start/resume — read it from there so a resumed run
     // keeps the budget it started with. exec.tokenBudget is a safety net for
@@ -2446,7 +2452,8 @@ export class WorkflowManager extends EventEmitter {
       // fallback — legacy runs resume with the manager's CURRENT default,
       // matching the only semantics such a run ever had.
       agentTimeoutMs: persisted.agentTimeoutMs !== undefined ? persisted.agentTimeoutMs : this.defaultAgentTimeoutMs,
-      workflowTimeoutMs: persisted.workflowTimeoutMs ?? this.defaultWorkflowTimeoutMs,
+      workflowTimeoutMs:
+        persisted.workflowTimeoutMs !== undefined ? persisted.workflowTimeoutMs : this.defaultWorkflowTimeoutMs,
       // concurrency/agentRetries have no "explicit opt-out sentinel" the way
       // tokenBudget's null does — a legacy run without a persisted value falls
       // back to the manager's current values, matching how this execution

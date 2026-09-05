@@ -46,7 +46,7 @@ pi install git:github.com/YukiRa1n/pi-dynamic-workflows
 For a reproducible installation, pin a release tag once tags are available:
 
 ```bash
-pi install git:github.com/YukiRa1n/pi-dynamic-workflows@v3.5.1-yuki.5
+pi install git:github.com/YukiRa1n/pi-dynamic-workflows@v3.5.1-yuki.6
 ```
 
 Reload Pi after installation:
@@ -213,7 +213,7 @@ Important globals include:
 | concurrency | workflow-tool-input | `concurrency?: number` | — |
 | agentRetries | workflow-tool-input | `agentRetries?: number = configured value or 0` | — |
 | agentTimeoutMs | workflow-tool-input | `agentTimeoutMs?: number = configured default or no per-agent limit` | — |
-| workflowTimeoutMs | workflow-tool-input | `workflowTimeoutMs?: number = 30 minute default, up to 24 hours` | — |
+| workflowTimeoutMs | workflow-tool-input | `workflowTimeoutMs?: number \| null = no deadline by default; explicit limits up to 24 hours` | — |
 | tokenBudget | workflow-tool-input | `tokenBudget?: number = configured default or unlimited` | — |
 <!-- END GENERATED SUPPORTED WORKFLOW CAPABILITIES -->
 
@@ -230,7 +230,7 @@ skills/workflow-patterns/
 
 - Workflow tool invocations always start in the background. Each live subagent final and the workflow terminal result normally return automatically through the durable safe-point delivery queue. `get_workflow_output` waits for the next delivery boundary and does not poll or replay earlier output. If a blocking wait already returned the terminal `completed` value, the duplicate automatic terminal notification is suppressed. Use the returned run ID with `/workflows status|watch|pause|resume|stop|steer <id>` for explicit inspection and lifecycle actions. A new user requirement starts in the main session or a fresh workflow; it is never sent to an existing unrelated run.
 - `concurrency` is bounded by the runtime maximum.
-- `maxAgents`, retry counts, per-agent timeouts, and optional token budgets can be set per run. Every workflow also has a finite logical wall-clock deadline (30 minutes by default, configurable up to 24 hours with `workflowTimeoutMs`).
+- `maxAgents`, retry counts, per-agent timeouts, and optional token budgets can be set per run. Workflows have no wall-clock deadline by default. Library callers may opt into a limit up to 24 hours with `workflowTimeoutMs`; explicit `null` disables a configured limit. Manual stop remains available. Older persisted runs retain their recorded deadline on resume; new workflows use the unlimited default.
 - A deadline races the complete script frame, closes admission, and aborts cooperative provider attempts. It cannot interrupt a pending Promise or a microtask-starved event loop; late provider settlement is observed and bounded drain cleanup is best effort.
 - Replay identity is run-scoped: provider context such as `cwd`, instructions, tools, and session is hashed once and included in each call key. Nested and retried calls cannot collide on a bare call index. A resumed workflow replays the unchanged completed prefix and runs changed/new calls live.
 - Anthropic-compatible, non-worktree fan-out uses a short cache-warm gate: one compatible request leads, and followers are released when its first assistant response starts. Set `PI_CACHE_RETENTION=none` to disable the gate; `short` is the default and `long` keeps the warm window longer.
