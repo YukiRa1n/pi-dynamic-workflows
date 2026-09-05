@@ -258,6 +258,28 @@ describe("workflow settings", () => {
     });
   });
 
+  it("saves and loads the default-on streamAgentResults override", () => {
+    withSettingsPath((settingsPath) => {
+      assert.equal(loadWorkflowSettings(settingsPath).streamAgentResults ?? true, true);
+
+      saveWorkflowSettings({ streamAgentResults: true }, settingsPath);
+      assert.deepEqual(loadWorkflowSettings(settingsPath), withRevision({ streamAgentResults: true }, 1));
+
+      saveWorkflowSettings({ streamAgentResults: false }, settingsPath);
+      assert.deepEqual(loadWorkflowSettings(settingsPath), withRevision({ streamAgentResults: false }, 2));
+    });
+  });
+
+  it("ignores non-boolean streamAgentResults values", () => {
+    withSettingsPath((settingsPath) => {
+      mkdirSync(dirname(settingsPath), { recursive: true });
+      for (const value of ["true", 1, null]) {
+        writeFileSync(settingsPath, JSON.stringify({ streamAgentResults: value }), "utf-8");
+        assert.deepEqual(loadWorkflowSettings(settingsPath), {});
+      }
+    });
+  });
+
   it("ignores non-boolean persistAgentSessions values", () => {
     withSettingsPath((settingsPath) => {
       mkdirSync(dirname(settingsPath), { recursive: true });

@@ -59,6 +59,7 @@ Every exact fact below is projected from the installed extension's capability co
 - Support: `supported`
 - Signature: `createTeam(name, options?) => AgentTeam`
 - Constraint: workflow-scoped peer messaging and shared task board
+- Constraint: team_inbox({ waitMs }) can event-wait for the next peer message without polling; the wait is bounded and abortable
 - Constraint: team.spawn(specs) reuses the workflow agent scheduler and concurrency budget
 - Constraint: team calls rerun live on resume because mailbox/task side effects are not journaled
 

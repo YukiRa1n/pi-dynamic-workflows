@@ -65,7 +65,7 @@ const plainMarkdownTheme: MarkdownTheme = {
   highlightCode: (code, language) => code.split("\n").map((line) => `[${language}] ${line}`),
 };
 
-test("pager key mappings include pages, boundaries, tail, and summary toggle", () => {
+test("activity key mappings include block pages, boundaries, follow, and expansion", () => {
   assert.deepEqual(keyToAction("enter", "detail"), { type: "togglePager" });
   assert.deepEqual(keyToAction("right", "detail"), { type: "openPager" });
   assert.deepEqual(keyToAction("pageUp", "detail"), { type: "page", direction: -1 });
@@ -76,18 +76,18 @@ test("pager key mappings include pages, boundaries, tail, and summary toggle", (
   assert.deepEqual(keyToAction("t", "runs"), { type: "none" });
 });
 
-test("opening an agent pager is idempotent", () => {
+test("opening agent activity is idempotent", () => {
   const model = modelForAgent({ id: 1, label: "worker", phase: "Work", prompt: "work", status: "running" });
   const state = enterAgentDetail(model);
 
   assert.equal(state.openPager(), true);
-  state.scroll = 4;
+  state.cursor = 4;
   assert.equal(state.openPager(), true);
   assert.equal(state.pagerOpen, true);
-  assert.equal(state.scroll, 4, "opening an existing pager does not reset its position");
+  assert.equal(state.cursor, 4, "opening an existing activity view does not reset its block selection");
 });
 
-test("completed agents default to result-only details and retain a full pager", () => {
+test("completed agents default to a result summary and progressively disclose semantic blocks", () => {
   const model = modelForAgent({
     id: 1,
     label: "completed worker",
@@ -104,16 +104,23 @@ test("completed agents default to result-only details and retain a full pager", 
   assert.match(summary, /complete/);
   assert.doesNotMatch(summary, /private prompt/);
   assert.doesNotMatch(summary, /old history/);
-  assert.match(summary, /enter open pager/);
+  assert.match(summary, /enter activity/);
 
   state.togglePager();
-  const pager = renderNavigator(state, model, 80, undefined, 20, plainMarkdownTheme).join("\n");
-  assert.match(pager, /private prompt/);
-  assert.match(pager, /old history/);
-  assert.match(pager, /\[json\]/);
+  const activity = renderNavigator(state, model, 80, undefined, 20, plainMarkdownTheme).join("\n");
+  assert.match(activity, /Task {2}private prompt/);
+  assert.match(activity, /Model output {2}old history/);
+  assert.match(activity, /Final result/);
+  assert.doesNotMatch(activity, /\[json\]/, "collapsed blocks do not dump raw payloads");
+
+  state.jump("end", 3);
+  state.togglePager();
+  const expanded = renderNavigator(state, model, 80, undefined, 20, plainMarkdownTheme).join("\n");
+  assert.match(expanded, /Final result detail/);
+  assert.match(expanded, /\[json\]/);
 });
 
-test("active agents show their prompt and two latest history events", () => {
+test("active agent summary shows the task, current semantic activity, and counts", () => {
   const history: AgentHistoryEntry[] = [
     { role: "assistant", kind: "text", text: "old event" },
     { role: "assistant", kind: "text", text: "recent event one" },
@@ -131,12 +138,18 @@ test("active agents show their prompt and two latest history events", () => {
   const summary = renderNavigator(state, model, 80, undefined, 30).join("\n");
 
   assert.match(summary, /inspect the project/);
-  assert.match(summary, /recent event one/);
   assert.match(summary, /recent event two/);
+  assert.match(summary, /1 tool · 2 models/);
+  assert.doesNotMatch(summary, /recent event one/, "older model output stays folded in the activity view");
   assert.doesNotMatch(summary, /old event/);
+
+  state.openPager();
+  const activity = renderNavigator(state, model, 80, undefined, 30).join("\n");
+  assert.match(activity, /Model output {2}recent event one/);
+  assert.match(activity, /Tool result · read {2}recent event two/);
 });
 
-test("tail mode follows appended history and scrolling up disables follow", () => {
+test("follow mode tracks appended blocks and moving up disables follow", () => {
   const history: AgentHistoryEntry[] = Array.from({ length: 20 }, (_, index) => ({
     role: "assistant",
     kind: "text",
@@ -154,15 +167,15 @@ test("tail mode follows appended history and scrolling up disables follow", () =
 
   assert.equal(state.toggleTail(), true);
   renderNavigator(state, model, 80, undefined, 12);
-  const previousScroll = state.scroll;
+  const previousCursor = state.cursor;
   history.push({ role: "assistant", kind: "text", text: "new tail event" });
   const tailed = renderNavigator(state, model, 80, undefined, 12).join("\n");
-  assert.ok(state.scroll > previousScroll);
-  assert.match(tailed, /TAIL/);
+  assert.ok(state.cursor > previousCursor);
+  assert.match(tailed, /follow/);
 
-  state.move(-1, 0);
+  state.move(-1, history.length + 1);
   assert.equal(state.tailing, false);
-  state.jump("end", 0);
+  state.jump("end", history.length + 1);
   assert.equal(state.tailing, true);
 });
 
@@ -178,15 +191,16 @@ test("escape closes the pager before leaving agent detail", () => {
   assert.equal(state.kind, "agents");
 });
 
-test("pager footer labels escape as back instead of duplicating the summary hint (#130)", () => {
+test("activity footer describes block navigation and escape returns to summary", () => {
   const model = modelForAgent({ id: 1, label: "worker", phase: "Work", prompt: "work", status: "running" });
   const state = enterAgentDetail(model);
   state.togglePager();
 
   const footer = renderNavigator(state, model, 80, undefined, 20, plainMarkdownTheme).join("\n");
-  assert.match(footer, /enter summary/);
-  assert.match(footer, /esc back/);
-  assert.doesNotMatch(footer, /esc summary/);
+  assert.match(footer, /↑\/↓ block/);
+  assert.match(footer, /enter expand/);
+  assert.match(footer, /esc summary/);
+  assert.doesNotMatch(footer, /↑\/↓ line/);
 });
 
 test("raw read results inherit syntax highlighting from the requested path", () => {
@@ -203,6 +217,8 @@ test("raw read results inherit syntax highlighting from the requested path", () 
     history,
   });
   const state = enterAgentDetail(model);
+  state.togglePager();
+  state.move(1, 2);
   state.togglePager();
   const text = renderNavigator(state, model, 100, undefined, 30, plainMarkdownTheme).join("\n");
 
@@ -230,6 +246,8 @@ test("write calls render source code instead of a raw JSON argument envelope", (
     history,
   });
   const state = enterAgentDetail(model);
+  state.togglePager();
+  state.move(1, 2);
   state.togglePager();
   const text = renderNavigator(state, model, 100, undefined, 30, plainMarkdownTheme).join("\n");
 
@@ -265,6 +283,8 @@ test("edit calls render with Pi's native diff view instead of replacement JSON",
     history,
   });
   const state = enterAgentDetail(model);
+  state.togglePager();
+  state.move(1, 2);
   state.togglePager();
   const text = renderNavigator(state, model, 100, undefined, 30, plainMarkdownTheme).join("\n");
 

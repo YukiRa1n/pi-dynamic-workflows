@@ -66,8 +66,7 @@ class NavigatorTextRenderCache {
   stringify(result: object): string {
     const cached = this.resultJson.get(result);
     if (cached !== undefined) return cached;
-    let json: string;
-    json = safeStringify(result);
+    const json = safeStringify(result);
     this.resultJson.set(result, json);
     return json;
   }
@@ -100,6 +99,13 @@ export type ViewKind = "runs" | "phases" | "agents" | "detail" | "savedDetail";
 
 export type ItemKind = "run" | "saved";
 
+/** Spatial shortcut from the editor to the workflow panel below it. Plain
+ * arrows remain owned by the editor; once open, the navigator uses arrows and
+ * Enter directly. Keep the terminal-facing label beside the binding so every
+ * hint describes the registered key accurately. */
+export const WORKFLOW_NAV_SHORTCUT = "alt+down" as const;
+export const WORKFLOW_NAV_SHORTCUT_LABEL = "Alt+↓";
+
 interface RunRow {
   runId: string;
   name: string;
@@ -129,6 +135,17 @@ interface AgentRow {
   tokens?: number;
   tokenUsage?: AgentUsage;
   model?: string;
+}
+
+type AgentActivityBlockKind = "context" | "model" | "tool" | "error" | "result";
+
+interface AgentActivityBlock {
+  kind: AgentActivityBlockKind;
+  title: string;
+  summary: string;
+  historyIndexes: number[];
+  result?: unknown;
+  resultPreview?: string;
 }
 
 /** Short, human-friendly model label: drop the provider prefix for display. */
@@ -397,6 +414,7 @@ export class NavigatorState {
   scroll = 0;
   tailing = false;
   pagerOpen = false;
+  detailExpanded = false;
   private pageSize = 1;
 
   private top(): StackFrame {
@@ -444,9 +462,16 @@ export class NavigatorState {
   }
 
   move(delta: number, count: number) {
-    if (this.kind === "detail" || this.kind === "savedDetail") {
-      if (this.kind === "detail") this.pagerOpen = true;
+    if (this.kind === "detail") {
+      this.pagerOpen = true;
       if (delta < 0) this.tailing = false;
+      if (count <= 0) return;
+      const next = Math.max(0, Math.min(count - 1, this.cursor + delta));
+      if (next !== this.cursor) this.detailExpanded = false;
+      this.cursor = next;
+      return;
+    }
+    if (this.kind === "savedDetail") {
       this.scroll = Math.max(0, this.scroll + delta);
       return;
     }
@@ -463,9 +488,16 @@ export class NavigatorState {
   /** Move by almost one viewport, retaining one line of reading context. */
   movePage(direction: -1 | 1, count: number) {
     const delta = direction * Math.max(1, this.pageSize - 1);
-    if (this.kind === "detail" || this.kind === "savedDetail") {
-      if (this.kind === "detail") this.pagerOpen = true;
+    if (this.kind === "detail") {
+      this.pagerOpen = true;
       if (direction < 0) this.tailing = false;
+      if (count <= 0) return;
+      const next = Math.max(0, Math.min(count - 1, this.cursor + delta));
+      if (next !== this.cursor) this.detailExpanded = false;
+      this.cursor = next;
+      return;
+    }
+    if (this.kind === "savedDetail") {
       this.scroll = Math.max(0, this.scroll + delta);
       return;
     }
@@ -475,10 +507,14 @@ export class NavigatorState {
   /** Jump to the beginning or end of the current list/detail. End also enables
    * follow mode for a live agent detail; start disables it. */
   jump(edge: "start" | "end", count: number) {
-    if (this.kind === "detail" || this.kind === "savedDetail") {
-      if (this.kind === "detail") this.pagerOpen = true;
-      this.tailing = this.kind === "detail" && edge === "end";
-      // renderNavigator knows the body length and clamps this sentinel.
+    if (this.kind === "detail") {
+      this.pagerOpen = true;
+      this.tailing = edge === "end";
+      this.detailExpanded = false;
+      this.cursor = edge === "start" || count <= 0 ? 0 : count - 1;
+      return;
+    }
+    if (this.kind === "savedDetail") {
       this.scroll = edge === "start" ? 0 : Number.MAX_SAFE_INTEGER;
       return;
     }
@@ -490,19 +526,18 @@ export class NavigatorState {
     if (this.kind !== "detail") return false;
     if (!this.pagerOpen) {
       this.pagerOpen = true;
-      this.scroll = 0;
+      this.cursor = 0;
+      this.detailExpanded = false;
     }
     return true;
   }
 
-  /** Toggle the full pager while retaining the compact agent summary view. */
+  /** Open the semantic activity view, or expand/collapse its selected block. */
   togglePager(): boolean {
     if (this.kind !== "detail") return false;
     if (!this.pagerOpen) return this.openPager();
-    this.pagerOpen = false;
-    this.scroll = 0;
-    this.tailing = false;
-    return false;
+    this.detailExpanded = !this.detailExpanded;
+    return this.detailExpanded;
   }
 
   /** Toggle live follow mode in an agent detail pager. */
@@ -510,7 +545,8 @@ export class NavigatorState {
     if (this.kind !== "detail") return false;
     this.pagerOpen = true;
     this.tailing = !this.tailing;
-    if (this.tailing) this.scroll = Number.MAX_SAFE_INTEGER;
+    this.detailExpanded = false;
+    if (this.tailing) this.cursor = Number.MAX_SAFE_INTEGER;
     return this.tailing;
   }
 
@@ -533,6 +569,7 @@ export class NavigatorState {
       this.scroll = 0;
       this.tailing = false;
       this.pagerOpen = false;
+      this.detailExpanded = false;
       this.stack.push({ kind: "savedDetail", cursor: 0, savedName: item.name });
       return true;
     }
@@ -550,6 +587,7 @@ export class NavigatorState {
       this.scroll = 0;
       this.tailing = false;
       this.pagerOpen = false;
+      this.detailExpanded = false;
       this.stack.push({ kind: "detail", cursor: 0, runId: t.runId, phase: t.phase, agentId: ag.id });
       return true;
     }
@@ -562,6 +600,7 @@ export class NavigatorState {
       this.pagerOpen = false;
       this.scroll = 0;
       this.tailing = false;
+      this.detailExpanded = false;
       return true;
     }
     if (this.stack.length <= 1) return false;
@@ -569,6 +608,7 @@ export class NavigatorState {
     this.scroll = 0;
     this.tailing = false;
     this.pagerOpen = false;
+    this.detailExpanded = false;
     return true;
   }
 
@@ -743,7 +783,7 @@ function rightAgentRow(
   const statsStyled = theme.fg("dim", stats);
 
   // Assemble with explicit cell padding (visibleWidth-driven gaps).
-  let out = marker + dot + " " + nameStyled;
+  let out = `${marker}${dot} ${nameStyled}`;
   const afterName = nameStart + visibleWidth(nameOut);
   if (modelOut) {
     out += " ".repeat(Math.max(0, modelStart - afterName)) + modelStyled;
@@ -1015,35 +1055,21 @@ function renderNavigatorFrame(
     i === state.cursor ? theme.fg("accent", theme.bold(`❯ ${text}`)) : `  ${text}`;
   const dim = (t: string) => theme.fg("dim", t);
 
-  // Render a detail body inside a FIXED-height viewport so j/k scrolls within a
-  // stable box (clamping state.scroll) instead of slicing to the end — which
-  // shrank the overlay and looked like it was collapsing.
+  // Saved workflow source remains a conventional line pager. Agent activity
+  // uses semantic block navigation below, so raw history no longer shares this
+  // scrolling state.
   const pushScrollable = (body: string[]) => {
     const viewport = Math.max(1, viewportRows - 4); // reserve title + blank + footer + indicator
     state.setPageSize(viewport);
     const maxScroll = Math.max(0, body.length - viewport);
-    if (state.kind === "detail" && state.tailing) state.scroll = maxScroll;
     state.scroll = Math.min(Math.max(0, state.scroll), maxScroll);
     lines.push(...body.slice(state.scroll, state.scroll + viewport));
     if (body.length > viewport) {
       const end = Math.min(state.scroll + viewport, body.length);
       const up = state.scroll > 0 ? "↑" : " ";
       const down = end < body.length ? "↓" : " ";
-      const mode = state.kind === "detail" && state.tailing ? " TAIL" : "";
-      lines.push(dim(`  [${state.scroll + 1}-${end} / ${body.length}] ${up}${down}${mode}`));
+      lines.push(dim(`  [${state.scroll + 1}-${end} / ${body.length}] ${up}${down}`));
     }
-  };
-
-  // Compact agent details are deliberately not a pager: they show the useful
-  // current snapshot and reserve scrolling for the explicit full-pager view.
-  const pushCompact = (body: string[]) => {
-    const viewport = Math.max(1, viewportRows - 3); // title + blank + footer
-    if (body.length <= viewport) {
-      lines.push(...body);
-      return;
-    }
-    lines.push(...body.slice(0, Math.max(1, viewport - 1)));
-    lines.push(dim("  … enter to open full pager"));
   };
 
   if (state.kind === "runs") {
@@ -1107,76 +1133,18 @@ function renderNavigatorFrame(
     lines.push(...renderPhasesAgents(state, model, state.runId, width, theme, bodyCap));
   } else if (state.kind === "detail" && state.runId && state.agentId != null) {
     const a = model.agentDetail(state.runId, state.agentId);
-    lines.push(theme.bold(a ? sanitizeUiText(a.label) : "agent"));
-    if (a?.callId) lines.push(dim(`ID: ${sanitizeUiText(a.callId)}`));
+    lines.push(theme.fg("accent", theme.bold(a ? sanitizeUiText(a.label) : "agent")));
     if (a) {
       // Coerce every dynamic value before wrap() (#110): a non-string prompt is
       // reachable even from a LIVE run — agent(42) in a model-written script is
       // never type-checked — and would crash wrap()'s text.split(). Persisted
       // error/status/history text can be non-string on a corrupt run too.
-      const body: string[] = [];
+      lines.push(dim(agentMetaLine(a)));
+      const bodyCap = Math.max(1, viewportRows - 4); // title + meta + blank + footer
       if (state.pagerOpen) {
-        body.push(dim("Status: ") + sanitizeUiText(a.status ?? ""));
-        if (a.model) body.push(dim("Model: ") + sanitizeUiText(shortModel(a.model) ?? ""));
-        if (a.error) body.push(dim("Error: ") + sanitizeUiText(a.error));
-        if (a.errorCode) {
-          body.push(`${dim("Error code: ")}${sanitizeUiText(a.errorCode)}${a.recoverable ? " (recoverable)" : ""}`);
-        }
-        body.push("", theme.fg("accent", theme.bold("Prompt:")));
-        body.push(...renderMarkdownLines(sanitizeUiText(a.prompt ?? ""), width, markdownTheme, renderCache));
-        body.push("", theme.fg("accent", theme.bold("Result:")));
-        body.push(...renderResultLines(a.result, a.resultPreview, width, markdownTheme, renderCache));
-        if (Array.isArray(a.history) && a.history.length) {
-          body.push("", theme.fg("accent", theme.bold("History:")));
-          for (let i = 0; i < a.history.length; i++) {
-            body.push(...renderHistoryEntryLines(a.history, i, width, markdownTheme, dim, renderCache));
-          }
-        }
-        pushScrollable(body);
-      } else if (a.status === "done") {
-        // Completed agents default to their useful final output; prompt/history
-        // remain one keypress away in the full pager.
-        body.push(theme.fg("accent", theme.bold("Result:")));
-        body.push(...renderResultLines(a.result, a.resultPreview, width, markdownTheme, renderCache));
-        pushCompact(body);
+        lines.push(...renderAgentActivity(state, a, width, bodyCap, theme, markdownTheme, renderCache));
       } else {
-        // Active/failed agents default to context plus the latest two events.
-        body.push(dim("Status: ") + sanitizeUiText(a.status ?? ""));
-        if (a.model) body.push(dim("Model: ") + sanitizeUiText(shortModel(a.model) ?? ""));
-        if (a.error) body.push(dim("Error: ") + sanitizeUiText(a.error));
-        if (a.errorCode) {
-          body.push(`${dim("Error code: ")}${sanitizeUiText(a.errorCode)}${a.recoverable ? " (recoverable)" : ""}`);
-        }
-        body.push("", theme.fg("accent", theme.bold("Prompt:")));
-        const promptLines = renderMarkdownLines(sanitizeUiText(a.prompt ?? ""), width, markdownTheme, renderCache);
-        body.push(...promptLines.slice(0, 5));
-        if (promptLines.length > 5) body.push(dim("  … prompt continues in pager"));
-        body.push("", theme.fg("accent", theme.bold("Recent activity:")));
-        if (a.history?.length) {
-          // Keep the latest two entries that can actually produce a useful
-          // summary. Tool results are meaningful activity too (especially for
-          // failed/empty-output agents), so do not discard them merely because
-          // they follow a tool call.
-          const recent: number[] = [];
-          for (let i = a.history.length - 1; i >= 0 && recent.length < 2; i--) {
-            const entry = a.history[i];
-            if (!entry || typeof entry !== "object" || typeof entry.kind !== "string") continue;
-            const text = asText(entry.text).trim();
-            // A tool call can still be useful when its payload is carried by
-            // the structured path/tool fields, but a completely empty corrupt
-            // entry should not displace a meaningful activity item.
-            if (!text && entry.kind !== "toolCall") continue;
-            if (!text && entry.kind === "toolCall" && !entry.toolName && !entry.path) continue;
-            recent.unshift(i);
-          }
-          for (const i of recent) {
-            body.push(...renderHistoryEntryLines(a.history, i, width, markdownTheme, dim, renderCache, true));
-          }
-          if (recent.length === 0) body.push(dim("  Waiting for the first agent event…"));
-        } else {
-          body.push(dim("  Waiting for the first agent event…"));
-        }
-        pushCompact(body);
+        lines.push(...renderAgentSummary(a, width, bodyCap, theme, markdownTheme, renderCache));
       }
     }
   } else if (state.kind === "savedDetail" && state.savedName) {
@@ -1457,21 +1425,287 @@ function renderHistoryEntryLines(
   ];
 }
 
+function agentMetaLine(agent: WorkflowAgentSnapshot): string {
+  const status = sanitizeUiText(agent.status ?? "unknown");
+  const icon = STATUS_ICON[status] ?? "?";
+  const stats = fmtTokenSegment(tokenFigures(agent.tokenUsage, agent.tokens), compactTokens);
+  return [
+    `${icon} ${status}`,
+    agent.phase != null ? sanitizeUiText(agent.phase) : "",
+    agent.model ? sanitizeUiText(shortModel(agent.model) ?? "") : "",
+    stats,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+}
+
+function oneLine(value: unknown): string {
+  return sanitizeUiText(value).replace(/\s+/g, " ").trim();
+}
+
+function resultSummary(result: unknown, previewText?: string): string {
+  if (result === undefined || result === null) return oneLine(previewText ?? "") || "no result";
+  if (typeof result === "string") return oneLine(result) || "no result";
+  return oneLine(serializeBounded(result, { pretty: false, maxBytes: 2_000 })) || "structured result";
+}
+
+function toolTargetSummary(entry: NonNullable<WorkflowAgentSnapshot["history"]>[number]): string {
+  const compact = compactHistoryLine(entry, 4_000);
+  const label = `${historyLabel(entry)}:`;
+  return oneLine(compact.startsWith(label) ? compact.slice(label.length) : compact);
+}
+
+/** Convert raw agent history into semantic blocks. A tool call and its matching
+ * result become one transaction instead of two unrelated rows. */
+function agentActivityBlocks(agent: WorkflowAgentSnapshot): AgentActivityBlock[] {
+  const blocks: AgentActivityBlock[] = [];
+  const prompt = oneLine(agent.prompt ?? "");
+  if (prompt) {
+    blocks.push({ kind: "context", title: "Task", summary: prompt, historyIndexes: [] });
+  }
+
+  const history = Array.isArray(agent.history) ? agent.history : [];
+  const pendingToolBlocks: number[] = [];
+  for (let index = 0; index < history.length; index++) {
+    const entry = history[index];
+    if (!entry || typeof entry !== "object" || typeof entry.kind !== "string") continue;
+    const text = oneLine(entry.text);
+
+    // Pi normally repeats the child prompt as the first user history entry.
+    // Keep it once as the Task block instead of showing duplicate context.
+    if (entry.role === "user" && prompt && text === prompt) continue;
+
+    if (entry.kind === "toolCall") {
+      const tool = oneLine(entry.toolName ?? "tool") || "tool";
+      blocks.push({
+        kind: "tool",
+        title: `Tool · ${tool}`,
+        summary: toolTargetSummary(entry) || "call",
+        historyIndexes: [index],
+      });
+      pendingToolBlocks.push(blocks.length - 1);
+      continue;
+    }
+
+    if (entry.role === "tool" || entry.kind === "toolResult") {
+      const tool = oneLine(entry.toolName ?? "tool") || "tool";
+      const pendingIndex = pendingToolBlocks.findIndex((blockIndex) => {
+        const pending = blocks[blockIndex];
+        return pending?.kind === "tool" && (pending.title === `Tool · ${tool}` || tool === "tool");
+      });
+      if (pendingIndex >= 0) {
+        const blockIndex = pendingToolBlocks.splice(pendingIndex, 1)[0];
+        const block = blocks[blockIndex];
+        if (block) {
+          block.historyIndexes.push(index);
+          block.summary = `${block.summary} · ${entry.isError || entry.kind === "error" ? "failed" : "done"}`;
+        }
+      } else {
+        blocks.push({
+          kind: entry.isError || entry.kind === "error" ? "error" : "tool",
+          title: `${entry.isError || entry.kind === "error" ? "Error" : "Tool result"} · ${tool}`,
+          summary: text || "no text output",
+          historyIndexes: [index],
+        });
+      }
+      continue;
+    }
+
+    if (entry.kind === "error" || entry.isError) {
+      blocks.push({ kind: "error", title: "Error", summary: text || "agent error", historyIndexes: [index] });
+      continue;
+    }
+
+    if (entry.role === "assistant") {
+      blocks.push({
+        kind: "model",
+        title: "Model output",
+        summary: text || "empty output",
+        historyIndexes: [index],
+      });
+      continue;
+    }
+
+    if (text) blocks.push({ kind: "context", title: "Input", summary: text, historyIndexes: [index] });
+  }
+
+  if (agent.result !== undefined || agent.resultPreview) {
+    blocks.push({
+      kind: "result",
+      title: "Final result",
+      summary: resultSummary(agent.result, agent.resultPreview),
+      historyIndexes: [],
+      result: agent.result,
+      resultPreview: agent.resultPreview,
+    });
+  }
+  return blocks;
+}
+
+function activityCountLabel(blocks: AgentActivityBlock[]): string {
+  const tools = blocks.filter((block) => block.kind === "tool").length;
+  const model = blocks.filter((block) => block.kind === "model").length;
+  const errors = blocks.filter((block) => block.kind === "error").length;
+  const hasResult = blocks.some((block) => block.kind === "result");
+  const parts = [
+    tools ? `${tools} ${pluralize("tool", tools)}` : "",
+    model ? `${model} ${pluralize("model", model)}` : "",
+    errors ? `${errors} ${pluralize("error", errors)}` : "",
+  ].filter(Boolean);
+  return parts.join(" · ") || (hasResult ? "result ready" : "no events yet");
+}
+
+function fitCompactBody(lines: string[], cap: number, theme: ThemeLike): string[] {
+  if (lines.length <= cap) return lines;
+  if (cap <= 1) return [theme.fg("dim", "…")];
+  return [...lines.slice(0, cap - 1), theme.fg("dim", "  … more in Activity")];
+}
+
+function renderAgentSummary(
+  agent: WorkflowAgentSnapshot,
+  width: number,
+  cap: number,
+  theme: ThemeLike,
+  markdownTheme: MarkdownTheme | undefined,
+  renderCache: NavigatorTextRenderCache | undefined,
+): string[] {
+  const blocks = agentActivityBlocks(agent);
+  const body: string[] = [];
+  const label = (text: string) => theme.fg("dim", `${text.padEnd(9)} `);
+
+  if (agent.error) body.push(`${label("Error")}${theme.fg("error", oneLine(agent.error))}`);
+  if (agent.errorCode) {
+    body.push(
+      `${label("Code")}${theme.fg("error", `${sanitizeUiText(agent.errorCode)}${agent.recoverable ? " · recoverable" : ""}`)}`,
+    );
+  }
+
+  body.push(`${label("Activity")}${activityCountLabel(blocks)}`);
+  if (agent.status === "done") {
+    body.push(theme.fg("accent", theme.bold("Result")));
+    body.push(...renderResultLines(agent.result, agent.resultPreview, width, markdownTheme, renderCache));
+    return fitCompactBody(body, cap, theme);
+  }
+
+  const task = oneLine(agent.prompt ?? "");
+  if (task) body.push(`${label("Task")}${truncateToWidth(task, Math.max(1, width - 11), ELLIPSIS, false)}`);
+  const current = [...blocks].reverse().find((block) => block.kind !== "context" && block.kind !== "result");
+  if (current) {
+    const summary = `${current.title}${current.summary ? ` — ${current.summary}` : ""}`;
+    body.push(`${label("Now")}${truncateToWidth(summary, Math.max(1, width - 11), ELLIPSIS, false)}`);
+  } else if (!agent.error) {
+    body.push(`${label("Now")}${theme.fg("dim", "waiting for the first agent event")}`);
+  }
+  return fitCompactBody(body, cap, theme);
+}
+
+const ACTIVITY_GLYPH: Record<AgentActivityBlockKind, string> = {
+  context: "·",
+  model: "◆",
+  tool: "↳",
+  error: "✗",
+  result: "✓",
+};
+
+function renderActivityBlockRow(block: AgentActivityBlock, selected: boolean, width: number, theme: ThemeLike): string {
+  const marker = selected ? "❯" : " ";
+  const raw = `${marker} ${ACTIVITY_GLYPH[block.kind]} ${block.title}${block.summary ? `  ${block.summary}` : ""}`;
+  const clipped = truncateToWidth(raw, width, ELLIPSIS, false);
+  if (selected) return theme.fg("accent", theme.bold(clipped));
+  if (block.kind === "error") return theme.fg("error", clipped);
+  if (block.kind === "result") return theme.fg("success", clipped);
+  return clipped;
+}
+
+function renderActivityBlockDetails(
+  block: AgentActivityBlock,
+  agent: WorkflowAgentSnapshot,
+  width: number,
+  markdownTheme: MarkdownTheme | undefined,
+  dim: (text: string) => string,
+  renderCache: NavigatorTextRenderCache | undefined,
+): string[] {
+  if (block.kind === "context" && block.historyIndexes.length === 0) {
+    return renderMarkdownLines(sanitizeUiText(agent.prompt ?? ""), width, markdownTheme, renderCache);
+  }
+  if (block.kind === "result") {
+    return renderResultLines(block.result, block.resultPreview, width, markdownTheme, renderCache);
+  }
+  const history = Array.isArray(agent.history) ? agent.history : [];
+  const lines: string[] = [];
+  for (const index of block.historyIndexes) {
+    const entry = history[index];
+    if (!entry || typeof entry !== "object") continue;
+    if (block.kind === "model" && entry.kind === "text") {
+      lines.push(...renderMarkdownLines(sanitizeUiText(entry.text), width, markdownTheme, renderCache));
+    } else {
+      lines.push(...renderHistoryEntryLines(history, index, width, markdownTheme, dim, renderCache));
+    }
+  }
+  return lines.length ? lines : [dim("No detail available.")];
+}
+
+function renderAgentActivity(
+  state: NavigatorState,
+  agent: WorkflowAgentSnapshot,
+  width: number,
+  cap: number,
+  theme: ThemeLike,
+  markdownTheme: MarkdownTheme | undefined,
+  renderCache: NavigatorTextRenderCache | undefined,
+): string[] {
+  const dim = (text: string) => theme.fg("dim", text);
+  const blocks = agentActivityBlocks(agent);
+  if (blocks.length === 0) return [dim("Activity · waiting for the first agent event")];
+  if (state.tailing) state.cursor = blocks.length - 1;
+  state.clamp(blocks.length);
+
+  const headerRows = 1;
+  const detailDividerRows = state.detailExpanded ? 1 : 0;
+  const listCap = state.detailExpanded
+    ? Math.max(1, Math.min(blocks.length, Math.min(6, Math.floor(Math.max(1, cap - 2) / 2))))
+    : Math.max(1, cap - headerRows);
+  state.setPageSize(listCap);
+  const win = scrollWindow(blocks.length, state.cursor, listCap);
+  const end = win.start + win.count;
+  const range =
+    blocks.length > listCap
+      ? ` · ${win.start + 1}-${end}/${blocks.length}`
+      : ` · ${blocks.length} ${pluralize("block", blocks.length)}`;
+  const follow = state.tailing ? " · follow" : "";
+  const out = [dim(`Activity · ${activityCountLabel(blocks)}${range}${follow}`)];
+  for (let index = win.start; index < end; index++) {
+    const block = blocks[index];
+    if (block) out.push(renderActivityBlockRow(block, index === state.cursor, width, theme));
+  }
+
+  if (!state.detailExpanded) return out.slice(0, cap);
+  const selected = blocks[state.cursor];
+  if (!selected || out.length + detailDividerRows >= cap) return out.slice(0, cap);
+  out.push(dim(`─ ${selected.title} detail ${"─".repeat(Math.max(0, width - visibleWidth(selected.title) - 11))}`));
+  const detail = renderActivityBlockDetails(selected, agent, width, markdownTheme, dim, renderCache);
+  const room = Math.max(0, cap - out.length);
+  if (detail.length <= room) return [...out, ...detail];
+  if (room <= 0) return out.slice(0, cap);
+  if (room === 1) return [...out, dim("  … detail clipped; full data remains in the run journal")];
+  return [...out, ...detail.slice(0, room - 1), dim("  … detail clipped; full data remains in the run journal")];
+}
+
 function footerHint(state: NavigatorState, model: NavigatorModel, theme: ThemeLike): string {
   const parts: string[] = [];
   switch (state.kind) {
     case "detail":
       if (state.pagerOpen) {
         parts.push(
-          "↑/↓ line",
-          "PgUp/PgDn page",
+          "↑/↓ block",
+          "PgUp/PgDn blocks",
           "g/G ends",
           `t tail:${state.tailing ? "on" : "off"}`,
-          "enter summary",
-          "esc back",
+          `enter ${state.detailExpanded ? "collapse" : "expand"}`,
+          "esc summary",
         );
       } else {
-        parts.push("enter open pager", "t tail", "esc back");
+        parts.push("enter activity", "t follow", "esc back");
       }
       break;
     case "savedDetail":
@@ -1654,6 +1888,10 @@ function currentCount(state: NavigatorState, model: NavigatorModel): number {
   if (state.kind === "runs") return model.runs().length + model.saved().length;
   if (state.kind === "phases" && state.runId) return model.phases(state.runId).length;
   if (state.kind === "agents" && state.runId && state.phase) return model.agents(state.runId, state.phase).length;
+  if (state.kind === "detail" && state.runId && state.agentId != null) {
+    const agent = model.agentDetail(state.runId, state.agentId);
+    return agent ? agentActivityBlocks(agent).length : 0;
+  }
   return 0;
 }
 

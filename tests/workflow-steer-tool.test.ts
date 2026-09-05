@@ -89,3 +89,46 @@ test("workflow_steer requires the agentId to belong to the same runId", async ()
     { message: "correction", agentId: "run-b:0", runId: "run-a", kind: "same_task_correction" },
   ]);
 });
+test("workflow_steer rejects steering a run owned by another session", async () => {
+  const manager = {
+    getSessionId: () => "session-a",
+    listRuns: () => [{ runId: "run-a", sessionId: "session-b", status: "running" }],
+    async sendToAgent() {
+      throw new Error("must not be reached");
+    },
+  } as unknown as WorkflowManager;
+  const tool = createWorkflowSteerTool({ manager });
+  await assert.rejects(
+    () =>
+      tool.execute(
+        "steer-own-1",
+        { runId: "run-a", message: "correction", kind: "same_task_correction" },
+        undefined,
+        undefined,
+        undefined,
+      ),
+    /not owned by the current session/i,
+  );
+});
+
+test("workflow_steer allows steering a run owned by the current session", async () => {
+  let reached = false;
+  const manager = {
+    getSessionId: () => "session-a",
+    listRuns: () => [{ runId: "run-a", sessionId: "session-a", status: "running" }],
+    enqueueUserMessage(_message: string, runId: string, _kind: string) {
+      reached = true;
+      return runId;
+    },
+  } as unknown as WorkflowManager;
+  const tool = createWorkflowSteerTool({ manager });
+  const result = await tool.execute(
+    "steer-own-2",
+    { runId: "run-a", message: "correction", kind: "same_task_correction" },
+    undefined,
+    undefined,
+    undefined,
+  );
+  assert.equal(reached, true);
+  assert.equal(result.details.runId, "run-a");
+});

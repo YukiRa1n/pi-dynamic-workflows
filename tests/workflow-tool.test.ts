@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { validateToolArguments } from "@earendil-works/pi-ai";
 import type { AgentUsage } from "../src/agent.js";
 import { BUILTIN_WORKFLOW_NAMES } from "../src/builtin-workflows.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
@@ -290,9 +291,50 @@ test("workflowToolSchema exposes resumeFromRunId, script, and name as optional a
   assert.ok(!(schema.required ?? []).includes("resumeFromRunId"), "resumeFromRunId is optional");
 });
 
+test("start_workflow call shapes pass through the installed Pi validator", () => {
+  const tool = createWorkflowTool({ modelFacing: true });
+  const validate = (args: Record<string, unknown>) =>
+    validateToolArguments(tool, { type: "toolCall", id: "schema-regression", name: tool.name, arguments: args });
+  for (const args of [
+    { preset: "codebase-audit" },
+    { preset: "codebase-audit", args: { scope: "outputs", checks: ["structure"] } },
+    { script: "return 1;" },
+  ])
+    assert.deepEqual(validate(args), args);
+  for (const args of [{}, { script: "return 1;", preset: "codebase-audit" }, { script: "return 1;", args: {} }]) {
+    assert.throws(() => validate(args), /Validation failed/);
+  }
+});
+
+test("preset arguments remain exclusive after Pi prepareArguments, including an empty script", async () => {
+  const tool = createWorkflowTool({ modelFacing: true });
+  for (const args of [
+    { preset: "codebase-audit" },
+    { preset: "codebase-audit", args: { scope: "logs", checks: ["inventory"] } },
+    { preset: "codebase-audit", script: "  " },
+  ]) {
+    const prepared = await tool.prepareArguments?.(args);
+    assert.ok(prepared);
+    assert.equal(Object.hasOwn(prepared, "script"), false, "undefined is not an absent property");
+    assert.deepEqual(
+      validateToolArguments(tool, {
+        type: "toolCall",
+        id: "prepared-probe",
+        name: tool.name,
+        arguments: prepared as Record<string, unknown>,
+      }),
+      prepared,
+    );
+  }
+});
+
 test("extension-facing workflow schema is start-only", () => {
   const tool = createWorkflowTool({ allowResume: false, exposeAdvancedParameters: false, modelFacing: true });
-  const schema = tool.parameters as { properties: Record<string, unknown>; required?: string[] };
+  const schema = tool.parameters as {
+    properties: Record<string, unknown>;
+    required?: string[];
+    oneOf?: Array<Record<string, unknown>>;
+  };
 
   assert.equal(tool.name, "start_workflow");
   assert.equal(schema.properties.resumeFromRunId, undefined, "extension surface must not advertise resume");
@@ -309,6 +351,11 @@ test("extension-facing workflow schema is start-only", () => {
   assert.ok(schema.properties.preset, "extension surface should expose curated presets, not arbitrary names");
   assert.equal(schema.properties.name, undefined, "extension surface must not accept arbitrary saved/run names");
   assert.equal((tool.parameters as Record<string, unknown>).additionalProperties, false);
+  assert.equal(schema.oneOf?.length, 2, "schema should advertise the two mutually exclusive invocation forms");
+  assert.deepEqual(
+    schema.oneOf?.map((branch) => branch.required),
+    [["script"], ["preset"]],
+  );
   assert.equal(tool.promptGuidelines, undefined);
   assert.match(tool.description, /existing runs use \/workflows/i);
   const prepared = tool.prepareArguments?.({ script: "await agent('inspect', { label: 'inspect' })" }) as {

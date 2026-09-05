@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { execSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import test from "node:test";
@@ -7,14 +6,9 @@ import packageJson from "../package.json" with { type: "json" };
 import { WORKFLOW_AUTHORING_COVERAGE } from "../src/workflow-authoring-coverage.js";
 import { WORKFLOW_CAPABILITY_DEFINITION } from "../src/workflow-capability-contract.js";
 import { checkWorkflowRelease, parseNpmPackFilePaths } from "../src/workflow-release-gate.js";
+import { publishableFiles } from "./helpers/publishable-files.js";
 
 const ROOT = join(import.meta.dirname, "..");
-const NPM_COMMAND = process.platform === "win32" ? "npm.cmd" : "npm";
-
-function publishableFiles(): string[] {
-  const output = execSync(`${NPM_COMMAND} pack --dry-run --json`, { cwd: ROOT, encoding: "utf8" });
-  return parseNpmPackFilePaths(output);
-}
 
 test("npm pack parsing keeps only valid publishable file paths", () => {
   assert.deepEqual(parseNpmPackFilePaths(JSON.stringify([{ files: [{ path: "README.md" }, {}, { path: 42 }] }])), [

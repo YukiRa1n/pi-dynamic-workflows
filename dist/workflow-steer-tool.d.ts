@@ -12,6 +12,8 @@ export interface WorkflowSteerToolOptions {
     manager?: WorkflowManager;
     /** Live manager accessor; prefer it when a session reload can replace the manager. */
     getManager?: () => WorkflowManager;
+    /** Current host-session accessor; enables ownership checks for steer. */
+    getSessionId?: () => string | undefined;
 }
 export declare function createWorkflowSteerTool(options: WorkflowSteerToolOptions): ToolDefinition<typeof workflowSteerSchema, Record<string, unknown>>;
 export {};

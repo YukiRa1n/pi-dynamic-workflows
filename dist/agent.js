@@ -120,7 +120,11 @@ export function throwIfProviderExecutionError(messages, label) {
 export async function resolveStructuredOutput(session, capture, schema, options, lastText) {
     if (capture.called)
         return capture.value;
-    const maxRetries = Math.max(0, options.maxSchemaRetries ?? 2);
+    // Guard against NaN/Infinity/non-integer retry counts: a NaN max would skip
+    // the schema-repair loop entirely (silently accepting a failed parse) and
+    // Infinity would retry forever. Clamp to a finite non-negative integer.
+    const requestedRetries = options.maxSchemaRetries ?? 2;
+    const maxRetries = Number.isFinite(requestedRetries) && requestedRetries > 0 ? Math.floor(requestedRetries) : 0;
     // Restrict to the schema tool so the only useful next action is calling it
     // (takes effect on the next prompt turn). Best-effort.
     try {
@@ -136,6 +140,11 @@ export async function resolveStructuredOutput(session, capture, schema, options,
     }
     if (capture.called)
         return capture.value;
+    // Cancellation must win even after the last repair prompt settles: an abort
+    // during that await leaves the session unusable, so a prose extraction or
+    // schema error returned here would be a stale success on a cancelled run.
+    if (options.signal?.aborted)
+        throw new Error("Subagent was aborted");
     const extracted = extractValidated(lastText(session.messages), schema);
     if (extracted !== undefined) {
         console.warn("[workflow] structured_output recovered from prose extraction (the model never called the tool); prefer a tool-reliable model");
@@ -724,7 +733,14 @@ export class WorkflowAgent {
             if (options.signal?.aborted)
                 throw new Error("Subagent was aborted");
             if (options.signal) {
-                const onAbort = () => void session.abort();
+                // abort() returns a Promise (it awaits provider idle); swallow a
+                // rejection so an abort-time provider failure cannot surface as an
+                // unhandled rejection from a fire-and-forget listener.
+                const onAbort = () => {
+                    session.abort().catch(() => {
+                        /* abort is best-effort; the run tail handles the outcome */
+                    });
+                };
                 options.signal.addEventListener("abort", onAbort, { once: true });
                 removeAbortListener = () => options.signal?.removeEventListener("abort", onAbort);
             }
@@ -762,13 +778,17 @@ export class WorkflowAgent {
             }
             if (options.signal?.aborted)
                 throw new Error("Subagent was aborted");
-            const promptPromise = session.prompt(this.buildPrompt(prompt, options, Boolean(options.schema)));
+            // Contract (see onSessionReady doc): the callback runs after the child
+            // session exists and BEFORE the first prompt. Calling it after
+            // session.prompt() starts lets the observer race the outbound request
+            // (e.g. a steering message or a session-state read).
             try {
                 options.onSessionReady?.(session);
             }
             catch {
-                // Session visibility is observer-only; the provider request is already live.
+                // Session visibility is observer-only; the observer must not break the run.
             }
+            const promptPromise = session.prompt(this.buildPrompt(prompt, options, Boolean(options.schema)));
             await promptPromise;
             promptCompleted = true;
             if (options.signal?.aborted)
@@ -828,7 +848,14 @@ export class WorkflowAgent {
                     // Usage is best-effort; never let stats failure mask the real result/error.
                 }
             }
-            session.dispose();
+            try {
+                session.dispose();
+            }
+            catch (disposeError) {
+                // A disposal failure must not mask the real result/error nor skip
+                // onSessionEnd (which lets the workflow release sender/team state).
+                console.warn("[workflow] session dispose failed:", disposeError);
+            }
             try {
                 options.onSessionEnd?.(session);
             }

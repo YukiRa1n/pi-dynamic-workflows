@@ -9,6 +9,7 @@ import {
   createListActiveWorkflowsTool,
   createStopWorkflowTool,
   createWorkflowControlTool,
+  releaseWorkflowOutputWaitForInput,
 } from "../src/workflow-control-tool.js";
 import type { WorkflowManager } from "../src/workflow-manager.js";
 
@@ -131,6 +132,7 @@ async function executeOutput(manager: WorkflowManager, params: Record<string, un
 
 const renderTheme = {
   fg: (_color: string, value: string) => value,
+  bg: (_color: string, value: string) => value,
   bold: (value: string) => value,
 };
 
@@ -157,17 +159,19 @@ test("list_active_workflows exposes a strict empty schema and no lifecycle contr
   assert.throws(() => prepare({ status: true }), /does not accept status/);
 });
 
-test("get_workflow_output exposes a strict one-shot blocking schema", () => {
+test("get_workflow_output exposes a strict next-output wait schema", () => {
   const manager = outputManager({ ...run("completed"), sessionId: "session-a", result: "done" });
   const tool = createGetWorkflowOutputTool({ manager });
 
   assert.equal(tool.name, "get_workflow_output");
-  assert.match(tool.description, /Wait once/i);
-  assert.match(tool.description, /Esc cancels only the wait/i);
-  assert.match(tool.description, /Never poll list_active_workflows or use shell sleep/i);
+  assert.match(tool.description, /event wait/i);
+  assert.match(tool.description, /not status/i);
+  assert.match(tool.description, /next agent result/i);
+  assert.match(tool.description, /Esc cancels this wait only/i);
+  assert.match(tool.description, /Never poll or use shell sleep/i);
   assert.equal(Check(tool.parameters, { runId: "audit-abc123" }), true);
-  assert.equal(Check(tool.parameters, { runId: "audit-abc123", block: false, timeoutMs: 10 }), true);
-  assert.equal(Check(tool.parameters, { runId: "audit-abc123", timeoutMs: 0 }), false);
+  assert.equal(Check(tool.parameters, { runId: "audit-abc123", block: false }), true);
+  assert.equal(Check(tool.parameters, { runId: "audit-abc123", timeoutMs: 10 }), false);
   assert.equal(Check(tool.parameters, { runId: "audit-abc123", extra: true }), false);
   assert.equal(tool.promptSnippet, undefined);
   assert.equal(tool.promptGuidelines, undefined);
@@ -177,10 +181,9 @@ test("get_workflow_output exposes a strict one-shot blocking schema", () => {
   assert.deepEqual(prepare({ runId: "audit-abc123" }), {
     runId: "audit-abc123",
     block: true,
-    timeoutMs: 600_000,
   });
   assert.throws(() => prepare({ runId: "../foreign" }), /canonical runId/);
-  assert.throws(() => prepare({ runId: "audit-abc123", timeoutMs: 0 }), /integer from 1/);
+  assert.throws(() => prepare({ runId: "audit-abc123", timeoutMs: 10 }), /does not accept timeoutMs/);
   assert.throws(() => prepare({ runId: "audit-abc123", extra: true }), /does not accept extra/);
 });
 
@@ -193,7 +196,7 @@ test("get_workflow_output returns a bounded completed result immediately", async
   const tool = createGetWorkflowOutputTool({ manager, getResultMaxChars: () => 80 });
   const response = await (tool.execute as any)(
     "output-call",
-    { runId: "audit-abc123", block: true, timeoutMs: 100 },
+    { runId: "audit-abc123", block: true },
     undefined,
     undefined,
     {},
@@ -201,7 +204,7 @@ test("get_workflow_output returns a bounded completed result immediately", async
 
   assert.equal(response.details.completed, true);
   assert.equal(response.details.status, "completed");
-  assert.equal(response.details.timedOut, undefined);
+  assert.equal(response.details.inputPending, undefined);
   assert.match(response.content[0].text, /final report/);
   assert.match(response.content[0].text, /Full persisted run: \[path redacted\]/);
   assert.equal(response.details.resultPath, "[path redacted]");
@@ -210,13 +213,15 @@ test("get_workflow_output returns a bounded completed result immediately", async
 
 test("get_workflow_output waits on lifecycle events once and removes every listener", async () => {
   const manager = outputManager({ ...run("running"), sessionId: "session-a" });
-  const pending = executeOutput(manager, { runId: "audit-abc123", block: true, timeoutMs: 500 });
+  const pending = executeOutput(manager, { runId: "audit-abc123", block: true });
   await new Promise<void>((resolve) => setImmediate(resolve));
 
   for (const eventName of ["complete", "error", "stopped", "paused", "deleted"]) {
     assert.equal(manager.listenerCount(eventName), 1);
   }
   assert.equal(manager.listenerCount("delivery"), 1);
+  assert.equal(manager.listenerCount("agentEnd"), 1);
+  assert.equal(manager.listenerCount("parentInput"), 1);
   manager.emit("complete", { runId: "other-run" });
   manager.state = { ...manager.state, status: "completed", result: "verified output" };
   manager.emit("complete", { runId: "audit-abc123" });
@@ -228,11 +233,155 @@ test("get_workflow_output waits on lifecycle events once and removes every liste
     assert.equal(manager.listenerCount(eventName), 0);
   }
   assert.equal(manager.listenerCount("delivery"), 0);
+  assert.equal(manager.listenerCount("agentEnd"), 0);
+  assert.equal(manager.listenerCount("parentInput"), 0);
+});
+
+test("waiting UI subscribes before publishing progress so immediate user input cannot be missed", async () => {
+  const manager = outputManager({ ...run("running"), sessionId: "session-a" });
+  const tool = createGetWorkflowOutputTool({ manager });
+  const updates: any[] = [];
+  const response = await (tool.execute as any)("wait-ui", { runId: "audit-abc123" }, undefined, (update: any) => {
+    updates.push(update);
+    releaseWorkflowOutputWaitForInput(manager, "audit-abc123");
+  });
+  assert.equal(updates.length, 1);
+  assert.match(updates[0].content[0].text, /Esc cancels the wait only/);
+  assert.equal(response.details.inputPending, true);
+  assert.equal(manager.eventNames().length, 0);
+  assert.equal(manager.state.status, "running");
+});
+
+test("get_workflow_output immediately returns an unconsumed completed agent result exactly once", async () => {
+  const item = { ...run("running"), sessionId: "session-a" };
+  item.agents[0] = {
+    id: 1,
+    callId: "audit-abc123:0",
+    label: "completed scan",
+    phase: "Inspect",
+    prompt: "scan",
+    status: "done",
+    resultPreview: "compact preview",
+    tokens: 30,
+  };
+  item.journal = [
+    {
+      index: 0,
+      runId: "audit-abc123",
+      hash: "scan-hash",
+      result: { findings: ["full agent result"] },
+    },
+  ];
+  const manager = outputManager(item);
+
+  const first = await executeOutput(manager, { runId: "audit-abc123", block: false });
+  assert.equal(first.details.completed, false);
+  assert.deepEqual(first.details.agentOutputs, [
+    {
+      id: 1,
+      callId: "audit-abc123:0",
+      label: "completed scan",
+      phase: "Inspect",
+      status: "done",
+    },
+  ]);
+  assert.match(first.content[0].text, /full agent result/);
+  assert.match(first.content[0].text, /call get_workflow_output again only if/i);
+
+  const secondPending = executeOutput(manager, { runId: "audit-abc123", block: true });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  releaseWorkflowOutputWaitForInput(manager, "audit-abc123");
+  const second = await secondPending;
+  assert.equal(second.details.agentOutputs, undefined);
+  assert.equal(second.details.inputPending, true, "the same completed result is not returned twice");
+});
+
+test("get_workflow_output drains every completed agent across bounded batches", async () => {
+  const item = { ...run("running"), sessionId: "session-a" };
+  item.agents = Array.from({ length: 18 }, (_, index) => ({
+    id: index + 1,
+    callId: `${item.runId}:${index}`,
+    label: `agent ${index + 1}`,
+    prompt: "scan",
+    status: "done" as const,
+    result: `result ${index + 1}`,
+  }));
+  const manager = outputManager(item);
+  const ids: number[] = [];
+  for (const expectedCount of [8, 8, 2]) {
+    const response = await executeOutput(manager, { runId: item.runId, block: false });
+    assert.equal(response.details.agentOutputs?.length, expectedCount);
+    ids.push(...response.details.agentOutputs.map((output: { id: number }) => output.id));
+    assert.equal(response.details.hasMoreAgentOutputs === true, ids.length < 18);
+  }
+  assert.deepEqual(
+    ids,
+    item.agents.map((agent) => agent.id),
+  );
+  const empty = await executeOutput(manager, { runId: item.runId, block: false });
+  assert.equal(empty.details.agentOutputs, undefined);
+});
+
+test("get_workflow_output wakes on agentEnd and returns the live subagent result", async () => {
+  const manager = outputManager({ ...run("running"), sessionId: "session-a" });
+  const pending = executeOutput(manager, { runId: "audit-abc123", block: true });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  manager.state = {
+    ...manager.state,
+    agents: manager.state.agents.map((agent) =>
+      agent.id === 1
+        ? {
+            ...agent,
+            callId: "audit-abc123:0",
+            status: "done" as const,
+            resultPreview: "agent completed",
+          }
+        : agent,
+    ),
+    journal: [
+      {
+        index: 0,
+        runId: "audit-abc123",
+        hash: "scan-hash",
+        result: "live completed result",
+      },
+    ],
+  };
+  manager.emit("agentEnd", { runId: "other-run", id: "other-run:0", result: "ignore" });
+  manager.emit("agentEnd", { runId: "audit-abc123", id: "audit-abc123:0", result: "live completed result" });
+
+  const response = await pending;
+  assert.equal(response.details.completed, false);
+  assert.equal(response.details.agentOutputs?.[0]?.callId, "audit-abc123:0");
+  assert.match(response.content[0].text, /live completed result/);
+  assert.equal(manager.eventNames().length, 0);
+});
+
+test("get_workflow_output prefers a terminal workflow result over the final agent batch", async () => {
+  const manager = outputManager({ ...run("running"), sessionId: "session-a" });
+  const pending = executeOutput(manager, { runId: "audit-abc123", block: true });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  manager.state = {
+    ...manager.state,
+    status: "completed",
+    result: "semantic terminal result",
+    agents: manager.state.agents.map((agent) =>
+      agent.id === 1 ? { ...agent, status: "done" as const, result: "synthesizer result" } : agent,
+    ),
+  };
+  manager.emit("agentEnd", { runId: "audit-abc123", id: "audit-abc123:0", result: "synthesizer result" });
+
+  const response = await pending;
+  assert.equal(response.details.completed, true);
+  assert.equal(response.details.agentOutputs, undefined);
+  assert.match(response.content[0].text, /semantic terminal result/);
 });
 
 test("get_workflow_output yields as soon as durable parent-visible output arrives", async () => {
   const manager = outputManager({ ...run("running"), sessionId: "session-a" });
-  const pending = executeOutput(manager, { runId: "audit-abc123", block: true, timeoutMs: 500 });
+  const pending = executeOutput(manager, { runId: "audit-abc123", block: true });
   await new Promise<void>((resolve) => setImmediate(resolve));
 
   manager.emit("delivery", { runId: "other-run", deliveryId: "wf_other" });
@@ -253,7 +402,7 @@ test("get_workflow_output closes the delivery subscribe/read race through the du
     { runId: "audit-abc123", deliveryId: "wf_already_admitted", kind: "explicit", status: "submitted" },
   ];
 
-  const response = await executeOutput(manager, { runId: "audit-abc123", block: true, timeoutMs: 500 });
+  const response = await executeOutput(manager, { runId: "audit-abc123", block: true });
   assert.equal(response.details.delivered, true);
   assert.equal(response.details.completed, false);
   assert.equal(manager.eventNames().length, 0);
@@ -266,26 +415,30 @@ test("get_workflow_output closes the subscribe/read race without polling", async
   let reads = 0;
   manager.listRuns = () => [reads++ === 0 ? initial : completed];
 
-  const response = await executeOutput(manager, { runId: initial.runId, block: true, timeoutMs: 500 });
+  const response = await executeOutput(manager, { runId: initial.runId, block: true });
   assert.equal(response.details.completed, true);
   assert.match(response.content[0].text, /race-safe output/);
   assert.equal(reads, 3);
   assert.equal(manager.eventNames().length, 0);
 });
 
-test("get_workflow_output timeout and Esc-like interrupt are leak-free and do not stop the run", async () => {
+test("get_workflow_output yields for queued input or Esc without stopping the run", async () => {
   const manager = outputManager({ ...run("running"), sessionId: "session-a" });
-  const timedOut = await executeOutput(manager, { runId: "audit-abc123", block: true, timeoutMs: 5 });
-  assert.equal(timedOut.details.completed, false);
-  assert.equal(timedOut.details.timedOut, true);
-  assert.match(timedOut.content[0].text, /Do not poll/);
+  const inputPendingPromise = executeOutput(manager, { runId: "audit-abc123", block: true });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  releaseWorkflowOutputWaitForInput(manager, "audit-abc123");
+  const inputPending = await inputPendingPromise;
+  assert.equal(inputPending.details.completed, false);
+  assert.equal(inputPending.details.inputPending, true);
+  assert.equal(inputPending.terminate, undefined, "queued input continues through Pi's normal post-tool boundary");
+  assert.match(inputPending.content[0].text, /queued user message/i);
   assert.equal(manager.eventNames().length, 0);
 
   const controller = new AbortController();
   const outputTool = createGetWorkflowOutputTool({ manager });
   const interruptedPromise = (outputTool.execute as any)(
     "output-call",
-    { runId: "audit-abc123", block: true, timeoutMs: 500 },
+    { runId: "audit-abc123", block: true },
     controller.signal,
     undefined,
     {},
@@ -554,6 +707,52 @@ test("get_workflow_output renders a yielded delivery as finished output, not ong
   assert.equal(renderedText(component as never), "Output delivered audit-abc123");
 });
 
+test("get_workflow_output renders a completed agent batch as returned output", () => {
+  const fixture = fakeManager([run()]);
+  const tool = createGetWorkflowOutputTool({ manager: fixture.manager, getSessionId: () => "session-1" });
+  const component = tool.renderResult?.(
+    {
+      content: [],
+      details: {
+        runId: "audit-abc123",
+        status: "running",
+        completed: false,
+        blocked: true,
+        agentOutputs: [
+          { id: 1, callId: "audit-abc123:0", label: "scan", status: "done" },
+          { id: 2, callId: "audit-abc123:1", label: "review", status: "done" },
+        ],
+      },
+    } as never,
+    { isPartial: false, expanded: false } as never,
+    renderTheme as never,
+  );
+  assert.ok(component);
+  assert.equal(renderedText(component as never), "2 agent outputs audit-abc123");
+});
+
+test("get_workflow_output renders partial and validation-error results without unknown undefined", () => {
+  const fixture = fakeManager([run()]);
+  const tool = createGetWorkflowOutputTool({ manager: fixture.manager, getSessionId: () => "session-1" });
+  const partial = tool.renderResult?.(
+    { content: [], details: undefined } as never,
+    { isPartial: true, expanded: false } as never,
+    renderTheme as never,
+  );
+  const invalid = tool.renderResult?.(
+    {
+      content: [{ type: "text", text: "get_workflow_output does not accept timeoutMs" }],
+      details: undefined,
+    } as never,
+    { isPartial: false, expanded: false } as never,
+    renderTheme as never,
+  );
+
+  assert.ok(partial && invalid);
+  assert.equal(renderedText(partial as never), "Waiting for workflow output… · Type to interject · Esc cancels wait");
+  assert.equal(renderedText(invalid as never), "get_workflow_output does not accept timeoutMs");
+});
+
 test("pause, resume, and stop call the shared manager lifecycle methods", async () => {
   const fixture = fakeManager([run()]);
   assert.match(text(await execute(fixture.manager, { action: "pause", runId: "audit-abc123" })), /result=paused/);
@@ -647,4 +846,43 @@ test("unknown IDs and illegal transitions return explicit mutation-only actions"
   const stopAborted = text(await execute(fixture.manager, { action: "stop", runId: "live-123" }));
   assert.match(stopAborted, /cannot stop run with status aborted/);
   assert.match(stopAborted, /allowed=none/);
+});
+test("workflow_control rejects runs owned by another session", async () => {
+  const mine = { ...run(), sessionId: "session-a" } as PersistedRunState;
+  const foreign = { ...run("running", "foreign-run"), sessionId: "session-b" } as PersistedRunState;
+  const manager = {
+    getSessionId: () => "session-a",
+    listRuns: () => [mine, foreign],
+    pause() {
+      return true;
+    },
+    resume: async () => true,
+    stop() {
+      return true;
+    },
+  } as unknown as WorkflowManager;
+  const response = await execute(manager, { action: "pause", runId: "foreign-run" });
+  assert.match(response.content[0].text, /run not found in current session/);
+  assert.equal(response.details.error, "run not found in current session");
+});
+
+test("workflow_control allows runs owned by the current session", async () => {
+  const mine = { ...run(), sessionId: "session-a" } as PersistedRunState;
+  const calls: string[] = [];
+  const manager = {
+    getSessionId: () => "session-a",
+    listRuns: () => [mine],
+    pause(runId: string) {
+      calls.push(`pause:${runId}`);
+      mine.status = "paused";
+      return true;
+    },
+    resume: async () => true,
+    stop() {
+      return true;
+    },
+  } as unknown as WorkflowManager;
+  const response = await execute(manager, { action: "pause", runId: "audit-abc123" });
+  assert.deepEqual(calls, ["pause:audit-abc123"]);
+  assert.doesNotMatch(response.content[0].text, /not found|not owned/);
 });

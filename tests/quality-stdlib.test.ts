@@ -142,7 +142,7 @@ return out`;
   assert.deepEqual([...res.result], [1], "partial result returned, not an abort");
 });
 
-test("loopUntilDry(): returns indistinguishable partial data for capacity exhaustion", async () => {
+test("loopUntilDry(): surfaces capacity exhaustion on the run result", async () => {
   for (const code of ["TOKEN_BUDGET_EXHAUSTED", "AGENT_LIMIT_EXCEEDED"]) {
     const script = `export const meta = { name: 'loop_capacity', description: 'partial capacity result' }
 await agent('quality-helper-contract-smoke')
@@ -157,6 +157,11 @@ return await loopUntilDry({
     assert.deepEqual(
       Array.from(res.result, ({ id }) => ({ id })),
       [{ id: "alpha" }],
+    );
+    assert.equal(
+      res.status,
+      "partial",
+      "capacity exhaustion must remain visible without erasing the earlier successful agent call",
     );
   }
 

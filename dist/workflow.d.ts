@@ -55,6 +55,8 @@ export interface JournalEntry {
 export interface SharedRuntime {
     limiter: WorkflowLimiter;
     agentCount: number;
+    /** Successful live or replayed agent calls; checkpoints are not agent successes. */
+    successfulAgentCount?: number;
     spent: number;
     tokenUsage: {
         input: number;
@@ -64,6 +66,20 @@ export interface SharedRuntime {
         cacheRead: number;
         cacheWrite: number;
     };
+    /**
+     * Terminal-failure records for every recoverable agent() call that exhausted
+     * its retries. Populated by the runtime so the top-level result can surface
+     * an explicit terminal state instead of silently treating swallowed nulls
+     * as success. Optional to keep existing SharedRuntime literals (tests,
+     * nested frames) compiling; the aggregate treats absence as "no failures".
+     */
+    agentFailures?: Array<{
+        label: string | undefined;
+        phase: string | undefined;
+        error: string;
+        errorCode?: WorkflowErrorCode;
+        recoverable: boolean;
+    }>;
     depth: number;
     /**
      * Monotonic count of every workflow() call anywhere in this run tree,
@@ -303,6 +319,8 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
      * Shared store for this run. One instance is created per top-level run and
      * propagated into nested workflow() calls. Pass an existing instance to share
      * state across a parent and child run; omit to create a fresh isolated store.
+     * An externally supplied store is never disposed by this run (the creator
+     * owns its lifetime), so concurrent runs can safely share one instance.
      */
     sharedStore?: SharedStore;
     /** Resolve a saved-workflow name to its script, enabling `workflow('name', args)`. */
@@ -406,6 +424,16 @@ export interface WorkflowRunResult<T = unknown> {
     agentCount: number;
     durationMs: number;
     runId?: string;
+    /**
+     * Explicit terminal state of the run. `completed` requires every logical
+     * agent() call to have succeeded (or been intentionally skipped);
+     * `partial` means at least one call failed while others succeeded;
+     * `exhausted` means every call failed after retries, so the run's result
+     * is best-effort at best. Script validation errors, timeouts, and aborts
+     * reject the promise before this is returned, so they do not appear here.
+     * Absent on legacy results (treat as `completed`).
+     */
+    status?: "completed" | "partial" | "exhausted";
     tokenUsage?: {
         input: number;
         output: number;

@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { execSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { dirname, join, normalize, relative } from "node:path";
 import test from "node:test";
@@ -13,11 +12,10 @@ import {
   renderWorkflowCapabilityReference,
 } from "../src/workflow-authoring-reference.js";
 import { WORKFLOW_CAPABILITY_CONTRACT } from "../src/workflow-capability-contract.js";
-import { parseNpmPackFilePaths } from "../src/workflow-release-gate.js";
 import { createWorkflowTool } from "../src/workflow-tool.js";
+import { publishableFiles as listPublishableFiles } from "./helpers/publishable-files.js";
 
 const ROOT = join(import.meta.dirname, "..");
-const NPM_COMMAND = process.platform === "win32" ? "npm.cmd" : "npm";
 const SKILL_ROOT = "skills/workflow-authoring";
 const REQUIRED_RESOURCES = [
   `${SKILL_ROOT}/SKILL.md`,
@@ -55,8 +53,7 @@ function requiredSchemaFields(schema?: Record<string, unknown>): unknown[] {
 }
 
 function publishableFiles(): Set<string> {
-  const output = execSync(`${NPM_COMMAND} pack --dry-run --json`, { cwd: ROOT, encoding: "utf8" });
-  return new Set(parseNpmPackFilePaths(output));
+  return new Set(listPublishableFiles());
 }
 
 test("publishable Pi package discovers the workflow-authoring skill and all linked resources", () => {

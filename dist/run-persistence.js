@@ -2,7 +2,7 @@
  * Workflow run state persistence for pause/resume support.
  */
 import { join } from "node:path";
-import { MAX_DURABLE_RUN_BYTES } from "./config.js";
+import { MAX_DURABLE_RUN_BYTES, MAX_PENDING_DELIVERIES_PER_RUN } from "./config.js";
 import { ensureDir as ensureDirFs, listJsonFilesSafe, resolvePersistenceFs, unlinkIfExistsSafe, writeJsonAtomicWithBackup, } from "./fs-persistence.js";
 import { workflowProjectPaths } from "./workflow-paths.js";
 /** Raised when a durable record has changed since the caller read it. */
@@ -205,10 +205,10 @@ export function createRunPersistence(cwd, fsOverride, options) {
                 return null;
         }
         if (state.deliveryOutbox !== undefined) {
-            if (!Array.isArray(state.deliveryOutbox) || state.deliveryOutbox.length > 512)
+            if (!Array.isArray(state.deliveryOutbox) || state.deliveryOutbox.length > MAX_PENDING_DELIVERIES_PER_RUN)
                 return null;
             const deliveryStatuses = new Set(["pending", "submitted", "projected"]);
-            const deliveryKinds = new Set(["explicit", "terminal"]);
+            const deliveryKinds = new Set(["explicit", "agent", "terminal"]);
             for (const delivery of state.deliveryOutbox) {
                 if (!isRecord(delivery) ||
                     !isText(delivery.deliveryId, 300) ||
@@ -221,6 +221,23 @@ export function createRunPersistence(cwd, fsOverride, options) {
                     !isText(delivery.createdAt, 200))
                     return null;
                 if (delivery.content !== undefined && !isText(delivery.content, 1_000_000))
+                    return null;
+                if (delivery.agentId !== undefined && !isText(delivery.agentId, 300))
+                    return null;
+                if (delivery.agentCallId !== undefined && !isText(delivery.agentCallId, 300))
+                    return null;
+                if (delivery.agentLabel !== undefined && !isText(delivery.agentLabel, 1_000))
+                    return null;
+                if (delivery.agentPhase !== undefined && !isText(delivery.agentPhase, 1_000))
+                    return null;
+                if (delivery.agentStatus !== undefined && !new Set(["done", "error"]).has(delivery.agentStatus))
+                    return null;
+                if (delivery.kind === "agent" &&
+                    (delivery.content === undefined ||
+                        delivery.agentId === undefined ||
+                        delivery.agentCallId === undefined ||
+                        delivery.agentLabel === undefined ||
+                        delivery.agentStatus === undefined))
                     return null;
                 if (delivery.alertKind !== undefined &&
                     !new Set(["blocker", "critical_finding", "decision"]).has(delivery.alertKind))
@@ -873,6 +890,11 @@ export function createRunPersistence(cwd, fsOverride, options) {
                     state.script = "";
                 if (!state.startedAt)
                     state.startedAt = nextUpdatedAt;
+                // Reject invalid records before replacing either the primary or backup.
+                // A successful write must be readable by the same persistence schema.
+                if (!validateState({ ...state, revision: nextRevision, updatedAt: nextUpdatedAt }, state.runId)) {
+                    throw new Error(`Invalid persisted workflow state for ${state.runId}`);
+                }
                 const path = primaryRunPath(state.runId);
                 // Publish a copy first. Mutating the caller's revision before an I/O
                 // failure would make its next retry fence against a revision that was

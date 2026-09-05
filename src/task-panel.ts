@@ -14,17 +14,18 @@ import {
   fmtCost,
   fmtTokenSegment,
   shorten,
-  statusIcon,
   tokenFigures,
   type WorkflowAgentSnapshot,
   type WorkflowSnapshot,
 } from "./display.js";
+import { type IconMode, type PanelSkin, paintStatus, panelSkin, resolveIconMode, treeConnector } from "./panel-skin.js";
 import { redactAbsolutePaths, redactForModel, sanitizeForTerminal } from "./sanitize.js";
+import { shimmerText } from "./shimmer.js";
 import type { ManagedRun, WorkflowManager } from "./workflow-manager.js";
 import { DEFAULT_WORKFLOW_RESULT_CHARS, summarizeWorkflowResult } from "./workflow-result-projection.js";
 import type { WorkflowStorage } from "./workflow-saved.js";
 import type { WorkflowSettings } from "./workflow-settings.js";
-import { shortModel } from "./workflow-ui.js";
+import { shortModel, WORKFLOW_NAV_SHORTCUT_LABEL } from "./workflow-ui.js";
 
 // `tokenUsage` is included so the detailed panel's live token/s counter refreshes
 // as tokens accrue (not only on agent start/end). It is harmless in compact mode —
@@ -48,6 +49,91 @@ const RUN_EVENTS = [
 const RUN_END_EVENTS = ["complete", "error", "stopped", "deleted"] as const;
 const MAX_TOKEN_SAMPLES_PER_RUN = 128;
 const MAX_TOKEN_SAMPLE_RUNS = 1024;
+/** OMP's loader redraw cadence: fast enough for a one-cell-per-frame light sweep. */
+const SHIMMER_FRAME_MS = 1000 / 30;
+/** Avoid filling the rolling token window with identical 30 FPS animation samples. */
+const MIN_UNCHANGED_TOKEN_SAMPLE_MS = 1000;
+/**
+ * Animation CPU ceiling, mirroring OMP's loader backpressure: idle for nine
+ * times the last frame's cost so a burst of provider events cannot turn the
+ * panel into a busy render loop.
+ */
+const FRAME_BACKPRESSURE_MULTIPLIER = 9;
+/**
+ * Terminal output backlog above which new frames are deferred (OMP's
+ * pending-output gate): a slow PTY cannot drain queued bytes, so composing
+ * more frames would only stack stale paints behind the backlog.
+ */
+const MAX_PENDING_OUTPUT_BYTES = 256 * 1024;
+/** Retry cadence while the output-backlog gate holds renders back. */
+const OUTPUT_BACKLOG_RETRY_MS = 10;
+/** Observed-snapshot window (OMP's AgentProgress): log entries surfaced in the detailed run body. */
+const RECENT_LOG_LINES = 3;
+/**
+ * Coalesce bursts of manager events into one repaint per frame budget
+ * (OMP's requestComponentRender semantics): events set a dirty flag; a
+ * trailing-edge timer flushes at most one `requestRender` per cadence.
+ */
+const EVENT_FLUSH_MIN_INTERVAL_MS = SHIMMER_FRAME_MS;
+
+/**
+ * Frame scheduler for the panel's animation and event-driven repaints.
+ * Mirrors OMP's loader tick loop: a recursive (not fixed-interval) timer that
+ * measures each paint's cost, sleeps proportionally (adaptive backpressure),
+ * and defers paints while the terminal's output backlog exceeds
+ * {@link MAX_PENDING_OUTPUT_BYTES}.
+ */
+class PanelFrameScheduler {
+  private timer: ReturnType<typeof setTimeout> | undefined;
+  private disposed = false;
+  private lastFrameCostMs = 0;
+
+  /** Test hook: injects the delay between frames. Defaults to SHIMMER_FRAME_MS. */
+  constructor(
+    private readonly requestRender: () => void,
+    private readonly readPendingOutputBytes: (() => number | undefined) | undefined,
+    private readonly frameIntervalMs: number = SHIMMER_FRAME_MS,
+  ) {}
+
+  /** Request one repaint, coalesced into the running tick loop. */
+  requestFrame(): void {
+    if (this.disposed || this.timer) return;
+    this.scheduleTick(0);
+  }
+
+  stop(): void {
+    this.disposed = true;
+    if (this.timer) {
+      clearTimeout(this.timer);
+      this.timer = undefined;
+    }
+  }
+
+  private scheduleTick(delayMs: number): void {
+    if (this.disposed) return;
+    this.timer = setTimeout(() => {
+      this.timer = undefined;
+      if (this.disposed) return;
+      const startedAt = performance.now();
+      // Pending-output gate: while the terminal cannot drain what is already
+      // queued, retry shortly instead of composing another stale frame.
+      const pending = this.readPendingOutputBytes?.();
+      if (typeof pending === "number" && pending > MAX_PENDING_OUTPUT_BYTES) {
+        this.scheduleTick(OUTPUT_BACKLOG_RETRY_MS);
+        return;
+      }
+      this.requestRender();
+      this.lastFrameCostMs = performance.now() - startedAt;
+      const cadenceDelayMs = Math.max(0, this.frameIntervalMs - this.lastFrameCostMs);
+      // Adaptive backpressure: idle for nine times the paint cost so the
+      // animation stays at or below ~10% CPU even when a slow terminal write
+      // exceeds the normal cadence.
+      const backpressureDelayMs = this.lastFrameCostMs * FRAME_BACKPRESSURE_MULTIPLIER;
+      this.scheduleTick(Math.max(cadenceDelayMs, backpressureDelayMs));
+    }, delayMs);
+    (this.timer as { unref?: () => void }).unref?.();
+  }
+}
 
 export interface TaskPanelOptions {
   storage?: WorkflowStorage;
@@ -286,7 +372,27 @@ function replayStandaloneOutbox(holder: DeliveryHolder): void {
       if (holder.pending.length >= MAX_PENDING_DELIVERY_PROJECTIONS) break;
       if (holder.submittedGeneration.get(record.deliveryId) === holder.generation) continue;
       if (holder.pending.some((item) => item.details?.deliveryId === record.deliveryId)) continue;
+
+      // A paused checkpoint (usage-limit auto-pause) is NOT a terminal outcome:
+      // it must be replayed as "paused", never as the deliverText "finished"
+      // copy or the completed/failed binary, so a restart does not misreport a
+      // resumable run as done (or failed).
       const run = holder.manager.getRun(record.runId);
+      if (record.checkpoint === "paused" || run?.status === "paused") {
+        enqueuePending(holder, {
+          content: `⏸ Background workflow ${record.runId} paused. Completed steps are saved — resume it once the limit resets.`,
+          details: {
+            status: "paused",
+            isError: false,
+            notificationKind: "workflow-result",
+            runId: record.runId,
+            sequence: record.sequence,
+            deliveryId: record.deliveryId,
+          },
+        });
+        continue;
+      }
+
       const content = run
         ? deliverText(run, { resultPath: persistedResultPath(holder.manager, record.runId) })
         : `${record.runStatus === "completed" ? "✓" : "✗"} Background workflow ${record.runId} ${record.runStatus}.`;
@@ -588,30 +694,89 @@ export function installResultDelivery(
   return disposer;
 }
 
-export function renderPanel(manager: WorkflowManager, theme: Theme, width?: number): string[] {
+/** Options for the zentui-style tree renderers. */
+export interface PanelSkinOptions {
+  /** Glyph set: "auto" Unicode tree glyphs (default) or "ascii" fallbacks. */
+  iconMode?: IconMode;
+  /** Show the navigator hint row (default true). */
+  hint?: boolean;
+}
+
+/**
+ * Zentui-style tree panel (compact): one summary header, then each active run
+ * as a tree row with its aggregate progress. Phase and agent labels belong to
+ * the detailed view so the compact row stays easy to scan.
+ */
+export function renderPanel(
+  manager: WorkflowManager,
+  theme: Theme,
+  width?: number,
+  now = Date.now(),
+  options?: PanelSkinOptions,
+): string[] {
   const all = manager.listRuns();
   const active = all.filter((r) => r.status === "running" || r.status === "paused");
   if (!active.length) return [];
-  const rows = active.map((r) => {
+  const skin = panelSkin(options?.iconMode ?? "auto");
+  const dim = (text: string) => theme.fg("dim", text);
+  const finished = all.filter((r) => r.status !== "running" && r.status !== "paused");
+  const failedCount = finished.filter((r) => r.status === "failed").length;
+  const finishedCount = finished.length;
+
+  const segments = [`${active.length} active`, `${finishedCount - failedCount} done`, `${failedCount} failed`];
+  const header = `${theme.fg("accent", skin.headerDot)} ${theme.fg("accent", theme.bold("Workflows"))} ${theme.fg(
+    "muted",
+    "—",
+  )} ${dim(segments.join(" · "))}`;
+
+  const rows = active.map((r, index) => {
+    const last = index === active.length - 1;
+    const connector = treeConnector(skin, last, theme);
     const live = manager.getRun(r.runId);
     // UIOBS-007: persisted JSON is not structurally validated — a corrupt or
     // legacy `agents` value (null/object) must never crash the panel render.
     const agents = safeAgentSnapshots(live?.snapshot.agents ?? r.agents);
     const done = agents.filter((a) => a.status === "done").length;
-    const icon = r.status === "paused" ? "⏸" : "◆";
-    const phase = live?.snapshot.currentPhase ? ` · ${terminalText(live.snapshot.currentPhase)}` : "";
-    return `  ${icon} ${terminalText(r.workflowName)}  ${done}/${agents.length} agents${phase}`;
+    const runningAgents = agents.filter((a) => a.status === "running");
+    const queued = agents.filter((a) => a.status === "queued").length;
+    const errors = agents.filter((a) => a.status === "error").length;
+    const state = r.status === "paused" ? "paused" : "running";
+    const icon = paintStatus(r.status === "paused" ? skin.paused : skin.running, state, theme);
+    const runUsage = aggregateAgentUsage(agents);
+    sampleTokens(r.runId, runUsage.fresh + runUsage.cacheRead, now);
+    const rate = r.status === "running" ? tokensPerSecond(r.runId) : 0;
+    const cost = live?.snapshot.tokenUsage?.cost ?? r.tokenUsage?.cost ?? 0;
+    const meta = [
+      `${done}/${agents.length} agents`,
+      runningAgents.length ? `${runningAgents.length} running` : "",
+      queued ? `${queued} queued` : "",
+      errors ? `${errors} ${errors === 1 ? "error" : "errors"}` : "",
+      fmtTokenSegment(runUsage, fmtTokensShort),
+      cost > 0 ? fmtCost(cost) : "",
+      rate > 0 ? `${Math.round(rate)} tok/s` : "",
+    ]
+      .filter(Boolean)
+      .join(" · ");
+    const workflowName = terminalText(r.workflowName);
+    if (r.status === "running") {
+      const rawConnector = last ? skin.lastBranch : skin.branch;
+      return shimmerText(`${rawConnector} ${skin.running} ${workflowName}  ${meta}`, theme, now);
+    }
+    return `${connector} ${icon} ${workflowName}  ${dim(meta)}`;
   });
-  // Finished runs leave this live panel but are kept in the navigator. Tell the
-  // user so a completed run doesn't look like it vanished.
-  const finished = all.filter((r) => r.status !== "running" && r.status !== "paused").length;
-  const hint = theme.fg(
-    "dim",
-    finished > 0
-      ? `  /workflows — open navigator (${finished} finished kept in history)`
-      : "  /workflows — open navigator",
-  );
-  return [theme.bold(`Workflows active (${active.length}):`), ...rows, hint].map((line) => fitLine(line, width));
+  // Finished runs leave this live panel but are kept in the navigator. Tell
+  // the user so a completed run doesn't look like it vanished. The hint row is
+  // optional: pass hint: false to drop it entirely.
+  if (options?.hint !== false) {
+    const hint = theme.fg(
+      "dim",
+      finishedCount > 0
+        ? `  ${WORKFLOW_NAV_SHORTCUT_LABEL} open · ↑/↓ select · Enter inspect · /workflows fallback (${finishedCount} finished kept in history)`
+        : `  ${WORKFLOW_NAV_SHORTCUT_LABEL} open · ↑/↓ select · Enter inspect · /workflows fallback`,
+    );
+    rows.push(hint);
+  }
+  return [header, ...rows].map((line) => fitLine(line, width));
 }
 
 // ─── Detailed mode: live token rate ────────────────────────────────────────────
@@ -628,6 +793,9 @@ export function sampleTokens(runId: string, total: number, now: number): void {
   const last = samples[samples.length - 1];
   // Collapse repeat renders within the same instant (e.g. width recalcs).
   if (last && last.ts === now && last.total === total) return;
+  // Shimmer repaints at 30 FPS. Keep plateau samples coarse while still adding
+  // one each second so a stalled rate naturally decays to zero.
+  if (last && last.total === total && now - last.ts < MIN_UNCHANGED_TOKEN_SAMPLE_MS) return;
   samples.push({ ts: now, total });
   if (samples.length > MAX_TOKEN_SAMPLES_PER_RUN) samples.splice(0, samples.length - MAX_TOKEN_SAMPLES_PER_RUN);
   if (!tokenSamples.has(runId) && tokenSamples.size >= MAX_TOKEN_SAMPLE_RUNS) {
@@ -677,8 +845,11 @@ function renderRunBody(
   agents: WorkflowAgentSnapshot[],
   maxAgents: number,
   theme: Theme,
+  now: number,
+  skin: PanelSkin,
 ): string[] {
   const dim = (t: string) => theme.fg("dim", t);
+  const muted = (t: string) => theme.fg("muted", t);
   const lines: string[] = [];
   // Group agents by phase, declared order first then discovery order (as the navigator does).
   const order = snap.phases.length ? [...snap.phases] : [];
@@ -689,7 +860,10 @@ function renderRunBody(
     byPhase.get(key)?.push(a);
     if (!order.includes(key)) order.push(key);
   }
-  for (const title of order) {
+  const renderedPhases = order.filter((title) => (byPhase.get(title) ?? []).length > 0);
+  for (let phaseIndex = 0; phaseIndex < renderedPhases.length; phaseIndex++) {
+    const title = renderedPhases[phaseIndex];
+    const lastPhase = phaseIndex === renderedPhases.length - 1;
     const phaseAgents = byPhase.get(title) ?? [];
     if (!phaseAgents.length) continue;
     const done = phaseAgents.filter((a) => a.status === "done").length;
@@ -697,7 +871,12 @@ function renderRunBody(
     const errors = phaseAgents.filter((a) => a.status === "error").length;
     const skipped = phaseAgents.filter((a) => a.status === "skipped").length;
     const complete = done + errors + skipped === phaseAgents.length;
-    const marker = running > 0 || (!complete && snap.currentPhase === title) ? "▶" : complete ? "✓" : " ";
+    const livePhase = running > 0 || (!complete && snap.currentPhase === title);
+    const marker = livePhase
+      ? paintStatus(skin.running, "running", theme)
+      : complete
+        ? paintStatus(skin.done, "done", theme)
+        : paintStatus(skin.pending, "queued", theme);
     const phaseMeta = [
       `${done}/${phaseAgents.length} agents`,
       running ? `${running} running` : "",
@@ -706,19 +885,45 @@ function renderRunBody(
     ]
       .filter(Boolean)
       .join(" · ");
-    lines.push(theme.fg("accent", `  ${marker} ${terminalText(title)}`) + dim(`  ${phaseMeta}`));
+    const phaseTitle = terminalText(title);
+    const styledTitle = livePhase ? shimmerText(phaseTitle, theme, now) : theme.fg("accent", phaseTitle);
+    lines.push(`${muted("│ ")}${marker} ${styledTitle}${dim(`  ${phaseMeta}`)}`);
 
     const visible = phaseAgents.slice(-maxAgents);
-    for (const a of visible) {
+    for (let i = 0; i < visible.length; i++) {
+      const a = visible[i];
+      const lastAgent = lastPhase && i === visible.length - 1;
+      const childConnector = muted(lastAgent ? skin.lastBranch : skin.branch);
       const segment = fmtTokenSegment(tokenFigures(a.tokenUsage, a.tokens), fmtTokensShort);
       const tok = segment ? dim(` ${segment}`) : "";
       const mdl = terminalText(shortModel(a.model) ?? "");
       const model = mdl ? dim(` · ${mdl}`) : "";
-      lines.push(`    [${a.id}] ${statusIcon(a.status)} ${shorten(terminalText(a.label), 40)}${tok}${model}`);
+      const label = shorten(terminalText(a.label), 40);
+      const styledLabel = a.status === "running" ? shimmerText(label, theme, now) : label;
+      const glyph =
+        a.status === "running"
+          ? skin.running
+          : a.status === "done"
+            ? skin.done
+            : a.status === "error"
+              ? skin.error
+              : a.status === "skipped"
+                ? skin.skipped
+                : skin.pending;
+      lines.push(`${childConnector} ${paintStatus(glyph, a.status, theme)} ${styledLabel}${tok}${model}`);
     }
     if (phaseAgents.length > visible.length) {
-      lines.push(dim(`    … ${phaseAgents.length - visible.length} earlier agents`));
+      lines.push(dim(`  ${skin.ellipsis} ${phaseAgents.length - visible.length} earlier agents`));
     }
+  }
+  // Observed-snapshot window: the last few log lines under the tree, capped so
+  // the panel's row budget survives verbose runs. Mirrors OMP's AgentProgress
+  // recent-output semantics — a bounded observation window, not the full log.
+  const recentLogs = snap.logs.slice(-RECENT_LOG_LINES);
+  for (const entry of recentLogs) {
+    const text = terminalText(entry);
+    if (!text) continue;
+    lines.push(dim(`  ${skin.ellipsis} ${shorten(text, 72)}`));
   }
   return lines;
 }
@@ -734,20 +939,33 @@ export function renderPanelDetailed(
   width: number | undefined,
   maxAgents: number,
   now: number,
+  options?: PanelSkinOptions,
 ): string[] {
   const all = manager.listRuns();
   const active = all.filter((r) => r.status === "running" || r.status === "paused");
   if (!active.length) return [];
+  const skin = panelSkin(options?.iconMode ?? "auto");
   const dim = (t: string) => theme.fg("dim", t);
-  const out: string[] = [theme.bold(`Workflows active (${active.length}):`)];
+  const finished = all.filter((r) => r.status !== "running" && r.status !== "paused");
+  const failedCount = finished.filter((r) => r.status === "failed").length;
+  const segments = [`${active.length} active`, `${finished.length - failedCount} done`, `${failedCount} failed`];
+  const header = `${theme.fg("accent", skin.headerDot)} ${theme.fg("accent", theme.bold("Workflows"))} ${theme.fg(
+    "muted",
+    "—",
+  )} ${dim(segments.join(" · "))}`;
+  const out: string[] = [header];
 
-  for (const r of active) {
+  for (let index = 0; index < active.length; index++) {
+    const r = active[index];
+    const last = index === active.length - 1;
+    const connector = treeConnector(skin, last, theme);
     const live = manager.getRun(r.runId);
     const snap = live?.snapshot;
     // UIOBS-007: same malformed-state guard as the compact panel.
     const agents = safeAgentSnapshots(snap?.agents ?? r.agents);
     const done = agents.filter((a) => a.status === "done").length;
-    const icon = r.status === "paused" ? "⏸" : "◆";
+    const state = r.status === "paused" ? "paused" : "running";
+    const icon = paintStatus(r.status === "paused" ? skin.paused : skin.running, state, theme);
     const usage = snap?.tokenUsage ?? r.tokenUsage;
     // The run-level tokenUsage aggregate is only finalized when the run ends, so
     // it reads 0 for the whole live run; per-agent figures update on each agent
@@ -762,7 +980,6 @@ export function renderPanelDetailed(
     const rate = r.status === "running" ? tokensPerSecond(r.runId) : 0;
     const meta = [
       `${done}/${agents.length} agents`,
-      snap?.currentPhase ? terminalText(snap.currentPhase) : "",
       fmtTokenSegment(runUsage, fmtTokensShort),
       // (cost is only known once the run finalizes its usage.)
       usage?.cost ? fmtCost(usage.cost) : "",
@@ -770,25 +987,35 @@ export function renderPanelDetailed(
     ]
       .filter(Boolean)
       .join(" · ");
-    out.push(`  ${icon} ${theme.bold(terminalText(r.workflowName))}  ${dim(meta)}`);
-    if (snap) out.push(...renderRunBody(snap, agents, maxAgents, theme));
+    const workflowName = terminalText(r.workflowName);
+    if (r.status === "running") {
+      const rawConnector = last ? skin.lastBranch : skin.branch;
+      out.push(shimmerText(`${rawConnector} ${skin.running} ${workflowName}  ${meta}`, theme, now));
+    } else {
+      out.push(`${connector} ${icon} ${theme.bold(workflowName)}  ${dim(meta)}`);
+    }
+    if (snap) out.push(...renderRunBody(snap, agents, maxAgents, theme, now, skin));
   }
 
-  const finished = all.filter((r) => r.status !== "running" && r.status !== "paused").length;
-  out.push(
-    dim(
-      finished > 0
-        ? `  /workflows — open navigator (${finished} finished kept in history)`
-        : "  /workflows — open navigator",
-    ),
-  );
+  const finishedCount = finished.length;
+  // The navigator hint row is optional: pass hint: false to drop it entirely.
+  if (options?.hint !== false) {
+    out.push(
+      dim(
+        finishedCount > 0
+          ? `  ${WORKFLOW_NAV_SHORTCUT_LABEL} open · ↑/↓ select · Enter inspect · /workflows fallback (${finishedCount} finished kept in history)`
+          : `  ${WORKFLOW_NAV_SHORTCUT_LABEL} open · ↑/↓ select · Enter inspect · /workflows fallback`,
+      ),
+    );
+  }
   return out.map((line) => fitLine(line, width));
 }
 
 /**
  * Install the live "workflows running" panel below the editor. Re-rendered on
- * every manager event. Informational only — the user opens the navigator with
- * /workflows. (`_pi` is kept for signature stability.)
+ * every manager event. The widget stays non-capturing so it never steals bare
+ * arrow keys from the editor; Alt+↓ opens the focused navigator, where arrows
+ * and Enter work directly. (`_pi` is kept for signature stability.)
  */
 export function installTaskPanel(
   _pi: ExtensionAPI,
@@ -814,61 +1041,100 @@ export function installTaskPanel(
     }
     return cached;
   };
-  const hasActiveRun = () => manager.listRuns().some((r) => r.status === "running" || r.status === "paused");
+  // Live shimmer and detailed token sampling need periodic ticks only while
+  // providers are actually working. Paused panels stay event-driven.
+  const hasActiveRun = () => manager.listRuns().some((r) => r.status === "running");
 
   ui.setWidget(
     "workflow-tasks",
     (tui: TUI, theme: Theme) => {
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      let disposed = false;
-      const stopTimer = () => {
-        if (!timer) return;
-        clearTimeout(timer);
-        timer = undefined;
-      };
-      const syncTimer = () => {
-        if (disposed) return;
-        if (settings().progressPanelMode !== "detailed" || !hasActiveRun()) {
-          stopTimer();
+      // Coalesced repaint scheduler: manager events only set the dirty flag;
+      // frames are composed at the shimmer cadence with OMP-style adaptive
+      // backpressure. The TUI's own pending-output backlog feeds the gate when
+      // the terminal exposes it, so a slow PTY never stacks stale frames.
+      const scheduler = new PanelFrameScheduler(
+        () => tui.requestRender(),
+        () => (tui as { pendingOutputBytes?: number }).pendingOutputBytes,
+      );
+      let lastFlushAt = Number.NEGATIVE_INFINITY;
+      const onEvent = () => {
+        // Trailing-edge coalescing: one repaint per EVENT_FLUSH_MIN_INTERVAL
+        // no matter how many events land in between. Without an active run the
+        // panel is event-driven only — the scheduler timer is not running, so
+        // flush immediately (once) here.
+        if (!hasActiveRun()) {
+          const now = performance.now();
+          if (now - lastFlushAt >= EVENT_FLUSH_MIN_INTERVAL_MS) {
+            lastFlushAt = now;
+            cachedLines = undefined;
+            cacheValid = false;
+            tui.requestRender();
+          }
+          scheduler.stop();
           return;
         }
-        if (timer) return;
-        timer = setTimeout(() => {
-          timer = undefined;
-          if (disposed) return;
-          tui.requestRender();
-          syncTimer();
-        }, 2000);
-        (timer as { unref?: () => void }).unref?.();
+        lastFlushAt = performance.now();
+        cachedLines = undefined;
+        cacheValid = false;
+        scheduler.requestFrame();
       };
-      const onEvent = () => {
-        tui.requestRender();
-        syncTimer();
-      };
-      for (const ev of RUN_EVENTS) manager.on(ev, onEvent);
       const onRunEnd = ({ runId }: { runId: string }) => {
         clearTokenSamples(runId);
-        syncTimer();
+        onEvent();
       };
+      for (const ev of RUN_EVENTS) manager.on(ev, onEvent);
       for (const ev of RUN_END_EVENTS) manager.on(ev, onRunEnd);
-      // Detailed mode samples token/s only while at least one run is active.
-      // Compact/idle panels own no periodic timer and perform no settings/disk
-      // reads merely because the widget exists.
-      syncTimer();
-      // Purely informational: it lists running runs and re-renders on events. To
-      // open the navigator, the user runs /workflows (the panel takes no input).
+      // Running panels repaint for the OMP-style light sweep. Idle and paused
+      // panels own no periodic timer and perform no settings/disk reads merely
+      // because the widget exists.
+      // Non-capturing summary: it lists running runs and re-renders on events.
+      // The extension-level Alt+↓ shortcut opens the focused navigator; the
+      // widget itself takes no input and therefore cannot steal editor arrows.
+      // Row-reference cache (OMP's Container/Box memo): when the width is
+      // unchanged and no manager event has landed since the previous compose,
+      // re-publish the previous line array reference. The host TUI then skips
+      // diffing/padding identical rows, so idle shimmer frames cost a
+      // reference comparison instead of a full snapshot walk.
+      let cachedLines: string[] | undefined;
+      let cachedWidth: number | undefined;
+      let cacheValid = false;
       const comp: Component & { dispose?(): void } = {
         render: (width: number) => {
-          const s = settings();
-          if (s.progressPanelMode === "detailed") {
-            return renderPanelDetailed(manager, theme, width, clampMaxAgents(s.progressPanelMaxAgents), Date.now());
+          if (cachedLines !== undefined && cacheValid && width === cachedWidth) {
+            return cachedLines;
           }
-          return renderPanel(manager, theme, width);
+          const s = settings();
+          const iconMode = resolveIconMode(s.progressPanelIcons);
+          const mode = s.progressPanelMode === "detailed" ? "detailed" : "compact";
+          const now = Date.now();
+          const lines =
+            mode === "detailed"
+              ? renderPanelDetailed(manager, theme, width, clampMaxAgents(s.progressPanelMaxAgents), now, {
+                  iconMode,
+                  hint: false,
+                })
+              : renderPanel(manager, theme, width, now, { iconMode, hint: false });
+          // Shimmer labels repaint every frame while a run is live, so cache
+          // only the settled (no active running run) composition; the live
+          // path stays uncached to keep the light sweep moving. Manager
+          // events invalidate via onEvent below, so a cached array is never
+          // stale across a state change.
+          if (!hasActiveRun()) {
+            cachedLines = lines;
+            cachedWidth = width;
+            cacheValid = true;
+          } else {
+            cachedLines = undefined;
+            cacheValid = false;
+          }
+          return lines;
         },
-        invalidate: () => {},
+        invalidate: () => {
+          cachedLines = undefined;
+          cacheValid = false;
+        },
         dispose: () => {
-          disposed = true;
-          stopTimer();
+          scheduler.stop();
           for (const ev of RUN_EVENTS) manager.off(ev, onEvent);
           for (const ev of RUN_END_EVENTS) manager.off(ev, onRunEnd);
         },

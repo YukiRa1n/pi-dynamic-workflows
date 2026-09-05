@@ -785,6 +785,51 @@ describe("installTaskPanel", () => {
 describe("renderPanel", () => {
   const theme = { fg: (_c: string, t: string) => t, bold: (t: string) => t };
 
+  it("keeps the compact run row focused on aggregate progress", async () => {
+    const { clearTokenSamples, renderPanel } = await import("../src/task-panel.js");
+    clearTokenSamples("dense-run");
+    const snapshot = {
+      name: "auth_audit",
+      phases: ["Scan"],
+      currentPhase: "Scan",
+      logs: [],
+      agents: [
+        { id: 1, label: "discover_routes", status: "done", phase: "Scan", tokens: 2_000 },
+        { id: 2, label: "audit_auth", status: "running", phase: "Scan", tokens: 1_000 },
+        { id: 3, label: "scan_middleware", status: "queued", phase: "Scan" },
+        { id: 4, label: "failed_probe", status: "error", phase: "Scan" },
+      ],
+      tokenUsage: { total: 0, input: 0, output: 0, cost: 0.12 },
+    };
+    const manager = {
+      listRuns: () => [
+        {
+          runId: "dense-run",
+          workflowName: "auth_audit",
+          status: "running",
+          agents: snapshot.agents,
+          tokenUsage: snapshot.tokenUsage,
+        },
+      ],
+      getRun: () => ({ snapshot, status: "running" }),
+    };
+
+    renderPanel(manager as never, theme as never, undefined, 1_000);
+    snapshot.agents[1].tokens = 3_000;
+    const rendered = renderPanel(manager as never, theme as never, undefined, 2_000);
+    const row = rendered[1] ?? "";
+
+    assert.match(rendered[0], /Workflows — 1 active · 0 done · 0 failed/, "tree summary header");
+    assert.match(row, /└─ ◐ auth_audit/, "tree connector + status glyph + workflow name");
+    assert.match(row, /1\/4 agents · 1 running · 1 queued · 1 error/);
+    assert.match(row, /5\.0K tok/);
+    assert.match(row, /\$0\.12/);
+    assert.match(row, /2000 tok\/s/);
+    assert.doesNotMatch(row, /Scan/, "compact row omits the current phase");
+    assert.doesNotMatch(row, /audit_auth/, "compact row omits running-agent labels");
+    clearTokenSamples("dense-run");
+  });
+
   it("hints that finished runs are kept in /workflows history", async () => {
     const { renderPanel } = await import("../src/task-panel.js");
     const manager = {
@@ -796,7 +841,10 @@ describe("renderPanel", () => {
       getRun: () => undefined,
     };
     const lines = renderPanel(manager as never, theme as never);
-    assert.ok(lines[0].includes("Workflows active (1):"), "compact panel uses active wording");
+    assert.ok(
+      lines[0].includes("Workflows — 1 active · 2 done · 0 failed"),
+      "tree summary header counts active/done/failed",
+    );
     assert.ok(
       lines.some((l) => /2 finished kept in history/.test(l)),
       "hint should report the finished-run count",
@@ -1001,7 +1049,7 @@ describe("renderPanelDetailed", () => {
     };
     const lines = renderPanelDetailed(manager as never, theme as never, undefined, 8, 1000);
     assert.ok(
-      lines.some((l) => l.includes("[1] ✓ cached_agent") && /100\.0K tok/.test(l) && /3\.0M cached/.test(l)),
+      lines.some((l) => l.includes("✓ cached_agent") && /100\.0K tok/.test(l) && /3\.0M cached/.test(l)),
       `expected a per-agent tok/cached row, got:\n${lines.join("\n")}`,
     );
   });
@@ -1041,7 +1089,7 @@ describe("renderPanelDetailed", () => {
     };
     const lines = renderPanelDetailed(manager as never, theme as never, undefined, 8, 1000);
     assert.ok(
-      lines.some((l) => l.includes("[1] ✓ cost_only") && /384 tok/.test(l)),
+      lines.some((l) => l.includes("✓ cost_only") && /384 tok/.test(l)),
       `cost-only agent should show its scalar estimate, got:\n${lines.join("\n")}`,
     );
     // The run header guard must agree with the value it gates (no "0 tok" beside a real cost).
@@ -1059,31 +1107,31 @@ describe("renderPanelDetailed", () => {
     const lines = renderPanelDetailed(detailedManager(2100) as never, theme as never, undefined, 8, 1000);
     const text = lines.join("\n");
 
-    assert.match(lines[0], /Workflows active \(1\):/);
+    assert.match(lines[0], /Workflows — 1 active · 0 done · 0 failed/);
     assert.ok(/auth_audit/.test(text), "shows the run name");
     assert.ok(/1\/4 agents/.test(text), "shows done/total agents");
     assert.ok(/3\.9K tok/.test(text), "shows aggregate tokens summed from per-agent tokens");
     assert.ok(/\$0\.02/.test(text), "shows cost");
-    // Phase headers
+    // Phase headers (tree style: │ + status glyph + title)
     assert.ok(
-      lines.some((l) => l.includes("▶ Scan") && /1\/3 agents/.test(l) && /3\.9K tok/.test(l)),
+      lines.some((l) => l.includes("◐ Scan") && /1\/3 agents/.test(l) && /3\.9K tok/.test(l)),
       "Scan phase header with subtotal",
     );
     assert.ok(
-      lines.some((l) => l.includes("Review") && /0\/1 agents/.test(l)),
+      lines.some((l) => l.includes("○ Review") && /0\/1 agents/.test(l)),
       "Review phase header",
     );
     // Agent rows: status icons + label + tokens + model
     assert.ok(
-      lines.some((l) => l.includes("[1] ✓ discover_routes") && /2\.1K tok/.test(l) && /claude-haiku-4-5/.test(l)),
+      lines.some((l) => l.includes("✓ discover_routes") && /2\.1K tok/.test(l) && /claude-haiku-4-5/.test(l)),
       "done agent row with model",
     );
     assert.ok(
-      lines.some((l) => l.includes("[2] ● audit_auth") && /1\.8K tok/.test(l)),
+      lines.some((l) => l.includes("◐ audit_auth") && /1\.8K tok/.test(l)),
       "running agent row",
     );
     assert.ok(
-      lines.some((l) => l.includes("[3] ○ scan_middleware")),
+      lines.some((l) => l.includes("○ scan_middleware")),
       "queued agent row",
     );
   });
@@ -1239,6 +1287,7 @@ describe("installTaskPanel mode selection", () => {
       "compact one-liner",
     );
     assert.ok(!lines.some((l) => /▶ P1/.test(l)), "no per-phase detail in compact");
+    assert.ok(!lines.some((l) => l.includes("open · ↑/↓ select")), "installed panel omits the navigator hint");
   });
 
   it("uses compact rendering when the mode is compact", () => {
@@ -1249,11 +1298,11 @@ describe("installTaskPanel mode selection", () => {
   it("uses detailed rendering when the mode is detailed", () => {
     const lines = captureRender(() => ({ progressPanelMode: "detailed" }));
     assert.ok(
-      lines.some((l) => /▶ P1/.test(l)),
+      lines.some((l) => /◐ P1/.test(l)),
       "per-phase detail in detailed mode",
     );
     assert.ok(
-      lines.some((l) => /\[1\] ● a/.test(l)),
+      lines.some((l) => /◐ a/.test(l)),
       "per-agent row in detailed mode",
     );
   });
@@ -1310,5 +1359,81 @@ describe("deliverText", () => {
     assert.ok(!under.includes("middle omitted"), "a sub-12k dump is preserved");
     const over = deliverText(makeResult({ note: "y".repeat(12_100) }) as never);
     assert.ok(over.includes("middle omitted"), "an over-12k dump is bounded");
+  });
+});
+
+// ─── panel skin (zentui-style tree glyphs) ──────────────────────────────────────
+
+describe("panel skin", () => {
+  const theme = { fg: (_c: string, t: string) => t, bold: (t: string) => t };
+
+  function treeManager() {
+    return {
+      listRuns: () => [
+        { runId: "a", workflowName: "live", status: "running", agents: [{ status: "running" }], logs: [] },
+        { runId: "b", workflowName: "other", status: "paused", agents: [{ status: "queued" }], logs: [] },
+      ],
+      getRun: (id: string) =>
+        id === "a"
+          ? { snapshot: { currentPhase: "P1", agents: [{ status: "running" }] }, status: "running" }
+          : { snapshot: { currentPhase: "P2", agents: [{ status: "done" }] }, status: "paused" },
+    };
+  }
+
+  it("renders the summary header and tree connectors in compact mode", async () => {
+    const { renderPanel } = await import("../src/task-panel.js");
+    const lines = renderPanel(treeManager() as never, theme as never, undefined, 1000);
+    assert.ok(lines[0].includes("● Workflows — 2 active · 0 done · 0 failed"), "summary header with counts");
+    assert.ok(lines[1].includes("├─ ◐ live"), "first run uses ├─ branch with running glyph");
+    assert.ok(lines[2].includes("└─ ⏸ other"), "last run uses └─ elbow with paused glyph");
+  });
+
+  it("falls back to ASCII glyphs in ascii icon mode", async () => {
+    const { renderPanel } = await import("../src/task-panel.js");
+    const lines = renderPanel(treeManager() as never, theme as never, undefined, 1000, { iconMode: "ascii" });
+    assert.ok(lines[0].includes("* Workflows"), "ascii header dot");
+    assert.ok(lines[1].includes("|- > live"), "ascii branch and running glyph");
+    assert.ok(lines[2].includes("|- ~ other"), "ascii paused glyph");
+    assert.ok(!lines.join("\n").includes("├"), "no unicode tree glyphs remain");
+  });
+
+  it("resolves unknown icon modes to the safe unicode default", async () => {
+    const { resolveIconMode } = await import("../src/panel-skin.js");
+    assert.equal(resolveIconMode("ascii"), "ascii");
+    assert.equal(resolveIconMode("auto"), "auto");
+    assert.equal(resolveIconMode(undefined), "auto");
+    assert.equal(resolveIconMode("garbage"), "auto");
+  });
+});
+
+describe("panel hint row", () => {
+  const theme = { fg: (_c: string, t: string) => t, bold: (t: string) => t };
+
+  function runningManager() {
+    return {
+      listRuns: () => [
+        { runId: "a", workflowName: "live", status: "running", agents: [{ status: "running" }], logs: [] },
+      ],
+      getRun: (id: string) =>
+        id === "a"
+          ? { snapshot: { currentPhase: "P1", agents: [{ status: "running" }] }, status: "running" }
+          : undefined,
+    };
+  }
+
+  it("includes the hint row by default", async () => {
+    const { renderPanel } = await import("../src/task-panel.js");
+    const lines = renderPanel(runningManager() as never, theme as never, undefined, 1000);
+    assert.ok(
+      lines.some((l) => l.includes("open · ↑/↓ select")),
+      "hint row present by default",
+    );
+  });
+
+  it("omits the hint row when hint: false", async () => {
+    const { renderPanel } = await import("../src/task-panel.js");
+    const lines = renderPanel(runningManager() as never, theme as never, undefined, 1000, { hint: false });
+    assert.ok(!lines.some((l) => l.includes("open · ↑/↓ select")), "no hint row when suppressed");
+    assert.ok(lines[0].includes("Workflows"), "header still present");
   });
 });

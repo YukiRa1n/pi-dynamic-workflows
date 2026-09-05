@@ -106,12 +106,17 @@ function normalizeSettings(value) {
         raw.progressPanelMaxAgents >= 1) {
         settings.progressPanelMaxAgents = Math.min(1000, Math.floor(raw.progressPanelMaxAgents));
     }
+    if (raw.progressPanelIcons === "auto" || raw.progressPanelIcons === "ascii") {
+        settings.progressPanelIcons = raw.progressPanelIcons;
+    }
     if (typeof raw.persistAgentSessions === "boolean") {
         settings.persistAgentSessions = raw.persistAgentSessions;
     }
     const deliveredResultMaxChars = normalizeInteger(raw.deliveredResultMaxChars, 1, 1_000_000);
     if (deliveredResultMaxChars !== undefined)
         settings.deliveredResultMaxChars = deliveredResultMaxChars;
+    if (typeof raw.streamAgentResults === "boolean")
+        settings.streamAgentResults = raw.streamAgentResults;
     if (Array.isArray(raw.excludeSubagentTools)) {
         const names = raw.excludeSubagentTools.filter((t) => typeof t === "string" && t.trim().length > 0);
         if (names.length)

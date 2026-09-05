@@ -87,6 +87,47 @@ test("outbox acknowledgement is generation-fenced and removes only the same stab
   }
 });
 
+test("completed-agent delivery is durable, replayable, and deduplicated by call ID", async () => {
+  const cwd = tempDir();
+  try {
+    const m = manager(cwd);
+    let firstDeliveryId: string | undefined;
+    m.onAgentMessage = (event) => {
+      const delivery = m.admitAgentDelivery(event.runId, {
+        agentId: event.id,
+        callId: event.callId ?? event.id,
+        label: event.label,
+        ...(event.phase ? { phase: event.phase } : {}),
+        status: event.status ?? "done",
+        content: `child result: ${String(event.result)}`,
+      });
+      firstDeliveryId = delivery?.deliveryId;
+    };
+
+    const run = m.startInBackground(script);
+    await run.promise;
+    const pending = m.listPendingDeliveries();
+    const agent = pending.find((item) => item.kind === "agent");
+    assert.ok(agent && firstDeliveryId);
+    assert.equal(agent.deliveryId, firstDeliveryId);
+    assert.equal(agent.agentCallId, `${run.runId}:0`);
+    assert.match(agent.content ?? "", /child result: complete/);
+    assert.equal(pending.filter((item) => item.kind === "agent").length, 1);
+
+    const duplicate = m.admitAgentDelivery(run.runId, {
+      agentId: agent.agentId ?? "",
+      callId: agent.agentCallId ?? "",
+      label: agent.agentLabel ?? "",
+      status: agent.agentStatus ?? "done",
+      content: agent.content ?? "",
+    });
+    assert.equal(duplicate?.deliveryId, agent.deliveryId);
+    assert.equal(m.listPendingDeliveries().filter((item) => item.kind === "agent").length, 1);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 test("acknowledged explicit delivery cannot reuse its stable ID for terminal completion", async () => {
   const cwd = tempDir();
   try {

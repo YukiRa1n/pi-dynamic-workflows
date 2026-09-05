@@ -63,6 +63,7 @@ describe("registerWorkflowProgressCommands", () => {
   function setup() {
     const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> }>();
     const sent: Array<{ content?: string }> = [];
+    const prompts: string[] = [];
     let settings: Record<string, unknown> = {};
     const pi = {
       registerCommand: (name: string, command: { handler: (args: string, ctx: unknown) => Promise<void> }) => {
@@ -71,6 +72,7 @@ describe("registerWorkflowProgressCommands", () => {
       sendMessage: (message: { content?: string }) => {
         sent.push(message);
       },
+      sendUserMessage: (prompt: string) => prompts.push(prompt),
     } as unknown as ExtensionAPI;
     const settingsStore = {
       load: () => ({ ...settings }),
@@ -78,17 +80,32 @@ describe("registerWorkflowProgressCommands", () => {
         settings = { ...settings, ...next };
       },
     };
-    return { commands, sent, settingsStore, getSettings: () => settings, pi };
+    return { commands, sent, prompts, settingsStore, getSettings: () => settings, pi };
   }
 
-  it("registers a single merged /workflows-progress command (no separate -max command)", async () => {
+  it("registers the merged progress command and the separate UI demo command", async () => {
     const mod = await load();
     const { commands, settingsStore, pi } = setup();
     mod.registerWorkflowProgressCommands(pi, settingsStore);
 
     assert.ok(commands.get("workflows-progress"), "registers /workflows-progress");
     assert.equal(commands.get("workflows-progress-max"), undefined, "no separate /workflows-progress-max command");
-    assert.equal(commands.size, 1, "only one command is registered");
+    assert.ok(commands.get("workflows-demo"), "registers /workflows-demo");
+    assert.equal(commands.size, 2, "registers progress controls plus the demo command");
+  });
+
+  it("default demo starts a real main-session prompt instead of opening an overlay", async () => {
+    const mod = await load();
+    const { commands, prompts, settingsStore, pi } = setup();
+    mod.registerWorkflowProgressCommands(pi, settingsStore);
+    let overlays = 0;
+    const ctx = { hasUI: true, isIdle: () => true, ui: { custom: () => overlays++, notify: () => {} } };
+    await commands.get("workflows-demo")?.handler("", ctx);
+    assert.equal(prompts.length, 1);
+    assert.match(prompts[0], /start_workflow/);
+    assert.equal(overlays, 0);
+    await commands.get("workflows-demo")?.handler("", { ...ctx, isIdle: () => false });
+    assert.equal(prompts.length, 1, "busy sessions do not receive a surprise demo interjection");
   });
 
   it("persists a valid mode and reports both mode and max on status", async () => {

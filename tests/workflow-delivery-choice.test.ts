@@ -59,7 +59,7 @@ test("delivery-choice scoring rejects malformed workflow calls", () => {
 
 test("delivery-choice CLI is package-wired and exposes help without provider calls", () => {
   assert.equal(packageJson.scripts["delivery-choice"], "tsx scripts/run-workflow-delivery-choice.ts");
-  assert.equal(packageJson.scripts["check:scripts"], "tsc -p tsconfig.scripts.json");
+  assert.match(packageJson.scripts["check:scripts"], /\btsc -p tsconfig\.scripts\.json$/);
   assert.match(packageJson.scripts.check, /check:scripts/);
   assert.doesNotMatch(packageJson.scripts.test, /delivery-choice/i);
   assert.doesNotMatch(packageJson.scripts["release:check"], /delivery-choice/i);

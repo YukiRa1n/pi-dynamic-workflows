@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import type { AgentUsage } from "../src/agent.js";
+import { MAX_PENDING_DELIVERIES_PER_RUN } from "../src/config.js";
 import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
 import { WorkflowManager } from "../src/workflow-manager.js";
 import { NavigatorModel, NavigatorState, renderNavigator } from "../src/workflow-ui.js";
@@ -28,7 +29,7 @@ function fakeAgent(usage: Partial<AgentUsage> = {}, result: unknown = "ok") {
   };
 }
 
-/** Agent that stays running until a deferred resolve is called externally. */
+/** Normal cooperative agent; uncooperative-provider tests supply their own runner. */
 function deferredAgent() {
   let deferredResolve: ((value: unknown) => void) | null = null;
   let deferredReject: ((err: Error) => void) | null = null;
@@ -40,8 +41,24 @@ function deferredAgent() {
     resolve: (value: unknown = "done") => deferredResolve?.(value),
     reject: (err: Error) => deferredReject?.(err),
     runner: {
-      async run(_prompt: string, _options?: { onUsage?: (u: AgentUsage) => void }) {
-        return promise;
+      async run(_prompt: string, options?: { signal?: AbortSignal; onUsage?: (u: AgentUsage) => void }) {
+        const signal = options?.signal;
+        if (!signal) return promise;
+        signal.throwIfAborted();
+        return new Promise((resolve, reject) => {
+          const onAbort = () => reject(signal.reason ?? new Error("Test agent aborted"));
+          signal.addEventListener("abort", onAbort, { once: true });
+          promise.then(
+            (value) => {
+              signal.removeEventListener("abort", onAbort);
+              resolve(value);
+            },
+            (error) => {
+              signal.removeEventListener("abort", onAbort);
+              reject(error);
+            },
+          );
+        });
       },
     },
   };
@@ -68,6 +85,70 @@ const oneAgentScript = `export const meta = { name: 'tracked_demo', description:
 phase('Work')
 const a = await agent('do it', { label: 'a' })
 return { a }`;
+
+test("agent delivery capacity reserves a readable terminal record", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-wf-outbox-capacity-"));
+  try {
+    await withFakeHomeAsync(cwd, async () => {
+      const deferred = deferredAgent();
+      const manager = new WorkflowManager({ cwd, agent: deferred.runner });
+      const run = manager.startInBackground(oneAgentScript);
+      const managed = manager.getRun(run.runId);
+      assert.ok(managed);
+      managed.deliveryOutbox = Array.from({ length: MAX_PENDING_DELIVERIES_PER_RUN - 2 }, (_, index) => ({
+        deliveryId: `pending-${index}`,
+        sequence: index,
+        kind: "agent" as const,
+        status: "pending" as const,
+        content: "result",
+        agentId: String(index),
+        agentCallId: `pending:${index}`,
+        agentLabel: "worker",
+        agentStatus: "done" as const,
+        createdAt: new Date().toISOString(),
+      }));
+      managed.nextDeliverySequence = managed.deliveryOutbox.length;
+      assert.equal(
+        manager.admitAgentDelivery(run.runId, {
+          agentId: "overflow",
+          callId: "overflow",
+          label: "overflow",
+          status: "done",
+          content: "result",
+        }),
+        undefined,
+      );
+      deferred.resolve();
+      await run.promise;
+      const persisted = manager.getPersistence().load(run.runId);
+      assert.equal(persisted?.status, "completed");
+      assert.equal(persisted?.deliveryOutbox?.length, MAX_PENDING_DELIVERIES_PER_RUN - 1);
+      assert.equal(persisted?.deliveryOutbox?.at(-1)?.terminal, true);
+    });
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("all-failed runs remain failed with a checkpoint and retain their fallback result", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-wf-failed-checkpoint-"));
+  try {
+    await withFakeHomeAsync(cwd, async () => {
+      const manager = new WorkflowManager({ cwd, agent: fakeAgent({}, ""), defaultAgentRetries: 0 });
+      const run = manager.startInBackground(`export const meta = { name: 'failed_check', description: 'audit' }
+await checkpoint('Continue?', { default: true })
+await agent('work')
+return { diagnostic: 'all work failed' }`);
+      await run.promise;
+      assert.equal(manager.getRun(run.runId)?.status, "failed");
+      const persisted = manager.getPersistence().load(run.runId);
+      assert.equal(persisted?.status, "failed");
+      assert.deepEqual(persisted?.result, { diagnostic: "all work failed" });
+    });
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
 
 test("queued steering never guesses the newest running workflow", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-wf-explicit-steer-"));
@@ -755,6 +836,9 @@ test(
     assert.equal(agent?.error, "agent exploded");
     assert.equal(agent?.errorCode, WorkflowErrorCode.AGENT_EXECUTION_ERROR);
     assert.equal(agent?.recoverable, true);
+    assert.equal(run?.status, "failed", "an all-agents-failed run is failed, not completed");
+    assert.equal(agent?.error, "agent exploded", "the persisted agent still carries the failure detail");
+    assert.equal(agent?.errorCode, WorkflowErrorCode.AGENT_EXECUTION_ERROR);
   }),
 );
 
@@ -841,6 +925,8 @@ await agent('second', { label: 'second' })`;
     assert.equal(state.drill(model), true);
     assert.equal(state.drill(model), true);
     assert.equal(state.drill(model), true);
+    state.togglePager();
+    state.jump("end", 2);
     state.togglePager();
     assert.match(renderNavigator(state, model, 120, undefined, 30).join("\n"), /FULL_RESULT_FROM_JOURNAL/);
   }),

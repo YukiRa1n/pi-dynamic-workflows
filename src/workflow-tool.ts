@@ -105,27 +105,38 @@ const workflowToolSchema = Type.Object(
  */
 const modelFacingWorkflowToolSchema = Type.Object(
   {
-    script: Type.Optional(
-      Type.String({
-        description: "JavaScript using agent(); omit when using preset.",
-      }),
-    ),
+    // Keep field-level schema metadata minimal: the model-facing tool's
+    // top-level description carries the invocation guidance, while this
+    // schema stays within the package's ordinary-turn context budget.
+    script: Type.Optional(Type.String()),
     preset: Type.Optional(
       Type.Unsafe<string>({
         type: "string",
         enum: [...BUILTIN_WORKFLOW_NAMES],
-        description: "Built-in workflow preset; use script for a custom workflow.",
       }),
     ),
-    args: Type.Optional(
-      Type.Unsafe<Record<string, unknown>>({
-        type: "object",
-        description: "Arguments for the selected preset.",
-      }),
-    ),
+    args: Type.Optional(Type.Unsafe<Record<string, unknown>>({ type: "object" })),
   },
   {
     additionalProperties: false,
+    // Keep the root an object (required by function-tool providers) while
+    // expressing the two legal call shapes to schema-aware models/validators:
+    // exactly { script } OR { preset, args? }. Runtime validation below remains
+    // the compatibility/defense-in-depth boundary for providers that ignore
+    // applicator keywords such as oneOf/not.
+    oneOf: [
+      {
+        type: "object",
+        required: ["script"],
+        not: {
+          anyOf: [
+            { type: "object", required: ["preset"] },
+            { type: "object", required: ["args"] },
+          ],
+        },
+      },
+      { type: "object", required: ["preset"], not: { type: "object", required: ["script"] } },
+    ],
   },
 );
 
@@ -231,7 +242,7 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
     name: modelFacing ? "start_workflow" : "workflow",
     label: modelFacing ? "Start workflow" : "Workflow",
     description: modelFacing
-      ? "Start a new background workflow only when the user requests multi-agent work. Use a script or preset; existing runs use /workflows."
+      ? "Start requested multi-agent work in background. Call exactly {script} or {preset,args?}; never put code in args. Existing runs use /workflows."
       : allowResume
         ? "Run a saved/built-in or JavaScript workflow in the background; results return automatically. Use resumeFromRunId only to revise the same paused run."
         : "Start a new background workflow for an explicitly requested multi-agent task. Provide a saved name or JavaScript using agent(), parallel(), and pipeline(); results return automatically. Existing runs use /workflows.",
@@ -516,14 +527,15 @@ function normalizeWorkflowToolArgs(
       throw new Error("workflow's `args` requires a `preset`");
     }
     if (hasScript || hasPreset) {
+      // Pi validates AFTER prepareArguments. A present `script: undefined`
+      // still satisfies JSON Schema `required`, so it violates preset's
+      // exclusive branch even though JSON.stringify hides it in the error.
+      if (!hasScript) delete normalized.script;
+      if (!hasPreset) delete normalized.preset;
       return {
         ...normalized,
         ...(hasPreset ? { preset: (value.preset as string).trim() } : {}),
         ...(hasScript ? { script: normalizeWorkflowScript(value.script as string, true) } : {}),
-        // An empty/whitespace `script` is treated as "not provided" (hasScript=false);
-        // drop it so a preset-only invocation does not trip the execute-time
-        // "either preset or script" conflict on a leftover empty string.
-        ...(!hasScript ? { script: undefined } : {}),
       } as WorkflowToolInput;
     }
     throw new Error("workflow requires either `script` or `preset` to be a string");

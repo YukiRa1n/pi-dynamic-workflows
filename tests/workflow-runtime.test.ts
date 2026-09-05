@@ -723,6 +723,7 @@ return a`,
   assert.equal(result.result, null);
   assert.equal(calls, 2);
   assert.equal(result.agentCount, 1);
+  assert.equal(result.status, "exhausted", "every agent call failed after retries");
   assert.equal(journal.length, 0, "failed/null recoverable results are not journaled");
   assert.ok(
     logs.some((message) => /retrying/i.test(message)),
@@ -732,6 +733,98 @@ return a`,
     logs.some((message) => /exhausted/i.test(message)),
     "logs should mention exhaustion",
   );
+});
+test("checkpoints do not turn an all-failed workflow into partial success", async () => {
+  const journal = new Map<string, JournalEntry>();
+  const script = `export const meta = { name: 'checkpoint_failure', description: 'audit' }
+await checkpoint('Continue?', { default: true })
+return await agent('work')`;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const result = await runWorkflow(script, {
+      runId: "checkpoint-failure",
+      agent: {
+        async run() {
+          return "";
+        },
+      },
+      persistLogs: false,
+      resumeJournal: journal,
+      onAgentJournal: (entry) => journal.set(`${entry.runId}:${entry.index}`, entry),
+    });
+    assert.equal(result.agentCount, 2);
+    assert.equal(result.status, "exhausted", "live and replayed checkpoints are not agent successes");
+  }
+});
+
+test("replayed successful agents still count toward a partial result", async () => {
+  const journal = new Map<string, JournalEntry>();
+  const script = `export const meta = { name: 'replay_partial', description: 'audit' }
+await agent('good')
+return await agent('bad')`;
+  let goodCalls = 0;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const result = await runWorkflow(script, {
+      runId: "replay-partial",
+      agent: {
+        async run(prompt: string) {
+          if (prompt === "good") {
+            goodCalls++;
+            return "ok";
+          }
+          return "";
+        },
+      },
+      persistLogs: false,
+      resumeJournal: journal,
+      onAgentJournal: (entry) => journal.set(`${entry.runId}:${entry.index}`, entry),
+    });
+    assert.equal(result.status, "partial");
+  }
+  assert.equal(goodCalls, 1);
+});
+
+test("runWorkflow reports completed status when every agent succeeds", async () => {
+  const result = await runWorkflow(
+    `export const meta = { name: 'status_completed', description: 'all succeed' }
+const a = await agent('work', { label: 'a' })
+return a`,
+    {
+      agent: {
+        async run() {
+          return "ok";
+        },
+      },
+      persistLogs: false,
+    },
+  );
+  assert.equal(result.status, "completed", "no agent failures");
+  assert.equal(result.result, "ok");
+});
+
+test("runWorkflow reports partial status when some agents fail and others succeed", async () => {
+  const result = await runWorkflow<Array<unknown>>(
+    `export const meta = { name: 'status_partial', description: 'mixed outcome' }
+const rs = await parallel([
+  () => agent('good', { label: 'good' }),
+  () => agent('bad', { label: 'bad' }),
+])
+return rs`,
+    {
+      agent: {
+        async run(prompt: string) {
+          if (prompt === "bad") {
+            return "";
+          }
+          return "good-result";
+        },
+      },
+      agentRetries: 1,
+      persistLogs: false,
+    },
+  );
+  assert.equal(result.status, "partial", "one call failed while another succeeded");
+  assert.equal(result.agentCount, 2);
+  assert.deepEqual(result.result, ["good-result", null]);
 });
 
 test("runWorkflow does not retry nonrecoverable errors", async () => {
@@ -2121,6 +2214,26 @@ return xs`;
   assert.equal(state.started, 3, "all three agent() calls actually started");
   assert.equal(state.aborted, 2, "both siblings were aborted once the run's fate was sealed");
   assert.equal(state.completed, 0, "no sibling ran to completion on a run that's already failing");
+});
+
+test("un-awaited vm bridge promises are observed when a later script error aborts the run", async () => {
+  const unhandled: unknown[] = [];
+  const onUnhandled = (reason: unknown) => unhandled.push(reason);
+  process.on("unhandledRejection", onUnhandled);
+  try {
+    const { runner } = abortAwareAgent(200);
+    const script = `export const meta = { name: 'bad_parallel', description: 'started promises are invalid thunks' }
+const a = agent('a', { label: 'a' })
+const b = agent('b', { label: 'b' })
+await parallel([a, b])
+return 'unreachable'`;
+
+    await assert.rejects(runWorkflow(script, { agent: runner, persistLogs: false }), /parallel\(\) expects functions/);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.deepEqual(unhandled, [], "the exact vm-realm promises returned to the script must be observed");
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+  }
 });
 
 test("a script's own try/catch around parallel() preserves in-flight siblings — no run-fatal abort", async () => {

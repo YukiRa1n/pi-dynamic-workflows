@@ -13,7 +13,6 @@ declare const listActiveWorkflowsSchema: Type.TObject<{}>;
 declare const getWorkflowOutputSchema: Type.TObject<{
     runId: Type.TString;
     block: Type.TOptional<Type.TBoolean>;
-    timeoutMs: Type.TOptional<Type.TInteger>;
 }>;
 export type WorkflowControlInput = Static<typeof workflowControlSchema>;
 export type StopWorkflowInput = Static<typeof stopWorkflowSchema>;
@@ -71,17 +70,27 @@ export interface GetWorkflowOutputResultDetails extends Record<string, unknown> 
     status?: RunStatus;
     completed: boolean;
     blocked: boolean;
-    timedOut?: boolean;
     interrupted?: boolean;
+    inputPending?: boolean;
     delivered?: boolean;
+    agentOutputs?: WorkflowAgentOutputDetails[];
+    hasMoreAgentOutputs?: boolean;
     resultPath?: string;
     error?: string;
     errorCode?: string;
     recoverable?: boolean;
 }
+export interface WorkflowAgentOutputDetails {
+    id: number;
+    callId?: string;
+    label: string;
+    phase?: string;
+    status: "done" | "error";
+    previewOnly?: boolean;
+}
 /** Exact cancellation handles for active runs owned by the bound Pi session. */
 export declare function createListActiveWorkflowsTool(options: WorkflowControlToolOptions): ToolDefinition<typeof listActiveWorkflowsSchema, ListActiveWorkflowsResultDetails>;
-/** One-shot, session-owned output retrieval with an interruptible event wait. */
+/** Session-owned next-output retrieval with an interruptible event wait. */
 export declare function createGetWorkflowOutputTool(options: WorkflowControlToolOptions): ToolDefinition<typeof getWorkflowOutputSchema, GetWorkflowOutputResultDetails>;
 /**
  * Provider-facing cancellation handle. It deliberately exposes no discovery,
@@ -91,4 +100,6 @@ export declare function createGetWorkflowOutputTool(options: WorkflowControlTool
  */
 export declare function createStopWorkflowTool(options: WorkflowControlToolOptions): ToolDefinition<typeof stopWorkflowSchema, StopWorkflowResultDetails>;
 export declare function createWorkflowControlTool(options: WorkflowControlToolOptions): ToolDefinition<typeof workflowControlSchema, Record<string, unknown>>;
+/** Release an unbounded output wait so Pi can deliver queued steer/follow-up input after the tool boundary. */
+export declare function releaseWorkflowOutputWaitForInput(manager: WorkflowManager, runId: string): void;
 export {};

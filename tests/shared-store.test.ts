@@ -16,6 +16,57 @@ test("SharedStore enforces finite key/value/total resource budgets before mutati
   assert.equal(store.get("a"), "1234", "rejected writes must not mutate existing state");
 });
 
+test("SharedStore limitsSnapshot reproduces the parent quotas on a fresh store", () => {
+  const parent = new SharedStore({ maxKeys: 3, maxKeyBytes: 8, maxValueBytes: 16, maxTotalBytes: 24 });
+  parent.put("a", "1234");
+  const child = new SharedStore(parent.limitsSnapshot());
+  child.restore(parent.snapshot());
+  // The child enforces the PARENT's strict quotas, not the 2048-key/4 MiB defaults.
+  child.put("b", "1234");
+  child.put("c", "1234");
+  // Exactly maxKeys=3 keys fit; the 4th is rejected by key count.
+  assert.throws(() => child.put("d", "1"), /key.*limit/i, "child inherits maxKeys=3");
+  // A stricter total quota is enforced too: a fresh child with maxTotalBytes=8
+  // rejects a second value that would exceed it, proving the snapshot carried
+  // the parent's total limit (not the 4 MiB default).
+  const strictChild = new SharedStore({ maxTotalBytes: 8 });
+  strictChild.put("a", "1");
+  assert.throws(
+    () => strictChild.put("b", "2222222222"),
+    /exceeds its .*limit/i,
+    "maxTotalBytes is enforced on the child store",
+  );
+});
+
+test("SharedStore external put after trackPut retires the key from the pending delta", () => {
+  const store = new SharedStore();
+  store.trackPut("k", "agent-value", "delta-1");
+  // External (untracked) write supersedes the agent's pending value.
+  store.put("k", "external-value");
+  const delta = store.commitDelta("delta-1");
+  assert.equal(Object.hasOwn(delta, "k"), false, "committed delta must not reapply the stale agent value");
+  assert.equal(store.get("k"), "external-value", "live value stays the newer external write");
+});
+
+test("runWorkflow does not dispose an externally supplied shared store", async () => {
+  const shared = new SharedStore();
+  shared.put("persist", "keep-me");
+  await runWorkflow(
+    `export const meta = { name: 'ext_store', description: 'external store' }
+return await agent('use external store')`,
+    {
+      agent: {
+        async run() {
+          return "ok";
+        },
+      },
+      persistLogs: false,
+      sharedStore: shared,
+    },
+  );
+  assert.equal(shared.get("persist"), "keep-me", "external store survives the run (owner manages lifetime)");
+});
+
 test("SharedStore rejects non-JSON values before they can enter replay state", () => {
   const store = new SharedStore();
   assert.throws(

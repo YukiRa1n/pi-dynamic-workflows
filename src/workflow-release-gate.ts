@@ -540,7 +540,7 @@ function validateGetWorkflowOutputSurface(): WorkflowReleaseDiagnostic[] {
     tool.name !== "get_workflow_output" ||
     parameters.type !== "object" ||
     parameters.additionalProperties !== false ||
-    Object.keys(properties).sort().join(",") !== "block,runId,timeoutMs" ||
+    Object.keys(properties).sort().join(",") !== "block,runId" ||
     required.length !== 1 ||
     required[0] !== "runId"
   ) {
@@ -548,12 +548,13 @@ function validateGetWorkflowOutputSurface(): WorkflowReleaseDiagnostic[] {
       diagnostic(
         WorkflowReleaseDiagnosticCode.TOOL_INPUT_MISMATCH,
         "get_workflow_output",
-        "get_workflow_output must expose exact runId plus optional block/timeoutMs in a strict object schema.",
+        "get_workflow_output must expose exact runId plus optional block in a strict object schema.",
       ),
     );
   }
   if (
-    !/wait once/iu.test(tool.description) ||
+    !/event wait/iu.test(tool.description) ||
+    !/not status/iu.test(tool.description) ||
     !/never poll/iu.test(tool.description) ||
     !/shell sleep/iu.test(tool.description)
   ) {
@@ -561,7 +562,7 @@ function validateGetWorkflowOutputSurface(): WorkflowReleaseDiagnostic[] {
       diagnostic(
         WorkflowReleaseDiagnosticCode.TOOL_INPUT_MISMATCH,
         "get_workflow_output.description",
-        "get_workflow_output must direct models to one event wait instead of list/shell polling.",
+        "get_workflow_output must describe a next-output event wait, not a status check or list/shell polling.",
       ),
     );
   }
@@ -615,6 +616,7 @@ const RELEASE_SURFACE_SOURCES = [
   "src/task-panel.ts",
   "src/usage-limit-scheduler.ts",
   "src/web-tools.ts",
+  "src/workflow-agent-output-source.ts",
   "src/workflow-authoring-coverage.ts",
   "src/workflow-authoring-reference.ts",
   "src/workflow-capability-contract.ts",

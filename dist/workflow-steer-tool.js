@@ -26,6 +26,30 @@ export function createWorkflowSteerTool(options) {
             throw new Error("workflow_steer: no WorkflowManager configured");
         return manager;
     };
+    const currentSessionId = () => {
+        if (options.getSessionId)
+            return options.getSessionId();
+        const manager = getManager();
+        return typeof manager.getSessionId === "function" ? manager.getSessionId() : undefined;
+    };
+    /**
+     * Ownership gate. Returns true when:
+     *  - no session id is knowable (embedder without a session concept — keep
+     *    the legacy runId-only behavior), or
+     *  - the manager cannot list runs (ownership is unverifiable, allow through
+     *    rather than breaking embedded steer), or
+     *  - the identified run exists and belongs to the current session.
+     */
+    const ownedRun = (runId, sessionId, manager) => {
+        if (sessionId === undefined)
+            return true;
+        if (typeof manager.listRuns !== "function")
+            return true;
+        const run = manager.listRuns().find((candidate) => "runId" in candidate && candidate.runId === runId);
+        if (!run)
+            return false;
+        return !("sessionId" in run) || run.sessionId === undefined || run.sessionId === sessionId;
+    };
     return defineTool({
         name: "workflow_steer",
         label: "Workflow Steer",
@@ -34,6 +58,15 @@ export function createWorkflowSteerTool(options) {
         prepareArguments: normalizeWorkflowSteerInput,
         async execute(_toolCallId, params) {
             const manager = getManager();
+            // Ownership gate: when the current session is knowable, steer may only
+            // update runs that session started. Without it an embedder sharing a
+            // manager could steer another session's live run by canonical runId.
+            const sessionId = currentSessionId();
+            if (!ownedRun(params.runId, sessionId, manager)) {
+                throw new Error(sessionId
+                    ? `workflow ${params.runId} is not owned by the current session`
+                    : `workflow ${params.runId} not found`);
+            }
             if (params.agentId) {
                 const targetRunId = await manager.sendToAgent(params.message, params.agentId, params.runId, params.kind);
                 if (!targetRunId) {

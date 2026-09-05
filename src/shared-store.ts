@@ -107,6 +107,13 @@ export class SharedStore {
     // An untracked script/replay write is a new stable baseline. Existing
     // transaction nodes become unreachable and can no longer roll it back.
     this.keyVersionHeads.delete(key);
+    // Drop `key` from every UNCOMMITTED agent delta: without this, a later
+    // commitDelta() returns the old value under `key` and resume replay
+    // reapplies it over this newer external write (live/replay divergence).
+    // Sibling attempts' other keys are untouched and stay commit-eligible.
+    for (const delta of this.agentDeltas.values()) {
+      delete (delta as Record<string, unknown>)[key];
+    }
   }
 
   /**
@@ -273,9 +280,20 @@ export class SharedStore {
     this.valueBytes.clear();
     this.totalBytes = 0;
     this.agentDeltas.clear();
-    this.deltaVersions.clear();
     this.keyVersionHeads.clear();
+    this.deltaVersions.clear();
     this.retiredDeltas.clear();
+  }
+
+  /**
+   * Return the live limits as constructor options so an isolated per-attempt
+   * store can be created with the SAME quotas as its parent. Without this a
+   * custom (stricter) parent limit would be silently lost on the attempt
+   * store, letting a delta exceed the parent's quota only at applyDelta time
+   * and stall the admission-order commit queue.
+   */
+  limitsSnapshot(): SharedStoreOptions {
+    return { ...this.limits };
   }
 
   private admitValue(key: string, value: unknown): { bytes: number; value: unknown } {

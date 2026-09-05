@@ -11,6 +11,18 @@ npm test     # Biome, TypeScript, unit tests, and release checks — must pass
 
 `npm test` runs exactly what CI runs. If it's green locally it should be green in CI. CI runs on every PR to `main`; for fork PRs a maintainer approves the first run.
 
+For everyday changes, run only the affected test files first:
+
+```bash
+npm run test:focus -- workflow-steering
+npm run test:focus -- workflow-manager.test.ts checkpoint.test.ts
+npm run test:focus -- workflow-steering --list
+```
+
+Selectors match a test filename or filename prefix. Missing/unknown selectors fail instead of silently running the whole suite. `npm test` still performs all release checks and all test files. The test runner stays serial because tests temporarily change process-global environment and mocks; it uses two V8 background threads and a concise reporter. Local test/typecheck processes request below-normal CPU priority so interactive apps can remain responsive. CI keeps its usual priority.
+
+The two no-emit TypeScript checks keep separate incremental caches under `node_modules/.cache/pi-workflow/`; a fresh checkout still performs a complete check. `build` remains non-incremental so missing distribution files are recreated reliably. Publishability tests reuse one immutable `npm pack --dry-run --ignore-scripts` snapshot per process; each caller receives a copy. Ordinary deferred-agent fixtures must honor AbortSignal so lifecycle tests do not wait for the production drain grace period. Dedicated uncooperative-provider tests retain their intentional late-settlement behavior.
+
 ## What a good PR looks like
 
 - **One concern per PR.** Keep a bug fix, a feature, and a refactor in separate PRs. A mixed PR (e.g. a test-infra fix *and* a new runtime feature) is harder to review and to revert; split it if you can.

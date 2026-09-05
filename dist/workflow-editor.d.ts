@@ -11,6 +11,7 @@ export declare function buildForcedWorkflowPrompt(text: string, extraDirective?:
  * Register the bottom progress-panel preference command:
  *  - `/workflows-progress compact|detailed|status` — switch (or report) the panel mode.
  *  - `/workflows-progress max <1-1000>` — cap agents shown per phase in detailed mode.
+ *  - `/workflows-progress icons auto|ascii` — pick the glyph set for the tree panel.
  * Both persist via `settingsStore` and take effect on the next live run (the panel
  * live-reads its settings), so no session restart is needed.
  */

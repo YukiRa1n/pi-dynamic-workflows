@@ -13,7 +13,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { WORKFLOW_RUNS_DIR } from "../src/config.js";
+import { MAX_PENDING_DELIVERIES_PER_RUN, WORKFLOW_RUNS_DIR } from "../src/config.js";
 import { createRunPersistence, generateRunId, type PersistedRunState } from "../src/run-persistence.js";
 import { WorkflowManager } from "../src/workflow-manager.js";
 import { workflowProjectPaths } from "../src/workflow-paths.js";
@@ -31,6 +31,56 @@ function withTempCwd(fn: (cwd: string) => Promise<void>) {
     }
   };
 }
+
+test(
+  "delivery outbox round-trips beyond 512 records and rejects overflow before publishing",
+  withTempCwd(async (cwd) => {
+    const persistence = createRunPersistence(cwd);
+    const state: PersistedRunState = {
+      runId: "outbox-capacity",
+      workflowName: "audit",
+      script: "",
+      status: "running",
+      phases: [],
+      agents: [],
+      logs: [],
+      startedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      deliveryOutbox: [],
+    };
+    const outbox = state.deliveryOutbox;
+    assert.ok(outbox);
+    for (let index = 0; index < MAX_PENDING_DELIVERIES_PER_RUN; index++) {
+      outbox.push({
+        deliveryId: `outbox-capacity:${index}`,
+        sequence: index,
+        kind: "agent",
+        status: "pending",
+        content: "result",
+        agentId: String(index),
+        agentCallId: `outbox-capacity:${index}`,
+        agentLabel: "worker",
+        agentStatus: "done",
+        createdAt: state.startedAt,
+      });
+      if (index === 512) {
+        persistence.save(state);
+        assert.equal(persistence.load(state.runId)?.deliveryOutbox?.length, 513);
+      }
+    }
+    persistence.save(state);
+    const revision = state.revision;
+    assert.ok(revision);
+    assert.equal(persistence.load(state.runId)?.deliveryOutbox?.length, MAX_PENDING_DELIVERIES_PER_RUN);
+    outbox.push({ ...outbox[0], deliveryId: "overflow" });
+    assert.throws(() => persistence.save(state), /Invalid persisted workflow state/);
+    assert.equal(state.revision, revision);
+    assert.equal(persistence.load(state.runId)?.revision, revision);
+    outbox.pop();
+    persistence.save(state);
+    assert.equal(persistence.load(state.runId)?.revision, revision + 1);
+  }),
+);
 
 test(
   "createRunPersistence creates runs directory on first save",

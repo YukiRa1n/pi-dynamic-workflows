@@ -41,7 +41,8 @@ export type { AlignmentEvidence, CapabilityDescriptor, CapabilityDiagnostic, Dyn
 export { CapabilityClassification, CapabilityOrigin, CapabilitySupport, DiagnosticSeverity, DiscoveryPlacement, defineWorkflowCapabilityContract, WORKFLOW_CAPABILITY_CONTRACT, WORKFLOW_CAPABILITY_DEFINITION, WorkflowCapabilityContractError, } from "./workflow-capability-contract.js";
 export { registerWorkflowCommands } from "./workflow-commands.js";
 export type { ActiveWorkflowHandle, GetWorkflowOutputInput, GetWorkflowOutputResultDetails, ListActiveWorkflowsInput, ListActiveWorkflowsResultDetails, StopWorkflowInput, StopWorkflowResultDetails, WorkflowControlInput, WorkflowControlRunDetails, WorkflowControlToolOptions, } from "./workflow-control-tool.js";
-export { createGetWorkflowOutputTool, createListActiveWorkflowsTool, createStopWorkflowTool, createWorkflowControlTool, } from "./workflow-control-tool.js";
+export { createGetWorkflowOutputTool, createListActiveWorkflowsTool, createStopWorkflowTool, createWorkflowControlTool, releaseWorkflowOutputWaitForInput, } from "./workflow-control-tool.js";
+export { openWorkflowDemo, renderWorkflowDemo } from "./workflow-demo.js";
 export { buildForcedWorkflowPrompt, registerWorkflowProgressCommands, } from "./workflow-editor.js";
 export type { ManagedRun, WorkflowManagerOptions } from "./workflow-manager.js";
 export { EXPLICIT_DELIVERY_RATE_WINDOW_MS, MAX_EXPLICIT_DELIVERIES_PER_RUN, MAX_EXPLICIT_DELIVERIES_PER_WINDOW, MAX_EXPLICIT_DELIVERY_BYTES_PER_RUN, WorkflowManager, } from "./workflow-manager.js";

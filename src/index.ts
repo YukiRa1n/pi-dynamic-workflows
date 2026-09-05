@@ -175,7 +175,9 @@ export {
   createListActiveWorkflowsTool,
   createStopWorkflowTool,
   createWorkflowControlTool,
+  releaseWorkflowOutputWaitForInput,
 } from "./workflow-control-tool.js";
+export { openWorkflowDemo, renderWorkflowDemo } from "./workflow-demo.js";
 export {
   buildForcedWorkflowPrompt,
   registerWorkflowProgressCommands,

@@ -53,6 +53,20 @@ test("unparseable script is a parse-error violation, not a throw", () => {
   assert.equal(violations[0].rule, "parse-error");
 });
 
+test("parallel result indexing reports distinct locations and an accepted array alternative", () => {
+  const prefix = `${META}\nconst jobs = ["a", "b"];\nconst raw = await parallel(jobs.map(job => () => agent(job)));\n`;
+  const decision = decideWorkflowScriptGate(
+    `${prefix}return jobs.map((job, index) => raw[index] === null ? job : raw[index]);`,
+  );
+  assert.equal(decision.action, "block");
+  if (decision.action !== "block") return;
+  assert.equal(decision.violations.length, 2);
+  assert.equal(new Set(decision.violations.map((v) => v.column)).size, 2);
+  assert.match(decision.reason, /column/);
+  assert.match(decision.reason, /results\.at\(index\)/);
+  assertAllowed(`${prefix}return jobs.map((job, index) => raw.at(index) === null ? job : raw.at(index));`);
+});
+
 // ─── attack vectors must be blocked ───────────────────────────────────────────
 
 test("prototype escape via .constructor on a bridge function is blocked", () => {
@@ -237,7 +251,7 @@ test("bridge globals cannot be shadowed as params or catch bindings", () => {
 // ─── gate byte cap ───────────────────────────────────────────────────────────
 
 test("oversized script is rejected without parsing", () => {
-  const huge = `${META}\n//` + "x".repeat(1_100_000);
+  const huge = `${META}\n//${"x".repeat(1_100_000)}`;
   const violations = auditWorkflowScript(huge);
   assert.equal(violations.length, 1);
   assert.equal(violations[0].rule, "script-too-large");
@@ -245,7 +259,7 @@ test("oversized script is rejected without parsing", () => {
 
 // ─── tool_call wiring (mock event, no Pi session) ───────────────────────────
 
-test("gateWorkflowScriptToolCall blocks a malicious start_workflow call", async () => {
+test("gateWorkflowScriptToolCall blocks a malicious call without requesting loop termination", async () => {
   const { gateWorkflowScriptToolCall } = await import("../extensions/workflow.js");
   const result = gateWorkflowScriptToolCall({
     toolName: "start_workflow",
@@ -253,7 +267,7 @@ test("gateWorkflowScriptToolCall blocks a malicious start_workflow call", async 
   });
   assert.ok(result, "expected a block result");
   assert.equal(result.block, true);
-  assert.equal(result.terminate, true);
+  assert.equal("terminate" in result, false);
   assert.match(result.reason, /static audit/);
 });
 

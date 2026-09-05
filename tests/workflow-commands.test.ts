@@ -33,11 +33,15 @@ function harness(
   let setActiveToolsCalls = 0;
   const eventHandlers = new Map<string, Array<(...args: any[]) => void>>();
   let handler: Handler | undefined;
+  let shortcut: { key: string; description?: string; handler: (ctx: any) => Promise<void> | void } | undefined;
 
   const pi: Partial<ExtensionAPI> = {
     getCommands: () => [],
     registerCommand: (_name: string, opts: { handler: Handler }) => {
       handler = opts.handler;
+    },
+    registerShortcut: (key: string, opts: { description?: string; handler: (ctx: any) => Promise<void> | void }) => {
+      shortcut = { key, ...opts };
     },
     sendMessage:
       sendMessageImpl ??
@@ -99,12 +103,21 @@ function harness(
     sent,
     notified,
     calls,
+    get shortcut() {
+      return shortcut;
+    },
     activeTools,
     get setActiveToolsCalls() {
       return setActiveToolsCalls;
     },
   };
 }
+
+test("registers a spatial keyboard shortcut for the interactive navigator", () => {
+  const h = harness();
+  assert.equal(h.shortcut?.key, "alt+down");
+  assert.match(h.shortcut?.description ?? "", /arrows and Enter/);
+});
 
 test("/workflows list shows empty hint when no runs", async () => {
   const h = harness();

@@ -20,6 +20,12 @@ import type { WorkflowManager } from "./workflow-manager.js";
 import type { SavedWorkflow, WorkflowStorage } from "./workflow-saved.js";
 export type ViewKind = "runs" | "phases" | "agents" | "detail" | "savedDetail";
 export type ItemKind = "run" | "saved";
+/** Spatial shortcut from the editor to the workflow panel below it. Plain
+ * arrows remain owned by the editor; once open, the navigator uses arrows and
+ * Enter directly. Keep the terminal-facing label beside the binding so every
+ * hint describes the registered key accurately. */
+export declare const WORKFLOW_NAV_SHORTCUT: "alt+down";
+export declare const WORKFLOW_NAV_SHORTCUT_LABEL = "Alt+\u2193";
 interface RunRow {
     runId: string;
     name: string;
@@ -90,6 +96,7 @@ export declare class NavigatorState {
     scroll: number;
     tailing: boolean;
     pagerOpen: boolean;
+    detailExpanded: boolean;
     private pageSize;
     private top;
     get kind(): ViewKind;
@@ -118,7 +125,7 @@ export declare class NavigatorState {
     jump(edge: "start" | "end", count: number): void;
     /** Open the full pager without closing an already-open pager. */
     openPager(): boolean;
-    /** Toggle the full pager while retaining the compact agent summary view. */
+    /** Open the semantic activity view, or expand/collapse its selected block. */
     togglePager(): boolean;
     /** Toggle live follow mode in an agent detail pager. */
     toggleTail(): boolean;

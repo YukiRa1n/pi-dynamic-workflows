@@ -5,7 +5,7 @@
 import { join } from "node:path";
 import type { AgentUsage } from "./agent.js";
 import type { AgentHistoryEntry } from "./agent-history.js";
-import { MAX_DURABLE_RUN_BYTES } from "./config.js";
+import { MAX_DURABLE_RUN_BYTES, MAX_PENDING_DELIVERIES_PER_RUN } from "./config.js";
 import type { WorkflowErrorCode } from "./errors.js";
 import {
   ensureDir as ensureDirFs,
@@ -20,7 +20,7 @@ import { workflowProjectPaths } from "./workflow-paths.js";
 export type RunStatus = "pending" | "running" | "paused" | "completed" | "failed" | "aborted";
 
 export type DeliveryOutboxStatus = "pending" | "submitted" | "projected";
-export type DeliveryOutboxKind = "explicit" | "terminal";
+export type DeliveryOutboxKind = "explicit" | "agent" | "terminal";
 
 /** A durable, replayable logical delivery. The provider-facing projection is
  * deliberately not persisted here; `content` is the complete explicit text,
@@ -32,6 +32,12 @@ export interface PersistedDeliveryRecord {
   kind: DeliveryOutboxKind;
   status: DeliveryOutboxStatus;
   content?: string;
+  /** Completed-agent identity for durable main-session delivery. */
+  agentId?: string;
+  agentCallId?: string;
+  agentLabel?: string;
+  agentPhase?: string;
+  agentStatus?: "done" | "error";
   /** Classified reason an explicit delivery is allowed to wake the parent. */
   alertKind?: "blocker" | "critical_finding" | "decision";
   terminal?: boolean;
@@ -493,9 +499,10 @@ export function createRunPersistence(
         return null;
     }
     if (state.deliveryOutbox !== undefined) {
-      if (!Array.isArray(state.deliveryOutbox) || state.deliveryOutbox.length > 512) return null;
+      if (!Array.isArray(state.deliveryOutbox) || state.deliveryOutbox.length > MAX_PENDING_DELIVERIES_PER_RUN)
+        return null;
       const deliveryStatuses = new Set(["pending", "submitted", "projected"]);
-      const deliveryKinds = new Set(["explicit", "terminal"]);
+      const deliveryKinds = new Set(["explicit", "agent", "terminal"]);
       for (const delivery of state.deliveryOutbox) {
         if (
           !isRecord(delivery) ||
@@ -510,6 +517,21 @@ export function createRunPersistence(
         )
           return null;
         if (delivery.content !== undefined && !isText(delivery.content, 1_000_000)) return null;
+        if (delivery.agentId !== undefined && !isText(delivery.agentId, 300)) return null;
+        if (delivery.agentCallId !== undefined && !isText(delivery.agentCallId, 300)) return null;
+        if (delivery.agentLabel !== undefined && !isText(delivery.agentLabel, 1_000)) return null;
+        if (delivery.agentPhase !== undefined && !isText(delivery.agentPhase, 1_000)) return null;
+        if (delivery.agentStatus !== undefined && !new Set(["done", "error"]).has(delivery.agentStatus as string))
+          return null;
+        if (
+          delivery.kind === "agent" &&
+          (delivery.content === undefined ||
+            delivery.agentId === undefined ||
+            delivery.agentCallId === undefined ||
+            delivery.agentLabel === undefined ||
+            delivery.agentStatus === undefined)
+        )
+          return null;
         if (
           delivery.alertKind !== undefined &&
           !new Set(["blocker", "critical_finding", "decision"]).has(delivery.alertKind as string)
@@ -1128,6 +1150,11 @@ export function createRunPersistence(
         // timestamps, but publish a record that passes our own schema immediately.
         if (typeof state.script !== "string") state.script = "";
         if (!state.startedAt) state.startedAt = nextUpdatedAt;
+        // Reject invalid records before replacing either the primary or backup.
+        // A successful write must be readable by the same persistence schema.
+        if (!validateState({ ...state, revision: nextRevision, updatedAt: nextUpdatedAt }, state.runId)) {
+          throw new Error(`Invalid persisted workflow state for ${state.runId}`);
+        }
         const path = primaryRunPath(state.runId);
         // Publish a copy first. Mutating the caller's revision before an I/O
         // failure would make its next retry fence against a revision that was

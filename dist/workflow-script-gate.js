@@ -357,7 +357,7 @@ function isReferencePosition(node) {
  * prove those containers are plain data. */
 function isLocalIndexedAccess(node, scope) {
     const object = node.object;
-    if (!object || object.type !== "Identifier")
+    if (object?.type !== "Identifier")
         return false;
     // Only a local binding, and only one pass 1 saw initialized from an array
     // literal, qualifies. Bridge globals (args, agent, ...) and whitelisted
@@ -389,7 +389,12 @@ export function auditWorkflowScript(script) {
     const push = (rule, message, node) => {
         if (violations.length >= MAX_REPORTED_VIOLATIONS)
             return;
-        violations.push({ rule, message, line: node?.loc?.start?.line });
+        violations.push({
+            rule,
+            message,
+            line: node?.loc?.start?.line,
+            column: node?.loc?.start ? node.loc.start.column + 1 : undefined,
+        });
     };
     if (typeof script === "string" && script.length > GATE_MAX_SCRIPT_BYTES) {
         return [
@@ -435,7 +440,10 @@ export function auditWorkflowScript(script) {
     {
         const stack = [{ node: ast, scope: moduleScope }];
         while (stack.length) {
-            const { node, scope } = stack.pop();
+            const frame = stack.pop();
+            if (!frame)
+                break;
+            const { node, scope } = frame;
             node.__scope = scope;
             node.__arrayLocals = arrayLocals;
             switch (node.type) {
@@ -520,6 +528,8 @@ export function auditWorkflowScript(script) {
         const stack = [ast];
         while (stack.length) {
             const node = stack.pop();
+            if (!node)
+                break;
             switch (node.type) {
                 case "ImportDeclaration":
                     push("import-declaration", "`import` is not allowed; workflows use injected globals, not modules", node);
@@ -538,7 +548,7 @@ export function auditWorkflowScript(script) {
                     const scope = node.__scope ?? moduleScope;
                     if (node.computed) {
                         if (!isLocalIndexedAccess(node, scope)) {
-                            push("computed-member-access", "computed member access `obj[expr]` is not allowed (string-keyed access can reach `constructor`/`__proto__`); use a literal property name, or a numeric/loop-variable index on a local array", node);
+                            push("computed-member-access", "computed member access `obj[expr]` cannot be verified (string keys can reach `constructor`/`__proto__`). Only directly declared array literals qualify for indexed access; results of `await parallel(...)` are not inferred. For result arrays, use `results.at(index)` with a numeric index or iterate with `results.map(...)`; use dot notation for a known property", node);
                         }
                     }
                     else if (node.property?.type === "Identifier" && DANGEROUS_MEMBERS.has(node.property.name)) {
@@ -699,7 +709,9 @@ export function decideWorkflowScriptGate(script) {
     const violations = auditWorkflowScript(script);
     if (violations.length === 0)
         return { action: "allow", via: "static-audit" };
-    const listed = violations.map((v) => `  - ${v.line !== undefined ? `line ${v.line}: ` : ""}${v.message}`).join("\n");
+    const listed = violations
+        .map((v) => `  - ${v.line !== undefined ? `line ${v.line}${v.column !== undefined ? `, column ${v.column}` : ""}: ` : ""}${v.message}`)
+        .join("\n");
     return {
         action: "block",
         violations,

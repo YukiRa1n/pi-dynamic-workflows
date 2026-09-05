@@ -8,7 +8,7 @@ import type { WorkflowErrorCode } from "./errors.js";
 import { type PersistenceFsLayer } from "./fs-persistence.js";
 export type RunStatus = "pending" | "running" | "paused" | "completed" | "failed" | "aborted";
 export type DeliveryOutboxStatus = "pending" | "submitted" | "projected";
-export type DeliveryOutboxKind = "explicit" | "terminal";
+export type DeliveryOutboxKind = "explicit" | "agent" | "terminal";
 /** A durable, replayable logical delivery. The provider-facing projection is
  * deliberately not persisted here; `content` is the complete explicit text,
  * while terminal records point at the complete run result and are projected by
@@ -19,6 +19,12 @@ export interface PersistedDeliveryRecord {
     kind: DeliveryOutboxKind;
     status: DeliveryOutboxStatus;
     content?: string;
+    /** Completed-agent identity for durable main-session delivery. */
+    agentId?: string;
+    agentCallId?: string;
+    agentLabel?: string;
+    agentPhase?: string;
+    agentStatus?: "done" | "error";
     /** Classified reason an explicit delivery is allowed to wake the parent. */
     alertKind?: "blocker" | "critical_finding" | "decision";
     terminal?: boolean;

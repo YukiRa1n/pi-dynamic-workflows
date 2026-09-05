@@ -19,7 +19,7 @@ import { registerSavedWorkflow } from "./saved-commands.js";
 import { buildForcedWorkflowPrompt } from "./workflow-editor.js";
 import type { WorkflowManager } from "./workflow-manager.js";
 import type { WorkflowStorage } from "./workflow-saved.js";
-import { openWorkflowNavigator } from "./workflow-ui.js";
+import { openWorkflowNavigator, WORKFLOW_NAV_SHORTCUT } from "./workflow-ui.js";
 
 const STATUS_ICON: Record<string, string> = {
   pending: "·",
@@ -196,6 +196,35 @@ export function registerWorkflowCommands(
     watcherCleanups.clear();
   });
 
+  // One navigator instance per extension generation. Repeated shortcut presses
+  // while the overlay is focused must not stack modal UIs or duplicate manager
+  // listeners.
+  let navigatorOpen = false;
+  const openNavigator = async (ctx: ExtensionCommandContext): Promise<boolean> => {
+    if (!ctx.hasUI || navigatorOpen) return navigatorOpen;
+    navigatorOpen = true;
+    try {
+      await openWorkflowNavigator(pi, getManager(), ctx.ui, {
+        storage: getStorage(),
+        cwd: getCwd(),
+        getStorage,
+        getCwd,
+        getManager,
+      });
+      return true;
+    } finally {
+      navigatorOpen = false;
+    }
+  };
+
+  const shortcutApi = pi as ExtensionAPI & { registerShortcut?: ExtensionAPI["registerShortcut"] };
+  shortcutApi.registerShortcut?.(WORKFLOW_NAV_SHORTCUT, {
+    description: "Open workflow navigator (then use arrows and Enter)",
+    handler: async (ctx) => {
+      await openNavigator(ctx as ExtensionCommandContext);
+    },
+  });
+
   pi.registerCommand("workflows", {
     description:
       "Manage workflow runs — no args (opens navigator) | run <prompt> | status/stop/pause/resume/steer | rm | save",
@@ -240,23 +269,11 @@ export function registerWorkflowCommands(
           // Interactive navigator when a UI is available; plain text otherwise
           // (print/RPC mode) or when the user explicitly asks for `list`.
           if (sub !== "list" && ctx.hasUI) {
-            await openWorkflowNavigator(pi, manager, ctx.ui, {
-              storage: getStorage(),
-              cwd: getCwd(),
-              getStorage,
-              getCwd,
-              getManager,
-            });
+            await openNavigator(ctx);
             return;
           }
           if (parts.length === 0 && ctx.hasUI) {
-            await openWorkflowNavigator(pi, manager, ctx.ui, {
-              storage: getStorage(),
-              cwd: getCwd(),
-              getStorage,
-              getCwd,
-              getManager,
-            });
+            await openNavigator(ctx);
             return;
           }
           const runs = manager.listRuns();

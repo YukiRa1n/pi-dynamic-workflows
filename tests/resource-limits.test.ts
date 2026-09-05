@@ -80,6 +80,47 @@ test("Agent Team exposes only classified, targeted model-facing messages", async
   assert.equal(workflowMessage.kind, "workflow_instruction");
 });
 
+test("Agent Team inbox can wait for a peer event without polling", async () => {
+  const team = new WorkflowAgentTeam("team", "wait", 2, { maxMessages: 4 });
+  const sender = team.addMember("sender");
+  const receiver = team.addMember("receiver");
+  const inbox = team.createTools(receiver).find((tool) => tool.name === "team_inbox");
+  assert.ok(inbox);
+
+  const pending = inbox.execute("wait", { waitMs: 1_000 });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  team.sendFromWorkflow(receiver, "peer is ready");
+  const result = await pending;
+  assert.deepEqual(
+    (result.details as { messages: Array<{ message: string }>; timedOut: boolean }).messages.map((m) => m.message),
+    ["peer is ready"],
+  );
+  assert.equal((result.details as { timedOut: boolean }).timedOut, false);
+  assert.equal(team.readInbox(receiver).length, 0, "a completed wait consumes the delivered message once");
+  assert.equal(sender, "team:member:1");
+});
+
+test("Agent Team inbox wait reports a bounded timeout", async () => {
+  const team = new WorkflowAgentTeam("team", "wait-timeout", 1);
+  const receiver = team.addMember("receiver");
+  const inbox = team.createTools(receiver).find((tool) => tool.name === "team_inbox");
+  assert.ok(inbox);
+  const result = await inbox.execute("timeout", { waitMs: 1 });
+  assert.deepEqual(result.details, { messages: [], timedOut: true });
+});
+
+test("Agent Team inbox wait is abortable", async () => {
+  const team = new WorkflowAgentTeam("team", "wait-abort", 1);
+  const receiver = team.addMember("receiver");
+  const inbox = team.createTools(receiver).find((tool) => tool.name === "team_inbox");
+  assert.ok(inbox);
+  const controller = new AbortController();
+  const pending = inbox.execute("abort", { waitMs: 1_000 }, controller.signal);
+  controller.abort(new Error("caller stopped waiting"));
+  await assert.rejects(pending, /caller stopped waiting/);
+  assert.equal(team.snapshot().pendingMessages, 0);
+});
+
 test("Agent Team committed spawn rollback restores metadata, members, sequence, and quota", () => {
   let reserved = 0;
   const team = new WorkflowAgentTeam("team", "transactional", 4, {

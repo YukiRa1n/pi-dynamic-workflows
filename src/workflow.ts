@@ -121,8 +121,24 @@ export interface JournalEntry {
 export interface SharedRuntime {
   limiter: WorkflowLimiter;
   agentCount: number;
+  /** Successful live or replayed agent calls; checkpoints are not agent successes. */
+  successfulAgentCount?: number;
   spent: number;
   tokenUsage: { input: number; output: number; total: number; cost: number; cacheRead: number; cacheWrite: number };
+  /**
+   * Terminal-failure records for every recoverable agent() call that exhausted
+   * its retries. Populated by the runtime so the top-level result can surface
+   * an explicit terminal state instead of silently treating swallowed nulls
+   * as success. Optional to keep existing SharedRuntime literals (tests,
+   * nested frames) compiling; the aggregate treats absence as "no failures".
+   */
+  agentFailures?: Array<{
+    label: string | undefined;
+    phase: string | undefined;
+    error: string;
+    errorCode?: WorkflowErrorCode;
+    recoverable: boolean;
+  }>;
   depth: number;
   /**
    * Monotonic count of every workflow() call anywhere in this run tree,
@@ -352,6 +368,8 @@ export interface WorkflowRunOptions extends WorkflowAgentOptions {
    * Shared store for this run. One instance is created per top-level run and
    * propagated into nested workflow() calls. Pass an existing instance to share
    * state across a parent and child run; omit to create a fresh isolated store.
+   * An externally supplied store is never disposed by this run (the creator
+   * owns its lifetime), so concurrent runs can safely share one instance.
    */
   sharedStore?: SharedStore;
   /** Resolve a saved-workflow name to its script, enabling `workflow('name', args)`. */
@@ -592,6 +610,16 @@ export interface WorkflowRunResult<T = unknown> {
   agentCount: number;
   durationMs: number;
   runId?: string;
+  /**
+   * Explicit terminal state of the run. `completed` requires every logical
+   * agent() call to have succeeded (or been intentionally skipped);
+   * `partial` means at least one call failed while others succeeded;
+   * `exhausted` means every call failed after retries, so the run's result
+   * is best-effort at best. Script validation errors, timeouts, and aborts
+   * reject the promise before this is returned, so they do not appear here.
+   * Absent on legacy results (treat as `completed`).
+   */
+  status?: "completed" | "partial" | "exhausted";
   tokenUsage?: {
     input: number;
     output: number;
@@ -960,7 +988,20 @@ export async function runWorkflow<T = unknown>(
     while (shared.pendingStoreDeltas.has(shared.nextStoreOrder)) {
       const next = shared.pendingStoreDeltas.get(shared.nextStoreOrder) as Record<string, unknown>;
       shared.pendingStoreDeltas.delete(shared.nextStoreOrder);
-      store.applyDelta(next);
+      try {
+        store.applyDelta(next);
+      } catch (error) {
+        // A concurrent over-quota delta must not stall the admission-order
+        // commit queue: applyDelta failed for THIS delta only, so drop it,
+        // diagnose via the run log, and keep committing later deltas. Without
+        // this the queue is permanently stuck (nextStoreOrder never advances)
+        // and every later store write waits forever.
+        appendLog(
+          `shared-store delta ${shared.nextStoreOrder} rejected at commit: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
       shared.nextStoreOrder++;
     }
   };
@@ -1429,6 +1470,7 @@ export async function runWorkflow<T = unknown>(
       // This is what makes a conflicting parallel write deterministic instead
       // of depending on whichever provider response happened to finish first.
       settleThisStoreOrder(cached.storeDelta ?? {});
+      shared.successfulAgentCount = (shared.successfulAgentCount ?? 0) + 1;
       return cached.result;
     }
     // A genuine miss (no journal entry, hash change, or live host message) marks
@@ -1712,7 +1754,11 @@ export async function runWorkflow<T = unknown>(
             // logical agent settles. This removes completion-order races from
             // both Promise.all/parallel fan-outs and gives retries a private
             // rollback window without exposing half-finished writes to peers.
-            attemptStore = new SharedStore();
+            // Inherit the parent's quotas (not the default 2048-key/4 MiB):
+            // a custom stricter parent limit must reject an over-quota write
+            // HERE instead of stalling the admission-order commit queue when
+            // applyDelta later hits the same limit on the shared store.
+            attemptStore = new SharedStore(store.limitsSnapshot());
             attemptStore.restore(store.snapshot());
             let attemptSession:
               | { sendUserMessage(content: string, options?: { deliverAs?: "steer" | "followUp" }): Promise<void> }
@@ -1917,6 +1963,7 @@ export async function runWorkflow<T = unknown>(
               worktree: runCwd,
               model: displayModel,
             });
+            shared.successfulAgentCount = (shared.successfulAgentCount ?? 0) + 1;
             return result;
           } catch (error) {
             if (isAborted()) {
@@ -1989,6 +2036,14 @@ export async function runWorkflow<T = unknown>(
             });
 
             if (workflowError.recoverable) {
+              shared.agentFailures ??= [];
+              shared.agentFailures.push({
+                label,
+                phase: assignedPhase,
+                error: workflowError.message,
+                errorCode: workflowError.code,
+                recoverable: true,
+              });
               logBestEffort(
                 `agent "${label}" exhausted ${maxAttempts} attempt${maxAttempts === 1 ? "" : "s"}: ${workflowError.code} ${workflowError.message}`,
               );
@@ -2513,9 +2568,24 @@ export async function runWorkflow<T = unknown>(
       try {
         items = (await opts.round(r)) ?? [];
       } catch (error) {
-        // Budget / agent-limit exhaustion: return the partial result, don't abort.
+        // Budget / agent-limit exhaustion: return the partial result, don't
+        // abort (documented contract), but surface the capacity signal on the
+        // run result so the top-level status is not a clean `completed`.
         const code = (error as { code?: string })?.code;
-        if (code === WorkflowErrorCode.TOKEN_BUDGET_EXHAUSTED || code === WorkflowErrorCode.AGENT_LIMIT_EXCEEDED) break;
+        if (code === WorkflowErrorCode.TOKEN_BUDGET_EXHAUSTED || code === WorkflowErrorCode.AGENT_LIMIT_EXCEEDED) {
+          shared.agentFailures ??= [];
+          shared.agentFailures.push({
+            label: "loopUntilDry",
+            phase: state.currentPhase,
+            error:
+              typeof error === "object" && error !== null && "message" in error
+                ? String((error as { message?: unknown }).message ?? code)
+                : String(code ?? "capacity exhaustion"),
+            errorCode: (code as WorkflowErrorCode | undefined) ?? WorkflowErrorCode.RESOURCE_LIMIT_EXCEEDED,
+            recoverable: false,
+          });
+          break;
+        }
         throw error;
       }
       const roundItems = Array.isArray(items) ? items : [];
@@ -2647,7 +2717,10 @@ export async function runWorkflow<T = unknown>(
         { recoverable: false },
       );
     } else {
-      reply = checkpointOptions.default ?? true;
+      // `default ?? true` would collapse an explicit `null` into the same true
+      // the omitted case gets, while hashCheckpoint records `?? null` — an
+      // explicit null must stay null so execution and the resume journal agree.
+      reply = checkpointOptions.default === undefined ? true : checkpointOptions.default;
     }
     throwIfAborted();
     throwIfAdmissionClosed();
@@ -2728,12 +2801,14 @@ for (const name of Object.getOwnPropertyNames(globalThis)) {
   globalThis[exposed] = (...args) => {
     const result = impl(...args);
     if (!result || typeof result.then !== "function") return result;
-    // Attach a noop rejection handler to the HOST promise immediately so a
-    // bridge rejection the script never awaits cannot surface as an
-    // unhandledRejection in the host process; the vm-realm promise below
-    // still carries the rejection to any real awaiter.
-    Promise.resolve(result).catch(() => {});
-    return Promise.resolve(result);
+    // Promise.resolve(hostPromise) creates a NEW vm-realm wrapper. Reuse that
+    // exact wrapper: observing a different wrapper still leaves the returned
+    // one unhandled when a script starts agent() and then exits before awaiting
+    // it (for example, parallel([alreadyStartedPromise])). Attaching catch does
+    // not change the original promise's rejection for a real awaiter.
+    const wrapped = Promise.resolve(result);
+    wrapped.catch(() => {});
+    return wrapped;
   };
   delete globalThis[name];
 }`,
@@ -2810,12 +2885,17 @@ for (const name of Object.getOwnPropertyNames(globalThis)) {
       );
     }
 
+    const failures = shared.agentFailures ?? [];
+    const status =
+      failures.length === 0 ? "completed" : (shared.successfulAgentCount ?? 0) === 0 ? "exhausted" : "partial";
+
     return {
       meta,
       result: result as T,
       logs: state.logs,
       phases: state.phases,
       agentCount: shared.agentCount,
+      status,
       durationMs: Date.now() - started,
       runId,
       tokenUsage: shared.tokenUsage,
@@ -2891,7 +2971,14 @@ for (const name of Object.getOwnPropertyNames(globalThis)) {
       // Emit once after every in-flight attempt has settled, including abort
       // paths where confirmed provider usage was recorded during unwinding.
       observers.onTokenUsage?.(shared.tokenUsage);
-      store.dispose();
+      // Dispose only a store THIS run created. An externally supplied
+      // `options.sharedStore` may be shared across concurrent runs; disposing
+      // it here would tear the store out from under the other run (every
+      // operation then throws "shared store is disposed"). The original
+      // creator/owner is responsible for its lifetime.
+      if (options.sharedStore === undefined) {
+        store.dispose();
+      }
     }
   }
 }
@@ -3122,12 +3209,17 @@ function defaultAgentLabel(phase: string | undefined, index: number): string {
  * one-time re-ask.
  */
 function hashCheckpoint(promptText: string, options: CheckpointOptions, resumeContextHash?: string): string {
+  // `default` distinguishes "omitted" (behaves as true in the headless path)
+  // from an explicit `null` (returns null). An explicit `undefined` value is
+  // treated as omitted (the documented true fallback). Tag presence separately:
+  // every JSON string is a legal default and cannot serve as an absence sentinel.
+  const hasExplicitDefault = Object.hasOwn(options, "default") && options.default !== undefined;
   const identity = serializeIdentity({
-    identityVersion: 2,
+    identityVersion: 4,
     promptText,
     kind: options.kind ?? "confirm",
     choices: options.choices ?? null,
-    default: options.default ?? null,
+    default: { provided: hasExplicitDefault, value: hasExplicitDefault ? options.default : null },
     headless: options.headless ?? "default",
     timeoutMs: options.timeoutMs ?? null,
     // A checkpoint in a nested frame has no provider call hash to carry the

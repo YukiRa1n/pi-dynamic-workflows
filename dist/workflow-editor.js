@@ -1,4 +1,5 @@
 /** Explicit workflow command prompt rewrites and interactive UI preferences. */
+import { buildLiveWorkflowDemoPrompt, openWorkflowDemo } from "./workflow-demo.js";
 import { loadWorkflowSettings, saveWorkflowSettings, } from "./workflow-settings.js";
 /** Legacy recognizer retained for embedders; the Pi extension does not lease tools from it. */
 export function hasExplicitWorkflowControlRequest(text) {
@@ -28,12 +29,13 @@ export function buildForcedWorkflowPrompt(text, extraDirective) {
  * Register the bottom progress-panel preference command:
  *  - `/workflows-progress compact|detailed|status` — switch (or report) the panel mode.
  *  - `/workflows-progress max <1-1000>` — cap agents shown per phase in detailed mode.
+ *  - `/workflows-progress icons auto|ascii` — pick the glyph set for the tree panel.
  * Both persist via `settingsStore` and take effect on the next live run (the panel
  * live-reads its settings), so no session restart is needed.
  */
 export function registerWorkflowProgressCommands(pi, settingsStore = DEFAULT_SETTINGS_STORE) {
     pi.registerCommand?.("workflows-progress", {
-        description: "Bottom progress panel: compact | detailed | status | max <N>",
+        description: "Bottom progress panel: compact | detailed | status | max <N> | icons auto | ascii",
         async handler(args, _ctx) {
             const trimmed = args.trim();
             const say = (content) => pi.sendMessage({ customType: "workflows-progress", content, display: true });
@@ -52,8 +54,13 @@ export function registerWorkflowProgressCommands(pi, settingsStore = DEFAULT_SET
                     await say(`Detailed progress shows up to ${loadProgressMaxAgents(settingsStore)} agents per phase. Usage: /workflows-progress max <1-1000>`);
                     return;
                 }
-                const n = Number.parseInt(rest, 10);
-                if (!Number.isFinite(n) || n < 1) {
+                const trimmed = rest.trim();
+                if (!/^\d+$/.test(trimmed)) {
+                    await say(`Invalid value "${rest}". Usage: /workflows-progress max <1-1000> (a whole number ≥ 1).`);
+                    return;
+                }
+                const n = Number.parseInt(trimmed, 10);
+                if (n < 1) {
                     await say(`Invalid value "${rest}". Usage: /workflows-progress max <1-1000> (a whole number ≥ 1).`);
                     return;
                 }
@@ -64,7 +71,47 @@ export function registerWorkflowProgressCommands(pi, settingsStore = DEFAULT_SET
                     : `Set to ${clamped} for this session, but the preference could not be saved.`);
                 return;
             }
-            await say(`Workflow progress panel is ${loadProgressMode(settingsStore)}, showing up to ${loadProgressMaxAgents(settingsStore)} agents per phase. Usage: /workflows-progress compact | detailed | status | max <N>`);
+            if (verb === "icons") {
+                if (!rest) {
+                    await say(`Progress panel glyphs are ${loadProgressIcons(settingsStore)}. Usage: /workflows-progress icons auto | ascii`);
+                    return;
+                }
+                const value = rest.toLowerCase();
+                if (value !== "auto" && value !== "ascii") {
+                    await say(`Invalid value "${rest}". Usage: /workflows-progress icons auto | ascii`);
+                    return;
+                }
+                const saved = persistProgressSettings(settingsStore, { progressPanelIcons: value });
+                await say(saved
+                    ? `Progress panel glyphs set to ${value} — takes effect on the next render of a live run.`
+                    : `Set to ${value} for this session, but the preference could not be saved.`);
+                return;
+            }
+            await say(`Workflow progress panel is ${loadProgressMode(settingsStore)}, showing up to ${loadProgressMaxAgents(settingsStore)} agents per phase. Usage: /workflows-progress compact | detailed | status | max <N> | icons auto | ascii`);
+        },
+    });
+    pi.registerCommand?.("workflows-demo", {
+        description: "Run the real Pi chat demo (2 model-backed agents); preview opens the offline panel",
+        async handler(args, ctx) {
+            const mode = args.trim().toLowerCase();
+            if (mode === "preview") {
+                if (!ctx.hasUI) {
+                    ctx.ui.notify("/workflows-demo preview requires TUI mode", "warning");
+                    return;
+                }
+                await ctx.waitForIdle();
+                await openWorkflowDemo(ctx.ui, loadProgressIcons(settingsStore));
+                return;
+            }
+            if (mode && mode !== "live") {
+                ctx.ui.notify("/workflows-demo [live | preview]：默认在主会话运行真实演示，使用两个子代理和模型 token。", "info");
+                return;
+            }
+            if (!ctx.isIdle()) {
+                ctx.ui.notify("请等当前回合结束后运行 /workflows-demo；演示开始后可以正常插话。", "info");
+                return;
+            }
+            pi.sendUserMessage(buildLiveWorkflowDemoPrompt());
         },
     });
 }
@@ -95,5 +142,13 @@ function loadProgressMaxAgents(settingsStore) {
     }
     catch {
         return 8;
+    }
+}
+function loadProgressIcons(settingsStore) {
+    try {
+        return settingsStore.load().progressPanelIcons ?? "auto";
+    }
+    catch {
+        return "auto";
     }
 }

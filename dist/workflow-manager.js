@@ -3,7 +3,7 @@
  */
 import { EventEmitter } from "node:events";
 import { resolve } from "node:path";
-import { DEFAULT_MAX_PAUSED_BYTES_ON_DISK, DEFAULT_MAX_PAUSED_RUNS_IN_MEMORY, DEFAULT_MAX_PAUSED_RUNS_ON_DISK, DEFAULT_WORKFLOW_TIMEOUT_MS, MAX_AGENT_PROMPT_BYTES, MAX_PENDING_MESSAGE_BYTES, MAX_PENDING_MESSAGES, } from "./config.js";
+import { DEFAULT_MAX_PAUSED_BYTES_ON_DISK, DEFAULT_MAX_PAUSED_RUNS_IN_MEMORY, DEFAULT_MAX_PAUSED_RUNS_ON_DISK, DEFAULT_WORKFLOW_TIMEOUT_MS, MAX_AGENT_PROMPT_BYTES, MAX_PENDING_DELIVERIES_PER_RUN, MAX_PENDING_MESSAGE_BYTES, MAX_PENDING_MESSAGES, } from "./config.js";
 import { preview } from "./display.js";
 import { isProviderUsageLimit, WorkflowError, WorkflowErrorCode } from "./errors.js";
 import { assertSafeRunId, createRunPersistence, generateRunId, } from "./run-persistence.js";
@@ -138,7 +138,7 @@ export class WorkflowManager extends EventEmitter {
     maxPausedBytesOnDisk;
     /** Runtime deliver() bridge; refreshed by host wiring each generation. */
     onDeliver;
-    /** Optional host observer for live subagent results; not provider delivery by default. */
+    /** Optional host observer for live subagent results; hosts own delivery policy. */
     onAgentMessage;
     pendingMessages = new Map();
     pendingMessageCount = 0;
@@ -639,7 +639,8 @@ export class WorkflowManager extends EventEmitter {
             budget.windowStartedAt = now;
             budget.windowCount = 0;
         }
-        if (budget.explicitCount >= MAX_EXPLICIT_DELIVERIES_PER_RUN ||
+        if (managed.deliveryOutbox.length >= MAX_PENDING_DELIVERIES_PER_RUN - 2 ||
+            budget.explicitCount >= MAX_EXPLICIT_DELIVERIES_PER_RUN ||
             budget.explicitBytes + bytes > MAX_EXPLICIT_DELIVERY_BYTES_PER_RUN ||
             budget.windowCount >= MAX_EXPLICIT_DELIVERIES_PER_WINDOW) {
             throw new WorkflowError("Explicit delivery budget exceeded; terminal lifecycle delivery remains reserved", WorkflowErrorCode.DELIVERY_BUDGET_EXCEEDED, { recoverable: true });
@@ -671,6 +672,55 @@ export class WorkflowManager extends EventEmitter {
         }
         return delivery;
     }
+    /**
+     * Persist a completed subagent before its host notification is admitted.
+     * The call ID is the logical identity, so a duplicate observer callback in
+     * the same run reuses the original durable record instead of publishing a
+     * second main-session message.
+     */
+    admitAgentDelivery(runId, input) {
+        assertSafeRunId(runId);
+        const managed = this.runs.get(runId);
+        if (!managed || !this.isCurrent(managed) || !managed.background)
+            return undefined;
+        const existing = managed.deliveryOutbox.find((item) => item.kind === "agent" && item.agentCallId === input.callId);
+        if (existing)
+            return existing;
+        // Leave room for pause and terminal records. A report not admitted here
+        // remains available through get_workflow_output and its agent snapshot.
+        if (managed.deliveryOutbox.length >= MAX_PENDING_DELIVERIES_PER_RUN - 2)
+            return undefined;
+        const sequence = managed.nextDeliverySequence++;
+        const delivery = {
+            deliveryId: stableDeliveryId(managed.runId, sequence),
+            sequence,
+            kind: "agent",
+            status: "pending",
+            content: input.content,
+            agentId: input.agentId,
+            agentCallId: input.callId,
+            agentLabel: input.label,
+            ...(input.phase ? { agentPhase: input.phase } : {}),
+            agentStatus: input.status,
+            createdAt: new Date().toISOString(),
+        };
+        managed.deliveryOutbox.push(delivery);
+        try {
+            this.persistRunStrict(managed);
+        }
+        catch (error) {
+            managed.deliveryOutbox.pop();
+            managed.nextDeliverySequence--;
+            throw error;
+        }
+        this.safeEmit("delivery", {
+            runId: managed.runId,
+            deliveryId: delivery.deliveryId,
+            sequence: delivery.sequence,
+            kind: "agent",
+        });
+        return delivery;
+    }
     /** Reserve one terminal record before publishing terminal state. It is
      * idempotent, so duplicate lifecycle events cannot create duplicate wakes. */
     ensureTerminalDelivery(managed) {
@@ -696,9 +746,12 @@ export class WorkflowManager extends EventEmitter {
     ensurePausedDelivery(managed, error) {
         if (!managed.background || managed.status !== "paused")
             return undefined;
-        const existing = managed.deliveryOutbox.find((item) => item.checkpoint === "paused");
-        if (existing)
-            return existing;
+        if (managed.deliveryOutbox.length >= MAX_PENDING_DELIVERIES_PER_RUN - 1)
+            return undefined;
+        // Every usage-limit pause gets its OWN record with a fresh deliveryId and
+        // current reset hint. Reusing the first paused record would let the bridge
+        // dedupe on the stable deliveryId and silently drop a SECOND pause notice
+        // (and show the first pause's stale error/hint).
         const sequence = managed.nextDeliverySequence++;
         const when = error.resetHint ? ` (${error.resetHint})` : "";
         const delivery = {
@@ -777,7 +830,9 @@ export class WorkflowManager extends EventEmitter {
                 return true;
             }
             catch {
-                managed.deliveryOutbox.splice(Math.min(index, managed.deliveryOutbox.length), 0, removed);
+                if (removed !== undefined) {
+                    managed.deliveryOutbox.splice(Math.min(index, managed.deliveryOutbox.length), 0, removed);
+                }
                 return false;
             }
         }
@@ -1160,17 +1215,23 @@ export class WorkflowManager extends EventEmitter {
                     // double-count" semantics of journal replay.
                     this.accumulateTokenUsage(managed, event.tokens ?? 0, event.tokenUsage);
                     this.activeAgentSenders.delete(event.id);
-                    this.emitLive(managed, "agentEnd", { runId: managed.runId, ...event });
                     if (!event.replayed) {
                         this.onAgentMessage?.({
                             runId: managed.runId,
+                            callId: event.id,
                             id: event.id,
                             label: event.label,
                             phase: event.phase,
                             result: event.result,
+                            status: event.result === null ? "error" : "done",
                             error: event.error,
                         });
                     }
+                    // The host observer above may durably publish a child result and
+                    // emit the delivery boundary. Emit the generic lifecycle event only
+                    // afterwards so get_workflow_output observes the custom delivery as
+                    // the winner instead of claiming the same result as a tool payload.
+                    this.emitLive(managed, "agentEnd", { runId: managed.runId, ...event });
                     progress();
                 },
                 onAgentHistory: (event) => {
@@ -1197,6 +1258,34 @@ export class WorkflowManager extends EventEmitter {
                 throw new WorkflowError("Workflow aborted before completion", WorkflowErrorCode.WORKFLOW_ABORTED, {
                     recoverable: true,
                 });
+            }
+            // A run whose every logical agent call failed after retries is not a
+            // clean success: surface it as failed (with a resumable/editable error)
+            // instead of reporting "completed" for an exhausted best-effort result.
+            // Partial success stays completed — the result itself carries the
+            // partial signal.
+            if (result.status === "exhausted") {
+                managed.status = "failed";
+                managed.result = result;
+                managed.error = new WorkflowError("All agent calls failed after retries; the workflow result is best-effort at best. Review the agents tab and edit/resume the script to retry.", WorkflowErrorCode.AGENT_EXECUTION_ERROR, { recoverable: true });
+                this.dropPendingMessages(managed.runId);
+                const failureDelivery = this.ensureTerminalDelivery(managed);
+                this.persistRunStrict(managed);
+                // Guarded like the catch path: EventEmitter throws on an unlistened
+                // "error" emit, and safeEmit would log misleading warn spam for a
+                // normal exhausted finish with no error listener attached.
+                if (this.listenerCount("error") > 0) {
+                    this.emitLive(managed, "error", {
+                        runId: managed.runId,
+                        error: managed.error,
+                        deliveryId: failureDelivery?.deliveryId,
+                        sequence: failureDelivery?.sequence,
+                    });
+                }
+                this.cleanupSettledGeneration(managed);
+                this.releaseExecutionCapacity(managed);
+                removeExternalAbort?.();
+                return result;
             }
             managed.status = "completed";
             managed.result = result;
@@ -1231,9 +1320,16 @@ export class WorkflowManager extends EventEmitter {
             return result;
         }
         catch (error) {
+            // A non-WorkflowError that escaped runWorkflow is either an intentional
+            // abort (pause/stop/Esc — recoverable, handled below by the signal
+            // branch) or a real bug in user script/tooling that no one caught.
+            // Treating every unknown error as recoverable would let a genuine
+            // programming error masquerade as a resumable abort; only signal-driven
+            // aborts keep the recoverable flag.
+            const intentionalAbort = managed.controller.signal.aborted;
             const workflowError = error instanceof WorkflowError
                 ? error
-                : new WorkflowError(error instanceof Error ? error.message : String(error), WorkflowErrorCode.WORKFLOW_ABORTED, { recoverable: true });
+                : new WorkflowError(error instanceof Error ? error.message : String(error), intentionalAbort ? WorkflowErrorCode.WORKFLOW_ABORTED : WorkflowErrorCode.UNKNOWN, { recoverable: intentionalAbort });
             const usageLimitPaused = !managed.controller.signal.aborted && isProviderUsageLimit(workflowError);
             // A failed terminal publication must not retain the uncommitted
             // completed-result marker; replace it with the failed terminal record.

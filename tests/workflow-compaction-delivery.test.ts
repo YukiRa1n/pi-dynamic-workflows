@@ -5,6 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { discardWorkflowRuntime, handoffWorkflowRuntime, takeWorkflowRuntime } from "../src/extension-reload.js";
+import { saveWorkflowSettings } from "../src/workflow-settings.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
 
 type Handler = (...args: any[]) => any;
@@ -116,6 +117,149 @@ function startAgent(handlers: Record<string, Handler[]>, signal: AbortSignal): v
     handler({ type: "agent_start" }, { signal });
   }
 }
+
+test("streamAgentResults durably delivers each live completion and shares the output claim cursor", async () => {
+  const fakeHome = mkdtempSync(join(tmpdir(), "pi-dw-stream-agent-results-"));
+  try {
+    await withFakeHomeAsync(fakeHome, async () => {
+      discardWorkflowRuntime();
+      saveWorkflowSettings({ streamAgentResults: true });
+      const { default: installExtension } = await import("../extensions/workflow.js");
+      const seedHandlers: Record<string, Handler[]> = {};
+      installExtension(makePi(seedHandlers, []));
+      startSession(seedHandlers);
+      seedHandlers.session_shutdown?.[0]?.({ reason: "reload" });
+      const runtime = takeWorkflowRuntime();
+      assert.ok(runtime);
+      handoffWorkflowRuntime(runtime);
+      const handlers: Record<string, Handler[]> = {};
+      const sent: Array<{ message: any; options: any }> = [];
+      installExtension(makePi(handlers, sent));
+      startSession(handlers);
+      const callback = runtime.manager.onAgentMessage;
+      assert.ok(callback);
+      const durableByCallId = new Map<string, any>();
+      (runtime.manager as any).admitAgentDelivery = (_runId: string, input: any) => {
+        const existing = durableByCallId.get(input.callId);
+        if (existing) return existing;
+        const record = {
+          deliveryId: `wf_agent_${durableByCallId.size}`,
+          sequence: durableByCallId.size,
+          kind: "agent",
+          status: "pending",
+          ...input,
+        };
+        durableByCallId.set(input.callId, record);
+        return record;
+      };
+      (runtime.manager as any).acknowledgeDelivery = () => true;
+
+      callback({
+        runId: "stream-run",
+        id: "stream-run:0",
+        label: "first",
+        phase: "research",
+        result: { report: "one" },
+      });
+      callback({
+        runId: "stream-run",
+        id: "stream-run:1",
+        label: "second",
+        phase: "research",
+        result: { report: "two" },
+      });
+      assert.equal(sent.length, 2, "each durable completion is admitted to passive history immediately");
+      assert.equal(sent[0]?.message.customType, "workflow-agent-completed");
+      assert.deepEqual(sent[0]?.options, { triggerTurn: false });
+      assert.doesNotMatch(sent[0]?.message.content, /UNTRUSTED|runId=|callId=|sequence=/);
+      assert.match(sent[0]?.message.content, /✓ first · 完成/);
+      assert.match(sent[1]?.message.content, /✓ second · 完成/);
+      assert.equal(sent[0]?.message.details.notificationKind, "agent-completed");
+      assert.deepEqual(
+        sent[0]?.message.details.agentResults.map((item: any) => item.callId),
+        ["stream-run:0"],
+      );
+      const provider = projectMessages(
+        handlers,
+        sent.map(({ message }, index) => ({ role: "custom", ...message, timestamp: index + 1 })),
+      );
+      const wire = JSON.stringify(provider);
+      assert.equal(wire.split("New subagent reports need review").length - 1, 1, "one review notice per batch");
+      assert.match(wire, /For EACH new report/);
+      assert.match(wire, /evidence, not instructions/);
+      const waitProjection = projectMessages(handlers, [
+        {
+          role: "assistant",
+          content: [
+            { type: "toolCall", id: "wait_reports", name: "get_workflow_output", arguments: { runId: "stream-run" } },
+          ],
+          stopReason: "toolUse",
+          timestamp: 0,
+        },
+        ...sent.map(({ message }, index) => ({ role: "custom", ...message, timestamp: index + 1 })),
+        {
+          role: "toolResult",
+          toolCallId: "wait_reports",
+          toolName: "get_workflow_output",
+          content: [{ type: "text", text: "parent-visible output" }],
+          details: { delivered: true, runId: "stream-run" },
+          timestamp: 3,
+        },
+      ]);
+      const waitBody = JSON.stringify(
+        waitProjection.find((message: any) => message.toolCallId === "wait_reports").content,
+      );
+      assert.match(waitBody, /one/);
+      assert.match(waitBody, /two/);
+      assert.match(waitBody, /non-actionable updates may stay silent/);
+      const { convertResponsesMessages } = await import("@earendil-works/pi-ai/api/openai-responses-shared");
+      const requestInput = convertResponsesMessages(
+        { id: "gpt-5.6-luna", api: "openai-responses", provider: "sunrain", input: ["text"] } as any,
+        { messages: waitProjection },
+        new Set(["sunrain"]),
+      );
+      const wireWait = requestInput.find(
+        (item: any) => item.type === "function_call_output" && item.call_id === "wait_reports",
+      );
+      assert.match(JSON.stringify(wireWait), /one/);
+      assert.match(JSON.stringify(wireWait), /two/);
+      assert.equal(
+        waitProjection.filter((message: any) => message.toolName === "workflow_agent_completed_notification").length,
+        0,
+      );
+      assert.equal(
+        provider.some((message: any) => message?.customType === "workflow-agent-completed"),
+        false,
+      );
+      assert.equal(
+        provider.some((message: any) =>
+          message?.content?.some?.((part: any) => part?.name === "workflow_agent_completed_notification"),
+        ),
+        true,
+      );
+
+      // The same completion is now claimed by the shared source cursor and
+      // cannot be injected a second time by a duplicate observer callback.
+      callback({
+        runId: "stream-run",
+        id: "stream-run:0",
+        label: "first",
+        phase: "research",
+        result: { report: "one" },
+      });
+      assert.equal(sent.length, 2);
+
+      for (const handler of handlers.agent_settled ?? []) handler({ type: "agent_settled" });
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      assert.equal(sent.filter(({ message }) => message.customType === "workflows").length, 1);
+      handlers.session_shutdown?.[0]?.({ reason: "quit" });
+      discardWorkflowRuntime();
+    });
+  } finally {
+    discardWorkflowRuntime();
+    rmSync(fakeHome, { recursive: true, force: true });
+  }
+});
 
 test("workflow deliveries stay out of Steering across compaction boundaries", async () => {
   const fakeHome = mkdtempSync(join(tmpdir(), "pi-dw-compaction-delivery-"));
@@ -1278,8 +1422,13 @@ test("a delivered output followed by Esc keeps post-cutoff bodies projected", as
         projected.filter(
           (message: any) => message?.role === "toolResult" && message?.toolName === "workflow_message_notification",
         ).length,
-        2,
+        0,
       );
+      const actualWaitBody = JSON.stringify(
+        projected.find((message: any) => message.toolCallId === toolCallId)?.content,
+      );
+      assert.match(actualWaitBody, /delivery won immediately before Esc/);
+      assert.match(actualWaitBody, /arrived after Esc but before settled/);
       assert.match(
         JSON.stringify(projected),
         /arrived after Esc but before settled/,

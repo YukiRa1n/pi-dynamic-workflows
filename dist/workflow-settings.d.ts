@@ -22,6 +22,8 @@ export interface WorkflowSettings {
     progressPanelMode?: "compact" | "detailed";
     /** Max agents shown per phase in detailed progress mode (default 8). */
     progressPanelMaxAgents?: number;
+    /** Progress-panel glyph set: "auto" (Unicode tree glyphs, default) | "ascii". */
+    progressPanelIcons?: "auto" | "ascii";
     /**
      * Persist each workflow subagent transcript as a real pi session file under
      * the standard sessions directory (~/.pi/agent/sessions/<encoded-cwd>/),
@@ -34,6 +36,8 @@ export interface WorkflowSettings {
      * result remains in the persisted run/pager and is linked from the delivery.
      */
     deliveredResultMaxChars?: number;
+    /** Deliver completed subagent results to the main session. Default true; set false to keep them on demand only. */
+    streamAgentResults?: boolean;
     /**
      * Extra tool names to deny in workflow subagent sessions, on top of the
      * built-in workflow-family defaults (#107). Use it to block

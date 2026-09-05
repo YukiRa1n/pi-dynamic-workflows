@@ -227,9 +227,11 @@ function primitiveProjection(value: unknown, writer: ByteWriter, limits: Require
     case "boolean":
       return writer.exact(value ? "true" : "false");
     case "number":
-      return Number.isFinite(value)
-        ? writer.exact(Object.is(value, -0) ? "-0" : String(value))
-        : (appendMarker(writer, NON_FINITE), true);
+      if (Number.isFinite(value)) {
+        return writer.exact(Object.is(value, -0) ? "-0" : String(value));
+      }
+      appendMarker(writer, NON_FINITE);
+      return true;
     case "undefined":
       appendMarker(writer, UNDEFINED);
       return true;
@@ -264,7 +266,9 @@ export function serializeBounded(value: unknown, options: SerializationLimits = 
 
   try {
     while (stack.length && !writer.exhausted) {
-      const task = stack.pop()!;
+      // `stack.length` in the loop condition guarantees a non-empty stack.
+      const task = stack.pop();
+      if (task === undefined) break;
       if (task.kind === "text") {
         writer.exact(task.value);
         continue;
@@ -422,7 +426,9 @@ export function serializeIdentity(value: unknown, options: SerializationLimits =
   };
 
   while (stack.length) {
-    const task = stack.pop()!;
+    // `stack.length` in the loop condition guarantees a non-empty stack.
+    const task = stack.pop();
+    if (task === undefined) break;
     if (task.kind === "text") {
       if (!writer.exact(task.value)) identityError("byte limit exceeded");
       continue;

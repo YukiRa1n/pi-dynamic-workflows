@@ -225,6 +225,75 @@ test("no-Esc cadence allows one autonomous hidden wake and does not chain Workin
   });
 });
 
+test("a real request association suppresses an empty wake when provider acknowledgement is missing", async () => {
+  await withHarness("missing-provider-ack", async ({ handlers, sent, staged, setHostIdle }) => {
+    staged.manager.onDeliver?.("notification already included by the real prompt", {
+      runId: "missing-provider-ack-run",
+      workflowName: "missing provider ack",
+      alertKind: "critical_finding",
+      sequence: 1,
+    });
+    assert.equal(sent.length, 1);
+
+    const delivery = { role: "custom", ...sent[0]?.message, timestamp: 2 };
+    const projected = projectProviderRequest(handlers, [
+      { role: "user", content: [{ type: "text", text: "continue" }], timestamp: 1 },
+      delivery,
+    ]);
+    assert.equal(notificationResults(projected).length, 1, "the real provider request contains the workflow body");
+
+    // Deliberately omit after_provider_response, matching providers that do not
+    // surface the transport hook. A successful agent_end is the fallback commit
+    // point, and settling the real turn must not manufacture a second,
+    // content-free model turn that can answer stale user history.
+    emit(handlers, "agent_end", {
+      type: "agent_end",
+      messages: [{ role: "assistant", content: [{ type: "text", text: "done" }], stopReason: "stop" }],
+    });
+    assert.equal(
+      staged.manager.listPendingDeliveries().some((record: any) => record.runId === "missing-provider-ack-run"),
+      false,
+      "successful agent_end must acknowledge the projected durable delivery",
+    );
+    setHostIdle(true);
+    emit(handlers, "agent_settled", { type: "agent_settled" });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    assert.equal(sent.length, 1);
+    assert.equal(
+      sent.some(({ message }) => message?.customType === "workflows"),
+      false,
+      "an associated notification cannot trigger an empty autonomous wake",
+    );
+  });
+});
+
+test("steer input releases an unbounded workflow output wait after the input hook", async () => {
+  await withHarness("output-wait-steer", async ({ handlers, staged }) => {
+    const runId = "output-wait-steer-run";
+    const toolCallId = "wait-for-steer";
+    emit(handlers, "tool_execution_start", {
+      type: "tool_execution_start",
+      toolCallId,
+      toolName: "get_workflow_output",
+      args: { runId, block: true },
+    });
+
+    const releases: unknown[] = [];
+    staged.manager.on("parentInput", (event: unknown) => releases.push(event));
+    emit(handlers, "input", {
+      type: "input",
+      text: "补充一条信息",
+      source: "interactive",
+      streamingBehavior: "steer",
+    });
+
+    assert.equal(releases.length, 0, "the wait stays blocked until Pi has queued the steer");
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.deepEqual(releases, [{ runId }]);
+  });
+});
+
 test("Esc ordinal fencing changes wake eligibility, not body projection", async () => {
   await withHarness("esc-scope-second-request", async ({ handlers, sent, staged, setHostIdle }) => {
     const runId = "esc-scope-second-request-run";

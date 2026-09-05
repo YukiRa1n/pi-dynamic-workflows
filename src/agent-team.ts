@@ -36,6 +36,21 @@ export interface AgentTeamTaskSnapshot {
   result?: string;
 }
 
+/** Result of an event-driven inbox wait. */
+export interface AgentTeamInboxWaitResult {
+  messages: AgentTeamMessage[];
+  timedOut: boolean;
+}
+
+interface AgentTeamInboxWaiter {
+  attemptGen?: number;
+  resolve: (result: AgentTeamInboxWaitResult) => void;
+  reject: (reason: unknown) => void;
+  timer?: NodeJS.Timeout;
+  signal?: AbortSignal;
+  onAbort?: () => void;
+}
+
 export interface AgentTeamSnapshot {
   id: string;
   name: string;
@@ -108,6 +123,7 @@ interface Task {
 export class WorkflowAgentTeam {
   private readonly members = new Map<string, Member>();
   private readonly inboxes = new Map<string, AgentTeamMessage[]>();
+  private readonly inboxWaiters = new Map<string, Set<AgentTeamInboxWaiter>>();
   private readonly tasks = new Map<string, Task>();
   private memberSeq = 0;
   private messageSeq = 0;
@@ -432,6 +448,7 @@ export class WorkflowAgentTeam {
     const entry = { id: `${this.id}:message:${++this.messageSeq}`, from, to, kind, message: text };
     this.inboxes.get(to)?.push(entry);
     this.messageCount++;
+    this.notifyInbox(to);
     return entry;
   }
 
@@ -468,6 +485,7 @@ export class WorkflowAgentTeam {
     };
     this.inboxes.get(to)?.push(entry);
     this.messageCount++;
+    this.notifyInbox(to);
     return entry;
   }
 
@@ -497,6 +515,56 @@ export class WorkflowAgentTeam {
     this.messageCount = Math.max(0, this.messageCount - inbox.length);
     this.quota?.releaseMessages?.(inbox.length);
     return inbox;
+  }
+
+  /**
+   * Wait for the next peer message without polling. The wait is transient (like
+   * the inbox itself) and is always bounded or abortable; messages remain
+   * ordinary inbox entries and are consumed exactly once by the waiter.
+   */
+  async waitForInbox(
+    memberId: string,
+    options: { attemptGen?: number; timeoutMs?: number; signal?: AbortSignal } = {},
+  ): Promise<AgentTeamInboxWaitResult> {
+    this.assertMemberAttempt(memberId, options.attemptGen);
+    const existing = this.readInbox(memberId, options.attemptGen);
+    if (existing.length > 0) return { messages: existing, timedOut: false };
+
+    const timeoutMs = options.timeoutMs ?? 0;
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) return { messages: [], timedOut: true };
+    if (options.signal?.aborted) throw options.signal.reason ?? new Error("Team inbox wait aborted");
+
+    let resolveWait: (result: AgentTeamInboxWaitResult) => void = () => {};
+    let rejectWait: (reason: unknown) => void = () => {};
+    const promise = new Promise<AgentTeamInboxWaitResult>((resolve, reject) => {
+      resolveWait = resolve;
+      rejectWait = reject;
+    });
+    const waiter: AgentTeamInboxWaiter = {
+      attemptGen: options.attemptGen,
+      resolve: resolveWait,
+      reject: rejectWait,
+      signal: options.signal,
+    };
+    const waiters = this.inboxWaiters.get(memberId) ?? new Set<AgentTeamInboxWaiter>();
+    const cleanup = () => {
+      if (waiter.timer) clearTimeout(waiter.timer);
+      if (waiter.signal && waiter.onAbort) waiter.signal.removeEventListener("abort", waiter.onAbort);
+      waiters.delete(waiter);
+      if (waiters.size === 0) this.inboxWaiters.delete(memberId);
+    };
+    waiter.onAbort = () => {
+      cleanup();
+      waiter.reject(options.signal?.reason ?? new Error("Team inbox wait aborted"));
+    };
+    options.signal?.addEventListener("abort", waiter.onAbort, { once: true });
+    waiter.timer = setTimeout(() => {
+      cleanup();
+      waiter.resolve({ messages: [], timedOut: true });
+    }, Math.floor(timeoutMs));
+    waiters.add(waiter);
+    this.inboxWaiters.set(memberId, waiters);
+    return promise;
   }
 
   listMembers(): AgentTeamMemberSnapshot[] {
@@ -577,12 +645,25 @@ export class WorkflowAgentTeam {
       defineTool({
         name: "team_inbox",
         label: "Team Inbox",
-        description: "Read and consume the team inbox.",
-        parameters: Type.Object({}, { additionalProperties: false }),
-        async execute() {
+        description: "Read and consume the team inbox, or event-wait for a peer message without polling.",
+        parameters: Type.Object(
+          {
+            waitMs: Type.Optional(
+              Type.Integer({ minimum: 1, maximum: 600_000, description: "Wait for a peer message for this many ms." }),
+            ),
+          },
+          { additionalProperties: false },
+        ),
+        async execute(_toolCallId, params, signal) {
           assertAdmitted();
-          const messages = thisTeam.readInbox(memberId, attemptGen);
-          return toolResult(serializeBounded(messages, { maxBytes: 16_000, pretty: false }), { messages });
+          const waited =
+            params.waitMs === undefined
+              ? { messages: thisTeam.readInbox(memberId, attemptGen), timedOut: false }
+              : await thisTeam.waitForInbox(memberId, { attemptGen, timeoutMs: params.waitMs, signal });
+          const text = waited.timedOut
+            ? "No peer message arrived before the inbox wait timed out."
+            : serializeBounded(waited.messages, { maxBytes: 16_000, pretty: false });
+          return toolResult(text, waited);
         },
       }),
       defineTool({
@@ -671,6 +752,22 @@ export class WorkflowAgentTeam {
       throw new Error(`Team member ${memberId} attempt is no longer current`);
     }
     return member;
+  }
+
+  /** Wake one waiter; additional waiters remain queued and observe later messages. */
+  private notifyInbox(memberId: string): void {
+    const waiters = this.inboxWaiters.get(memberId);
+    const waiter = waiters?.values().next().value;
+    if (!waiter || !waiters) return;
+    waiters.delete(waiter);
+    if (waiters.size === 0) this.inboxWaiters.delete(memberId);
+    if (waiter.timer) clearTimeout(waiter.timer);
+    if (waiter.signal && waiter.onAbort) waiter.signal.removeEventListener("abort", waiter.onAbort);
+    try {
+      waiter.resolve({ messages: this.readInbox(memberId, waiter.attemptGen), timedOut: false });
+    } catch (error) {
+      waiter.reject(error);
+    }
   }
 
   private ensureMessageCapacity(to: string, text: string): void {

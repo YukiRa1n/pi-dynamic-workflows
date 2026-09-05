@@ -285,3 +285,90 @@ return { answer, marker }`;
   assert.equal(changed.result.answer, "new-answer");
   assert.equal(changed.result.marker, "v2");
 });
+test("checkpoint(): explicit null default returns null, distinct from the omitted true fallback", async () => {
+  const journal = new Map<string, JournalEntry>();
+  const script = (def: string) => `export const meta = { name: 'c', description: 'checkpoint' }
+const r = await checkpoint('Approve?', { default: ${def} })
+return { r }`;
+  const nullResult = await runWorkflow<{ r: unknown }>(script("null"), {
+    agent: noopAgent,
+    persistLogs: false,
+    runId: "checkpoint-null-default-run",
+    onAgentJournal: (e) => journal.set(`${e.runId}:${e.index}`, e),
+  });
+  assert.equal(nullResult.result.r, null, "explicit null is a real (null) default, not the true fallback");
+
+  // Editing from an explicit null to the omitted case must not replay the
+  // stale null reply: the omitted case behaves as true and must cache-miss.
+  const omittedResult = await runWorkflow<{ r: unknown }>(
+    `export const meta = { name: 'c', description: 'checkpoint' }
+const r = await checkpoint('Approve?', {})
+return { r }`,
+    {
+      agent: noopAgent,
+      persistLogs: false,
+      runId: "checkpoint-null-default-run",
+      resumeJournal: journal,
+    },
+  );
+  assert.equal(omittedResult.result.r, true, "omitted default falls back to true and must not replay the old null");
+});
+
+test("checkpoint(): a legal default string cannot collide with the omitted default", async () => {
+  const journal = new Map<string, JournalEntry>();
+  const script = (options: string) => `export const meta = { name: 'c', description: 'checkpoint' }
+return await checkpoint('Choose?', ${options})`;
+  await runWorkflow(script("{}"), {
+    agent: noopAgent,
+    persistLogs: false,
+    runId: "checkpoint-sentinel",
+    onAgentJournal: (entry) => journal.set(`${entry.runId}:${entry.index}`, entry),
+  });
+  const changed = await runWorkflow(script("{ default: '__checkpoint_default_omitted__' }"), {
+    agent: noopAgent,
+    persistLogs: false,
+    runId: "checkpoint-sentinel",
+    resumeJournal: journal,
+  });
+  assert.equal(changed.result, "__checkpoint_default_omitted__");
+});
+
+test("checkpoint(): explicit undefined default and omitted are one identity (true fallback)", async () => {
+  const journal = new Map<string, JournalEntry>();
+  const run = (def: string) =>
+    runWorkflow<{ r: unknown }>(
+      `export const meta = { name: 'c', description: 'checkpoint' }
+const r = await checkpoint('Approve?', { default: ${def} })
+return { r }`,
+      {
+        agent: noopAgent,
+        persistLogs: false,
+        runId: "checkpoint-undefined-identity-run",
+        onAgentJournal: (e) => journal.set(`${e.runId}:${e.index}`, e),
+      },
+    );
+
+  const first = await run("undefined");
+  assert.equal(first.result.r, true, "explicit undefined behaves as the true fallback");
+
+  // Omitting the field entirely is the same identity: it must cache-hit and
+  // replay instead of re-prompting.
+  let confirmCalls = 0;
+  const second = await runWorkflow<{ r: unknown }>(
+    `export const meta = { name: 'c', description: 'checkpoint' }
+const r = await checkpoint('Approve?')
+return { r }`,
+    {
+      agent: noopAgent,
+      persistLogs: false,
+      runId: "checkpoint-undefined-identity-run",
+      resumeJournal: journal,
+      confirm: async () => {
+        confirmCalls++;
+        return "live";
+      },
+    },
+  );
+  assert.equal(confirmCalls, 0, "undefined-default identity equals omitted identity, so it replays");
+  assert.equal(second.result.r, true);
+});

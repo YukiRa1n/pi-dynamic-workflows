@@ -4,7 +4,7 @@ import {
   measureWorkflowContextSurfaces,
   WORKFLOW_CONTEXT_MEASUREMENT_PATH,
   writeWorkflowContextMeasurement,
-} from "../src/workflow-context-measurement.js";
+} from "../src/workflow-context-measurement.ts";
 
 const root = resolve(import.meta.dirname, "..");
 const check = process.argv.includes("--check");

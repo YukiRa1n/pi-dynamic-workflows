@@ -491,7 +491,7 @@ test("a null/primitive element in a corrupt agent history doesn't crash the deta
   assert.doesNotThrow(() => renderNavigator(state, model, 80), "null history entry must be skipped, not crash");
 });
 
-test("NavigatorState cursor wraps and detail scroll clamps at 0", () => {
+test("NavigatorState cursor wraps in lists and clamps semantic activity blocks", () => {
   const model = new NavigatorModel(fakeManager());
   const state = new NavigatorState();
   state.move(-1, 1);
@@ -505,10 +505,12 @@ test("NavigatorState cursor wraps and detail scroll clamps at 0", () => {
   assert.equal(state.cursor, 0);
 
   state.drill(model);
-  state.move(-1, 0);
-  assert.equal(state.scroll, 0);
-  state.move(1, 0);
-  assert.equal(state.scroll, 1);
+  state.move(-1, 2);
+  assert.equal(state.cursor, 0);
+  state.move(1, 2);
+  assert.equal(state.cursor, 1);
+  state.move(1, 2);
+  assert.equal(state.cursor, 1, "detail block navigation does not wrap at the end");
 });
 
 function longDetailManager(): Pick<WorkflowManager, "listRuns" | "getRun"> {
@@ -536,7 +538,7 @@ function longDetailManager(): Pick<WorkflowManager, "listRuns" | "getRun"> {
   };
 }
 
-test("detail view scrolls within a fixed viewport and does not collapse", () => {
+test("detail activity navigates by semantic block within a fixed viewport", () => {
   const model = new NavigatorModel(longDetailManager());
   const state = new NavigatorState();
   state.drill(model); // runs -> phases
@@ -547,20 +549,22 @@ test("detail view scrolls within a fixed viewport and does not collapse", () => 
 
   const vp = 14;
   const top = renderNavigator(state, model, 40, undefined, vp);
-  state.move(5, 0); // scroll down within detail
+  state.move(1, 2); // task block -> final-result block
   const mid = renderNavigator(state, model, 40, undefined, vp);
-  state.move(1000, 0); // scroll past the end (clamped)
+  state.move(1000, 2); // move past the end (clamped)
   const end = renderNavigator(state, model, 40, undefined, vp);
 
-  // The box height stays stable while scrolling — the old slice-to-end code shrank it.
-  assert.equal(top.length, mid.length, "viewport height is stable while scrolling (no collapse)");
-  assert.equal(top.length, end.length, "still a full viewport at the bottom (clamped, not collapsed)");
-  // Scrolling actually changes the visible window.
-  assert.notDeepEqual(top, mid, "scroll shifts the visible window");
-  // A position indicator is shown when content overflows the viewport.
+  assert.equal(top.length, mid.length, "viewport height is stable while block focus moves");
+  assert.equal(top.length, end.length, "clamping at the last block keeps the viewport stable");
+  assert.notDeepEqual(top, mid, "block focus moves instead of scrolling one wrapped line");
+  assert.deepEqual(mid, end, "selection clamps at the last semantic block");
   assert.ok(
-    end.some((l) => /\[\d+-\d+ \/ \d+\]/.test(l)),
-    "shows a scroll position indicator",
+    end.some((line) => /❯ ✓ Final result/.test(line)),
+    "the final result is selected as one block",
+  );
+  assert.ok(
+    end.some((line) => /↑\/↓ block/.test(line)),
+    "footer documents block navigation",
   );
 });
 
@@ -675,7 +679,7 @@ test("renderNavigator shows agents view", () => {
   assert.match(text, /enter open/);
 });
 
-test("completed agent detail defaults to result and can open the full pager", () => {
+test("completed agent detail defaults to result and opens grouped activity", () => {
   const model = new NavigatorModel(fakeManager());
   const state = new NavigatorState();
   state.drill(model);
@@ -683,20 +687,18 @@ test("completed agent detail defaults to result and can open the full pager", ()
   state.drill(model);
 
   const summary = renderNavigator(state, model, 80).join("\n");
-  assert.match(summary, /Result:/);
+  assert.match(summary, /Result/);
   assert.match(summary, /found 2/);
   assert.doesNotMatch(summary, /scan the code/);
-  assert.match(summary, /enter open pager/);
+  assert.match(summary, /enter activity/);
 
   state.togglePager();
-  const pager = renderNavigator(state, model, 80).join("\n");
-  assert.match(pager, /Prompt:/);
-  assert.match(pager, /scan the code/);
-  assert.match(pager, /Result:/);
-  assert.match(pager, /Status:/);
-  assert.match(pager, /Model:/);
-  assert.match(pager, /model/);
-  assert.match(pager, /PgUp\/PgDn page/);
+  const activity = renderNavigator(state, model, 80).join("\n");
+  assert.match(activity, /Task {2}scan the code/);
+  assert.match(activity, /Final result {2}found 2/);
+  assert.match(activity, /✓ done · Scan · model/);
+  assert.match(activity, /PgUp\/PgDn blocks/);
+  assert.doesNotMatch(activity, /assistant tool.*tool read/s, "tool calls and results are not dumped into one stream");
 });
 
 test("renderNavigator shows agent error diagnostics in detail view", () => {
@@ -707,13 +709,12 @@ test("renderNavigator shows agent error diagnostics in detail view", () => {
   state.drill(model);
 
   const text = renderNavigator(state, model, 80).join("\n");
-  assert.match(text, /Error:/);
+  assert.match(text, /Error\s+Subagent produced no assistant output/);
   assert.match(text, /Subagent produced no assistant output/);
-  assert.match(text, /Error code:/);
-  assert.match(text, /AGENT_EMPTY_OUTPUT \(recoverable\)/);
-  assert.match(text, /Recent activity:/);
-  assert.match(text, /assistant tool read: \{"file":"README.md"\}/);
-  assert.match(text, /tool read: README content/);
+  assert.match(text, /Code\s+AGENT_EMPTY_OUTPUT · recoverable/);
+  assert.match(text, /Activity\s+1 tool/);
+  assert.match(text, /Now\s+Tool · read — \{"file":"README.md"\} · done/);
+  assert.doesNotMatch(text, /README content/, "tool payload stays folded until its transaction block is expanded");
 });
 
 test("renderNavigator shows model info in agent rows", () => {
@@ -739,10 +740,11 @@ test("renderNavigator shows correct footer hint per view", () => {
   state.drill(model);
   state.drill(model);
   const summaryLines = renderNavigator(state, model, 80);
-  assert.match(summaryLines.join("\n"), /enter open pager/);
+  assert.match(summaryLines.join("\n"), /enter activity/);
   state.togglePager();
-  const pagerLines = renderNavigator(state, model, 80);
-  assert.match(pagerLines.join("\n"), /PgUp\/PgDn page/);
+  const activityLines = renderNavigator(state, model, 80);
+  assert.match(activityLines.join("\n"), /PgUp\/PgDn blocks/);
+  assert.doesNotMatch(activityLines.join("\n"), /↑\/↓ line/);
 });
 
 // ═══════════════════════════════════════════════════════════════════════════

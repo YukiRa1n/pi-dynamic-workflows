@@ -3,6 +3,8 @@
  */
 /** Maximum number of agents allowed per workflow run. */
 export declare const MAX_AGENTS_PER_RUN = 1000;
+/** Pending child reports plus lifecycle/explicit delivery headroom. */
+export declare const MAX_PENDING_DELIVERIES_PER_RUN: number;
 /** Maximum number of items materialized by one parallel()/pipeline() fan-out. */
 export declare const MAX_FANOUT_ITEMS = 10000;
 /** Maximum log entries retained by one workflow run. */

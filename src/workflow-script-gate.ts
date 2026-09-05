@@ -192,13 +192,21 @@ export type WorkflowScriptAuditViolation = {
   message: string;
   /** 1-based source line when the parser provided one. */
   line?: number;
+  /** 1-based source column when the parser provided one. */
+  column?: number;
 };
 
 export type WorkflowScriptGateDecision =
   | { action: "allow"; via: "static-audit" | "not-required" }
   | { action: "block"; reason: string; violations: WorkflowScriptAuditViolation[] };
 
-type AnyNode = { type: string; start: number; end: number; loc?: { start: { line: number } }; [key: string]: any };
+type AnyNode = {
+  type: string;
+  start: number;
+  end: number;
+  loc?: { start: { line: number; column: number } };
+  [key: string]: any;
+};
 
 /** Cap the report size; the scan still covers the whole file so the model
  * sees the shape of what to fix, but reason text stays small. */
@@ -389,7 +397,7 @@ function isReferencePosition(node: AnyNode): boolean {
  * prove those containers are plain data. */
 function isLocalIndexedAccess(node: AnyNode, scope: Scope): boolean {
   const object = node.object;
-  if (!object || object.type !== "Identifier") return false;
+  if (object?.type !== "Identifier") return false;
   // Only a local binding, and only one pass 1 saw initialized from an array
   // literal, qualifies. Bridge globals (args, agent, ...) and whitelisted
   // built-ins are never in any local scope, so they cannot reach here.
@@ -417,7 +425,12 @@ export function auditWorkflowScript(script: string): WorkflowScriptAuditViolatio
   const violations: WorkflowScriptAuditViolation[] = [];
   const push = (rule: string, message: string, node?: AnyNode) => {
     if (violations.length >= MAX_REPORTED_VIOLATIONS) return;
-    violations.push({ rule, message, line: node?.loc?.start?.line });
+    violations.push({
+      rule,
+      message,
+      line: node?.loc?.start?.line,
+      column: node?.loc?.start ? node.loc.start.column + 1 : undefined,
+    });
   };
 
   if (typeof script === "string" && script.length > GATE_MAX_SCRIPT_BYTES) {
@@ -466,7 +479,9 @@ export function auditWorkflowScript(script: string): WorkflowScriptAuditViolatio
     type Frame = { node: AnyNode; scope: Scope };
     const stack: Frame[] = [{ node: ast, scope: moduleScope }];
     while (stack.length) {
-      const { node, scope } = stack.pop()!;
+      const frame = stack.pop();
+      if (!frame) break;
+      const { node, scope } = frame;
       node.__scope = scope;
       node.__arrayLocals = arrayLocals;
 
@@ -550,7 +565,8 @@ export function auditWorkflowScript(script: string): WorkflowScriptAuditViolatio
   {
     const stack: AnyNode[] = [ast];
     while (stack.length) {
-      const node = stack.pop()!;
+      const node = stack.pop();
+      if (!node) break;
 
       switch (node.type) {
         case "ImportDeclaration":
@@ -576,7 +592,7 @@ export function auditWorkflowScript(script: string): WorkflowScriptAuditViolatio
             if (!isLocalIndexedAccess(node, scope)) {
               push(
                 "computed-member-access",
-                "computed member access `obj[expr]` is not allowed (string-keyed access can reach `constructor`/`__proto__`); use a literal property name, or a numeric/loop-variable index on a local array",
+                "computed member access `obj[expr]` cannot be verified (string keys can reach `constructor`/`__proto__`). Only directly declared array literals qualify for indexed access; results of `await parallel(...)` are not inferred. For result arrays, use `results.at(index)` with a numeric index or iterate with `results.map(...)`; use dot notation for a known property",
                 node,
               );
             }
@@ -777,7 +793,12 @@ export function decideWorkflowScriptGate(script: string | undefined): WorkflowSc
   }
   const violations = auditWorkflowScript(script);
   if (violations.length === 0) return { action: "allow", via: "static-audit" };
-  const listed = violations.map((v) => `  - ${v.line !== undefined ? `line ${v.line}: ` : ""}${v.message}`).join("\n");
+  const listed = violations
+    .map(
+      (v) =>
+        `  - ${v.line !== undefined ? `line ${v.line}${v.column !== undefined ? `, column ${v.column}` : ""}: ` : ""}${v.message}`,
+    )
+    .join("\n");
   return {
     action: "block",
     violations,

@@ -346,6 +346,7 @@ const capabilities: readonly CapabilityDescriptor[] = [
     signature: "createTeam(name, options?) => AgentTeam",
     constraints: [
       "workflow-scoped peer messaging and shared task board",
+      "team_inbox({ waitMs }) can event-wait for the next peer message without polling; the wait is bounded and abortable",
       "team.spawn(specs) reuses the workflow agent scheduler and concurrency budget",
       "team calls rerun live on resume because mailbox/task side effects are not journaled",
     ],

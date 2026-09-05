@@ -6,10 +6,24 @@ All notable changes to `@quintinshaw/pi-dynamic-workflows` are documented here.
 
 ### Added
 
-- Added `get_workflow_output`, an interruptible one-shot lifecycle wait for an exact current-session run ID. It returns bounded terminal output and replaces repeated `list_active_workflows` plus shell-sleep polling. Esc cancels only the wait; the workflow continues in the background.
+- Added `get_workflow_output`, an interruptible deadline-free event wait for an exact current-session run ID. Durable workflow deliveries release the wait without status polling; Esc cancels only the wait and the workflow continues in the background.
+- Added the OMP-inspired progress-panel presentation: compact/detailed tree rows, semantic agent Activity blocks, adaptive shimmer/backpressure, `Alt+↓` navigator access, `/workflows-progress icons auto|ascii`, and the non-executing `/workflows-demo` preview.
+
+### Changed
+
+- Background subagent finals now use the same durable outbox, acknowledgement, reload replay, purple custom-message rendering, and safe-point wake lane as workflow terminal results. Automatic delivery is the default and can be disabled with `streamAgentResults: false`; the legacy output-tool fallback remains exactly-once. Exhausted all-agent runs are persisted as failed with a recoverable diagnostic, while mixed outcomes remain partial in the runtime result.
 
 ### Fixed
 
+- Removed absent script/preset keys during start argument preparation. Preset calls now pass the actual CLI's prepare-then-validate path instead of failing oneOf because `script: undefined` remained present.
+- `/workflows-demo` now launches the main-session live demo with a fixed read-only sample and two real subagents; the offline overlay is available as `/workflows-demo preview`.
+- Simplified child-report headers and provider metadata. A yielded output wait now carries report bodies in its real tool result while the UI keeps purple custom messages. New reports receive one temporary review notice per request: assess each report, respond only when useful, and keep newer user input authoritative.
+- Bound output claims to the returned batch so subsequent `get_workflow_output` calls can retrieve every remaining child result.
+- Unified delivery-outbox capacity with the maximum agent count, reserved lifecycle space, and rejected invalid state before replacing readable primary/backup records.
+- Separated successful agent calls from checkpoint admission when classifying exhausted runs; failed runs retain their best-effort result for inspection.
+- Tagged checkpoint-default presence in the resume identity to prevent legal strings from colliding with an omitted default. Older checkpoint identities conservatively miss the cache on first resume.
+- Made interjection priority request-scoped and acknowledged by successful visible replies. Persisted receipts survive reload/context pruning; tool-only notifications and provider errors preserve unanswered input. Added queued/replying footer status and actionable output-wait hints.
+- Limited the provider-only interjection notice to the active steering boundary, so an already-answered historical steer cannot be promoted again on a later user turn. Agent-output claims now survive in-process reload and share one cursor with automatic child-result delivery.
 - Fixed concurrent SharedStore rollback so failed interleaved writers cannot restore another failed writer's value or diverge from the durable journal.
 - Fixed run deletion ordering so a primary-record unlink failure preserves its backup and live lease; worktree startup reaping now preserves a healthy checkout even when stale-marker cleanup fails.
 - Hardened IPv6 SSRF filtering with binary longest-prefix matching for special-purpose, translated, tunneled, deprecated site-local, and non-global address space.
@@ -19,7 +33,7 @@ All notable changes to `@quintinshaw/pi-dynamic-workflows` are documented here.
 
 ### Verification
 
-- `npm test` release gate passed with 1,431 tests and zero release-gate warnings.
+- `npm test` release gate passed with 1,434 tests and zero release-gate warnings. The installed Pi 0.85.0 bundled CLI also passed an isolated, offline interjection/tool/background-notification smoke test.
 
 ## [3.5.1-yuki.4] - 2026-08-19
 

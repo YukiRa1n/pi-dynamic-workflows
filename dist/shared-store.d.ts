@@ -100,6 +100,14 @@ export declare class SharedStore {
     restore(snap: Record<string, unknown>): void;
     /** Clear all entries (called when the run ends). */
     dispose(): void;
+    /**
+     * Return the live limits as constructor options so an isolated per-attempt
+     * store can be created with the SAME quotas as its parent. Without this a
+     * custom (stricter) parent limit would be silently lost on the attempt
+     * store, letting a delta exceed the parent's quota only at applyDelta time
+     * and stall the admission-order commit queue.
+     */
+    limitsSnapshot(): SharedStoreOptions;
     private admitValue;
     private replaceValue;
     private removeValue;

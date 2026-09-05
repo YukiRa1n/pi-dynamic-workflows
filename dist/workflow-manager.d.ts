@@ -272,13 +272,16 @@ export interface WorkflowManagerOptions {
         deliveryId?: string;
         sequence?: number;
     }) => void | Promise<void>;
-    /** Optional observer for each live subagent result. Hosts should normally keep this persistence/UI-only. */
+    /** Optional observer for each live subagent result. Hosts own delivery policy. */
     onAgentMessage?: (event: {
         runId: string;
+        /** Stable agent call identity; currently equal to `id`. */
+        callId?: string;
         id: string;
         label: string;
         phase?: string;
         result: unknown;
+        status?: "done" | "error";
         error?: string;
     }) => void;
     /**
@@ -296,6 +299,15 @@ export interface WorkflowManagerOptions {
     maxTerminalRunsInMemory?: number;
     /** How many settled paused run snapshots to retain in memory; disk remains resumable. */
     maxPausedRunsInMemory?: number;
+}
+/** Bounded host projection of one completed subagent for the durable outbox. */
+export interface WorkflowAgentDelivery {
+    agentId: string;
+    callId: string;
+    label: string;
+    phase?: string;
+    status: "done" | "error";
+    content: string;
 }
 /** Options that a fresh extension generation may safely refresh on a live
  * manager handed across `/reload`. Execution identity (`cwd`, persistence,
@@ -386,7 +398,7 @@ export declare class WorkflowManager extends EventEmitter {
     private readonly maxPausedBytesOnDisk;
     /** Runtime deliver() bridge; refreshed by host wiring each generation. */
     onDeliver?: WorkflowManagerOptions["onDeliver"];
-    /** Optional host observer for live subagent results; not provider delivery by default. */
+    /** Optional host observer for live subagent results; hosts own delivery policy. */
     onAgentMessage?: WorkflowManagerOptions["onAgentMessage"];
     private pendingMessages;
     private pendingMessageCount;
@@ -471,6 +483,13 @@ export declare class WorkflowManager extends EventEmitter {
      * are cumulative for the run, while the sliding window bounds continuation
      * storms. Terminal notifications intentionally bypass this admission path. */
     private admitExplicitDelivery;
+    /**
+     * Persist a completed subagent before its host notification is admitted.
+     * The call ID is the logical identity, so a duplicate observer callback in
+     * the same run reuses the original durable record instead of publishing a
+     * second main-session message.
+     */
+    admitAgentDelivery(runId: string, input: WorkflowAgentDelivery): PersistedDeliveryRecord | undefined;
     /** Reserve one terminal record before publishing terminal state. It is
      * idempotent, so duplicate lifecycle events cannot create duplicate wakes. */
     private ensureTerminalDelivery;

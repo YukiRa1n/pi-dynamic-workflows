@@ -25,6 +25,11 @@ export interface AgentTeamTaskSnapshot {
     assignee?: string;
     result?: string;
 }
+/** Result of an event-driven inbox wait. */
+export interface AgentTeamInboxWaitResult {
+    messages: AgentTeamMessage[];
+    timedOut: boolean;
+}
 export interface AgentTeamSnapshot {
     id: string;
     name: string;
@@ -68,6 +73,7 @@ export declare class WorkflowAgentTeam {
     readonly name: string;
     private readonly members;
     private readonly inboxes;
+    private readonly inboxWaiters;
     private readonly tasks;
     private memberSeq;
     private messageSeq;
@@ -137,6 +143,16 @@ export declare class WorkflowAgentTeam {
     sendFromWorkflow(to: string, message: string): AgentTeamMessage;
     broadcastFromWorkflow(message: string): number;
     readInbox(memberId: string, attemptGen?: number): AgentTeamMessage[];
+    /**
+     * Wait for the next peer message without polling. The wait is transient (like
+     * the inbox itself) and is always bounded or abortable; messages remain
+     * ordinary inbox entries and are consumed exactly once by the waiter.
+     */
+    waitForInbox(memberId: string, options?: {
+        attemptGen?: number;
+        timeoutMs?: number;
+        signal?: AbortSignal;
+    }): Promise<AgentTeamInboxWaitResult>;
     listMembers(): AgentTeamMemberSnapshot[];
     listTasks(): AgentTeamTaskSnapshot[];
     claimTask(memberId: string, taskId: string, attemptGen?: number): AgentTeamTaskSnapshot;
@@ -145,6 +161,8 @@ export declare class WorkflowAgentTeam {
     /** Static tool schemas; dynamic team/member identity stays in closures. */
     createTools(memberId: string, attemptGen?: number, isAdmitted?: () => boolean): ToolDefinition[];
     private assertMemberAttempt;
+    /** Wake one waiter; additional waiters remain queued and observe later messages. */
+    private notifyInbox;
     private ensureMessageCapacity;
     private ensureBroadcastCapacity;
     private member;

@@ -6,6 +6,7 @@
  *    conversation so the paused task continues with the outcome.
  */
 import type { ExtensionAPI, ExtensionUIContext, Theme } from "@earendil-works/pi-coding-agent";
+import { type IconMode } from "./panel-skin.js";
 import type { ManagedRun, WorkflowManager } from "./workflow-manager.js";
 import type { WorkflowStorage } from "./workflow-saved.js";
 import type { WorkflowSettings } from "./workflow-settings.js";
@@ -56,7 +57,19 @@ export declare function installResultDelivery(pi: ExtensionAPI, manager: Workflo
     /** Route terminal results through an extension-owned batching/dedup bridge. */
     sendResult?: (payload: WorkflowDeliveryPayload) => void;
 }): () => void;
-export declare function renderPanel(manager: WorkflowManager, theme: Theme, width?: number): string[];
+/** Options for the zentui-style tree renderers. */
+export interface PanelSkinOptions {
+    /** Glyph set: "auto" Unicode tree glyphs (default) or "ascii" fallbacks. */
+    iconMode?: IconMode;
+    /** Show the navigator hint row (default true). */
+    hint?: boolean;
+}
+/**
+ * Zentui-style tree panel (compact): one summary header, then each active run
+ * as a tree row with its aggregate progress. Phase and agent labels belong to
+ * the detailed view so the compact row stays easy to scan.
+ */
+export declare function renderPanel(manager: WorkflowManager, theme: Theme, width?: number, now?: number, options?: PanelSkinOptions): string[];
 /** Record a token-total sample for `runId` at time `now` (ms). */
 export declare function sampleTokens(runId: string, total: number, now: number): void;
 /** Tokens/second over the rolling window; 0 when too few samples or totals plateau. */
@@ -70,10 +83,11 @@ export declare function clampMaxAgents(value: number | undefined): number;
  * cost, and a live token/s rate, followed by per-phase progress and per-agent rows
  * (capped at `maxAgents` per phase). `now` is injected for testability.
  */
-export declare function renderPanelDetailed(manager: WorkflowManager, theme: Theme, width: number | undefined, maxAgents: number, now: number): string[];
+export declare function renderPanelDetailed(manager: WorkflowManager, theme: Theme, width: number | undefined, maxAgents: number, now: number, options?: PanelSkinOptions): string[];
 /**
  * Install the live "workflows running" panel below the editor. Re-rendered on
- * every manager event. Informational only — the user opens the navigator with
- * /workflows. (`_pi` is kept for signature stability.)
+ * every manager event. The widget stays non-capturing so it never steals bare
+ * arrow keys from the editor; Alt+↓ opens the focused navigator, where arrows
+ * and Enter work directly. (`_pi` is kept for signature stability.)
  */
 export declare function installTaskPanel(_pi: ExtensionAPI, manager: WorkflowManager, ui: ExtensionUIContext, opts?: TaskPanelOptions): void;

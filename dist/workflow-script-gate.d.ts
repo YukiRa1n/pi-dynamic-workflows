@@ -5,6 +5,8 @@ export type WorkflowScriptAuditViolation = {
     message: string;
     /** 1-based source line when the parser provided one. */
     line?: number;
+    /** 1-based source column when the parser provided one. */
+    column?: number;
 };
 export type WorkflowScriptGateDecision = {
     action: "allow";

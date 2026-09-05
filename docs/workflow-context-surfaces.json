@@ -15,16 +15,16 @@
     },
     "providerVisibleWorkflowToolDefinition": {
       "serialization": "UTF-8 bytes of the stable JSON.stringify({ name, description, parameters }) workflow definition",
-      "bytes": 617
+      "bytes": 667
     },
     "providerVisibleAlwaysOnToolDefinitions": {
       "serialization": "sum of stable provider-visible workflow tool definitions on ordinary turns",
-      "bytes": 1529,
+      "bytes": 1616,
       "tools": [
         {
           "name": "start_workflow",
           "serialization": "UTF-8 bytes of JSON.stringify({ name, description, parameters })",
-          "bytes": 617
+          "bytes": 667
         },
         {
           "name": "list_active_workflows",
@@ -34,7 +34,7 @@
         {
           "name": "get_workflow_output",
           "serialization": "UTF-8 bytes of JSON.stringify({ name, description, parameters })",
-          "bytes": 450
+          "bytes": 487
         },
         {
           "name": "stop_workflow",
@@ -49,7 +49,7 @@
     },
     "stableWorkflowOwnedContext": {
       "serialization": "sum of the stable Pi prompt and provider workflow definitions",
-      "bytes": 1529
+      "bytes": 1616
     },
     "registeredSkillsDiscovery": {
       "serialization": "sum of UTF-8 bytes of normalized Pi skill XML (name + description + location) across every root in package.json's pi.skills",
@@ -69,12 +69,12 @@
     },
     "ordinaryWorkflowOwnedAlwaysOn": {
       "serialization": "sum of the stable workflow definition and every registered skill discovery entry",
-      "bytes": 1982
+      "bytes": 2069
     },
     "workflowAuthoringSkillCorpus": {
       "serialization": "sum of UTF-8 bytes for every file under skills/workflow-authoring",
       "files": 28,
-      "bytes": 76722
+      "bytes": 76851
     },
     "representativeAuthoringProfiles": {
       "serialization": "sum of UTF-8 bytes for each profile's declared package-relative files",
