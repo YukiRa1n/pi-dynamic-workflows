@@ -210,7 +210,7 @@ export type WorkflowRuntimeEvent = {
 export interface WorkflowAgentRunner {
     run(prompt: string, options?: AgentRunOptions<TSchema>): Promise<unknown>;
 }
-export type WorkflowDeliveryKind = "blocker" | "critical_finding" | "decision";
+export type WorkflowDeliveryKind = "blocker" | "critical_finding" | "finding" | "decision";
 export interface WorkflowDeliveryMessage {
     kind: WorkflowDeliveryKind;
     message: string;

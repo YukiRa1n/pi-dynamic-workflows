@@ -257,7 +257,7 @@ export interface WorkflowAgentRunner {
   run(prompt: string, options?: AgentRunOptions<TSchema>): Promise<unknown>;
 }
 
-export type WorkflowDeliveryKind = "blocker" | "critical_finding" | "decision";
+export type WorkflowDeliveryKind = "blocker" | "critical_finding" | "finding" | "decision";
 export interface WorkflowDeliveryMessage {
   kind: WorkflowDeliveryKind;
   message: string;
@@ -571,17 +571,28 @@ function createParentMessageTool(
 ) {
   return defineTool({
     name: "workflow_alert_parent",
-    label: "Alert Main Session",
-    description: "Send a blocker, critical finding, or decision the main session must act on before completion.",
+    label: "Update Main Session",
+    description:
+      "Send a substantive finding, blocker, or decision before completion. Include evidence and context needed to understand it; critical severity or an immediate user reply is not required. Skip receipt-only or unchanged progress updates.",
     parameters: Type.Object(
       {
-        kind: Type.Union([Type.Literal("blocker"), Type.Literal("critical_finding"), Type.Literal("decision")], {
-          description: "Why the main session must act now.",
-        }),
+        kind: Type.Union(
+          [
+            Type.Literal("blocker"),
+            Type.Literal("critical_finding"),
+            Type.Literal("finding"),
+            Type.Literal("decision"),
+          ],
+          {
+            description:
+              "Use finding for useful evidence, constraints, uncertainty, or changed assumptions; reserve critical_finding for urgent issues.",
+          },
+        ),
         message: Type.String({
           minLength: 1,
           maxLength: 8_000,
-          description: "Concise update.",
+          description:
+            "State the new finding, supporting evidence, applicable conditions, impact and uncertainty. Explain any effect on other work or suggested next step. Send the substance, not a notification that a report exists.",
         }),
       },
       { additionalProperties: false },
@@ -1081,13 +1092,13 @@ export async function runWorkflow<T = unknown>(
     appendLog(message, true);
   };
 
-  // Runtime deliver() global: only a classified task-changing message may wake
-  // the host conversation. Progress and routine results belong in logs/finals.
+  // Runtime deliver() includes useful intermediate evidence, even when it
+  // does not require immediate action. Receipt-only updates belong in logs.
   const deliver = async (value: unknown) => {
     throwIfAdmissionClosed();
     if (!value || typeof value !== "object" || Array.isArray(value)) {
       throw new WorkflowError(
-        "deliver() requires { kind: 'blocker' | 'critical_finding' | 'decision', message }",
+        "deliver() requires { kind: 'blocker' | 'critical_finding' | 'finding' | 'decision', message }",
         WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
         { recoverable: true },
       );
@@ -1098,7 +1109,7 @@ export async function runWorkflow<T = unknown>(
         recoverable: true,
       });
     }
-    const kinds: ReadonlySet<string> = new Set(["blocker", "critical_finding", "decision"]);
+    const kinds: ReadonlySet<string> = new Set(["blocker", "critical_finding", "finding", "decision"]);
     const text = typeof input.message === "string" ? input.message.trim() : "";
     if (typeof input.kind !== "string" || !kinds.has(input.kind) || !text || text.length > 8_000) {
       throw new WorkflowError(

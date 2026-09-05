@@ -121,7 +121,7 @@ export function createGetWorkflowOutputTool(options) {
     return defineTool({
         name: "get_workflow_output",
         label: "Wait for workflow output",
-        description: "Wait without a deadline for the next agent result, message, or final result. Esc cancels this wait only; queued user input releases it at Pi's normal post-tool steering boundary. Event wait, not status. After partial output, wait again if needed. Never poll or use shell sleep.",
+        description: "Event wait, not status: next agent result, message or completion; no deadline. Esc cancels this wait only; user input yields at tool boundary. Review before re-waiting. Never poll or use shell sleep.",
         parameters: getWorkflowOutputSchema,
         prepareArguments: normalizeGetWorkflowOutputInput,
         executionMode: "sequential",

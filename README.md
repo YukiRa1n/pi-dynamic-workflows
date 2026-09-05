@@ -46,7 +46,7 @@ pi install git:github.com/YukiRa1n/pi-dynamic-workflows
 For a reproducible installation, pin a release tag once tags are available:
 
 ```bash
-pi install git:github.com/YukiRa1n/pi-dynamic-workflows@v3.5.1-yuki.4
+pi install git:github.com/YukiRa1n/pi-dynamic-workflows@v3.5.1-yuki.5
 ```
 
 Reload Pi after installation:
@@ -200,7 +200,7 @@ Important globals include:
 | gate | runtime-global | `gate(thunk: (feedback: string \| undefined, attempt: number) => unknown \| Promise<unknown>, validator: (value: unknown) => { ok: boolean; feedback?: string } \| Promise<{ ok: boolean; feedback?: string }>, options?: { attempts?: number }) => Promise<{ ok: boolean; value: unknown; attempts: number }>` | `attempts`: number (optional; default: 3) |
 | checkpoint | runtime-global | `checkpoint(prompt, options?) => Promise<unknown>` | `default`: unknown (optional; default: true when no UI and omitted)<br>`headless`: "default" \| "abort" (optional; default: "default")<br>`kind`: "confirm" \| "input" \| "select" (optional; default: "confirm")<br>`choices`: string[] (optional)<br>`timeoutMs`: number (optional) |
 | log | runtime-global | `log(message) => void` | — |
-| deliver | runtime-global | `deliver({ kind, message }) => Promise<void>` | `kind`: "blocker" \| "critical_finding" \| "decision" (required)<br>`message`: string (required) |
+| deliver | runtime-global | `deliver({ kind, message }) => Promise<void>` | `kind`: "blocker" \| "critical_finding" \| "finding" \| "decision" (required)<br>`message`: string (required) |
 | phase | runtime-global | `phase(title, options?) => void` | `budget`: number (optional) |
 | args | runtime-global | `args: unknown` | — |
 | cwd | runtime-global | `cwd: string` | — |
@@ -235,7 +235,7 @@ skills/workflow-patterns/
 - Replay identity is run-scoped: provider context such as `cwd`, instructions, tools, and session is hashed once and included in each call key. Nested and retried calls cannot collide on a bare call index. A resumed workflow replays the unchanged completed prefix and runs changed/new calls live.
 - Anthropic-compatible, non-worktree fan-out uses a short cache-warm gate: one compatible request leads, and followers are released when its first assistant response starts. Set `PI_CACHE_RETENTION=none` to disable the gate; `short` is the default and `long` keeps the warm window longer.
 - `isolation: "worktree"` is fail-closed: if a Git worktree cannot be created, that agent does not silently edit the shared checkout.
-- Completed subagent results, explicit child-to-parent `deliver({ kind, message })` messages, and the terminal workflow result are written as passive custom-history entries with `triggerTurn: false`; the only `triggerTurn: true` send is the single empty UI-only `workflows` marker fired at a verified safe point. Explicit messages must be classified as `blocker`, `critical_finding`, or `decision`. Delivery does not abort an already-running provider request.
+- Completed subagent results, explicit child-to-parent `deliver({ kind, message })` messages, and the terminal workflow result are written as passive custom-history entries with `triggerTurn: false`; the only `triggerTurn: true` send is the single empty UI-only `workflows` marker fired at a verified safe point. Explicit messages use `finding`, `blocker`, `critical_finding`, or `decision`. Use `finding` for substantive intermediate evidence, applicability, uncertainty, or changed assumptions; it need not be urgent or require a visible user reply. Include the actual finding and its supporting context, not a receipt that a report exists. Receipt-only and unchanged progress messages belong in logs. Delivery does not abort an already-running provider request. A wait/status call alone does not retire the temporary report-review notice; a later reply or substantive tool action crosses that boundary. This is a processing heuristic, not proof of understanding.
 - Explicit delivery admission is finite per run: at most 32 messages, 256 KiB of UTF-8 payload, and 8 messages per 10-second window. A rejected delivery reports `DELIVERY_BUDGET_EXCEEDED`; terminal lifecycle delivery is reserved and is never downgraded or displaced by an explicit burst.
 - Automatic per-subagent finals are bounded, marked `[UNTRUSTED]`, and persisted to the same replayable delivery outbox used by terminal workflow results before their purple `workflow-agent-completed` message enters main-session history. They are enabled by default; set `streamAgentResults: false` to keep the legacy on-demand tool path. The notification and `get_workflow_output` share one reload-safe fingerprint cursor, so one result is never injected through both paths. Execution order is not used to guess that the last agent is the final product; the workflow's explicit return remains the terminal result.
 - The workflow's explicit return value is the semantic terminal product. Its provider projection prioritizes conventional `report`, `synthesis`, `summary`, or `answer` fields and is bounded to 12,000 UTF-8 bytes by default (configurable via the `deliveredResultMaxChars` setting); omitted content remains in the persisted run.

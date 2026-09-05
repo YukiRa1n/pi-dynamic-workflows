@@ -2,7 +2,7 @@
 # Exhaustive workflow capability facts
 
 Contract format: `1.0.0`<br>
-Contract content / skill / extension: `3.5.1-yuki.4`
+Contract content / skill / extension: `3.5.1-yuki.5`
 
 Every exact fact below is projected from the installed extension's capability contract. Explanatory judgment belongs in the hand-written references next to this file.
 
@@ -185,11 +185,12 @@ Every exact fact below is projected from the installed extension's capability co
 - Support: `supported`
 - Signature: `deliver({ kind, message }) => Promise<void>`
 - Option shape: `classified-delivery`
-- `kind`: "blocker" | "critical_finding" | "decision" (required)
+- `kind`: "blocker" | "critical_finding" | "finding" | "decision" (required)
 - `message`: string (required; non-empty after trimming; at most 8000 characters)
-- Constraint: kind is blocker, critical_finding, or decision
+- Constraint: kind is blocker, critical_finding, finding, or decision
 - Constraint: message is non-empty and at most 8000 characters
-- Constraint: progress, acknowledgements, and routine results are rejected by contract and belong in logs or final output
+- Constraint: finding carries substantive intermediate evidence, conditions, uncertainty, or changed assumptions without requiring urgent severity or a user reply
+- Constraint: receipt-only, duplicate, and unchanged progress updates belong in logs; ordinary child finals use automatic result delivery
 - Constraint: delivers into the host conversation when the host wired onDeliver; no-op otherwise
 
 <a id="phase"></a>

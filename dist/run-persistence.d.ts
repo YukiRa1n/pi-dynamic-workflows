@@ -26,7 +26,7 @@ export interface PersistedDeliveryRecord {
     agentPhase?: string;
     agentStatus?: "done" | "error";
     /** Classified reason an explicit delivery is allowed to wake the parent. */
-    alertKind?: "blocker" | "critical_finding" | "decision";
+    alertKind?: "blocker" | "critical_finding" | "finding" | "decision";
     terminal?: boolean;
     /** Durable non-terminal lifecycle checkpoint. */
     checkpoint?: "paused";

@@ -85,7 +85,7 @@ const GATE_OPTIONS = {
 const CLASSIFIED_DELIVERY = {
     id: "classified-delivery",
     options: [
-        option("kind", '"blocker" | "critical_finding" | "decision"', false),
+        option("kind", '"blocker" | "critical_finding" | "finding" | "decision"', false),
         option("message", "string", false, null, ["non-empty after trimming", "at most 8000 characters"]),
     ],
 };
@@ -265,9 +265,10 @@ const capabilities = [
         signature: "deliver({ kind, message }) => Promise<void>",
         optionShape: "classified-delivery",
         constraints: [
-            "kind is blocker, critical_finding, or decision",
+            "kind is blocker, critical_finding, finding, or decision",
             "message is non-empty and at most 8000 characters",
-            "progress, acknowledgements, and routine results are rejected by contract and belong in logs or final output",
+            "finding carries substantive intermediate evidence, conditions, uncertainty, or changed assumptions without requiring urgent severity or a user reply",
+            "receipt-only, duplicate, and unchanged progress updates belong in logs; ordinary child finals use automatic result delivery",
             "delivers into the host conversation when the host wired onDeliver; no-op otherwise",
         ],
     }),

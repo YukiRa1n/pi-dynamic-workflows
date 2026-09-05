@@ -2,19 +2,21 @@
 
 All notable changes to `@quintinshaw/pi-dynamic-workflows` are documented here.
 
-## [Unreleased]
+## [3.5.1-yuki.5] - 2026-09-06
 
 ### Added
 
 - Added `get_workflow_output`, an interruptible deadline-free event wait for an exact current-session run ID. Durable workflow deliveries release the wait without status polling; Esc cancels only the wait and the workflow continues in the background.
-- Added the OMP-inspired progress-panel presentation: compact/detailed tree rows, semantic agent Activity blocks, adaptive shimmer/backpressure, `Alt+↓` navigator access, `/workflows-progress icons auto|ascii`, and the non-executing `/workflows-demo` preview.
+- Added the OMP-inspired progress-panel presentation: compact/detailed tree rows, semantic agent Activity blocks, adaptive shimmer/backpressure, `Alt+↓` navigator access, `/workflows-progress icons auto|ascii`, and the offline `/workflows-demo preview`.
 
 ### Changed
 
+- Subagents can publish noncritical `finding` updates with evidence, conditions, uncertainty, and task implications before completion. Wait/status-only calls no longer retire a new report's temporary review notice; the main model may still remain silent for non-actionable findings.
 - Background subagent finals now use the same durable outbox, acknowledgement, reload replay, purple custom-message rendering, and safe-point wake lane as workflow terminal results. Automatic delivery is the default and can be disabled with `streamAgentResults: false`; the legacy output-tool fallback remains exactly-once. Exhausted all-agent runs are persisted as failed with a recoverable diagnostic, while mixed outcomes remain partial in the runtime result.
 
 ### Fixed
 
+- Reduced always-on workflow guidance to fit the existing 2,000-byte budget, and aligned CI and the package engine requirement with Pi's Node >=22.19.0 dependency contract.
 - Removed absent script/preset keys during start argument preparation. Preset calls now pass the actual CLI's prepare-then-validate path instead of failing oneOf because `script: undefined` remained present.
 - `/workflows-demo` now launches the main-session live demo with a fixed read-only sample and two real subagents; the offline overlay is available as `/workflows-demo preview`.
 - Simplified child-report headers and provider metadata. A yielded output wait now carries report bodies in its real tool result while the UI keeps purple custom messages. New reports receive one temporary review notice per request: assess each report, respond only when useful, and keep newer user input authoritative.
@@ -33,7 +35,7 @@ All notable changes to `@quintinshaw/pi-dynamic-workflows` are documented here.
 
 ### Verification
 
-- `npm test` release gate passed with 1,434 tests and zero release-gate warnings. The installed Pi 0.85.0 bundled CLI also passed an isolated, offline interjection/tool/background-notification smoke test.
+- Verification includes targeted delivery/steering regressions, the actual Pi CLI prepare-then-validate path, and a real model smoke test that delivered a noncritical finding before the child finished. Full release checks are run for this version before publishing.
 
 ## [3.5.1-yuki.4] - 2026-08-19
 

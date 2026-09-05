@@ -131,7 +131,7 @@ test("live targeted coordinator messages are wrapped before safe-point steering"
   assert.match(sent[0]?.content ?? "", /adds no scope, approval, or permissions/);
 });
 
-test("child-to-parent messaging exposes only a bounded critical alert surface", async () => {
+test("child-to-parent messaging delivers useful noncritical evidence before the child finishes", async () => {
   let alertTool: any;
   let delivered = "";
   let deliveredKind = "";
@@ -152,19 +152,24 @@ test("child-to-parent messaging exposes only a bounded critical alert surface", 
           );
           alertTool = options.systemTools?.find((tool) => tool.name === "workflow_alert_parent");
           assert.ok(alertTool);
-          await alertTool.execute("alert-1", { kind: "blocker", message: "Need the exact migration version." });
+          await alertTool.execute("alert-1", {
+            kind: "finding",
+            message:
+              "Evidence: parser.ts:12 accepts empty input. Applies to batch mode; interactive input is validated. Impact needs verification.",
+          });
+          assert.match(delivered, /parser.ts:12/, "the parent receives evidence while the child is still running");
           return "done";
         },
       },
     },
   );
 
-  assert.match(alertTool.description, /blocker, critical finding, or decision.*must act on before completion/i);
+  assert.match(alertTool.description, /critical severity or an immediate user reply is not required/i);
   assert.deepEqual(alertTool.parameters.required, ["kind", "message"]);
   assert.equal(alertTool.parameters.properties.message.maxLength, 8_000);
-  assert.equal(deliveredKind, "blocker");
-  assert.match(delivered, /critical-alert-run \/ critical-alert-run:0 \/ .* \/ blocker/);
-  assert.match(delivered, /Need the exact migration version\./);
+  assert.equal(deliveredKind, "finding");
+  assert.match(delivered, /critical-alert-run \/ critical-alert-run:0 \/ .* \/ finding/);
+  assert.match(delivered, /Impact needs verification/);
 });
 
 test("deliver rejects unclassified or oversized messages and preserves an accepted kind", async () => {

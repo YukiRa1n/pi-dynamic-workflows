@@ -311,7 +311,7 @@ type WorkflowDeliveryDetails = {
     status: "done" | "error";
     sequence: number;
   }>;
-  alertKind?: "blocker" | "critical_finding" | "decision";
+  alertKind?: "blocker" | "critical_finding" | "finding" | "decision";
   sequence?: number;
   /** Internal acknowledgement identity; forwarded only as notification metadata. */
   deliveryId?: string;
@@ -2550,7 +2550,11 @@ export function needsAgentReportReview(messages: any[], index: number): boolean 
           typeof report.timestamp !== "number" ||
           message.timestamp >= report.timestamp) &&
         Array.isArray(message.content) &&
-        message.content.some((part: any) => part?.type === "toolCall" || (part?.type === "text" && part.text?.trim())),
+        message.content.some(
+          (part: any) =>
+            (part?.type === "toolCall" && !["get_workflow_output", "list_active_workflows"].includes(part.name)) ||
+            (part?.type === "text" && part.text?.trim()),
+        ),
     );
 }
 

@@ -268,7 +268,7 @@ export interface WorkflowManagerOptions {
     onDeliver?: (message: string, source?: {
         runId: string;
         workflowName: string;
-        alertKind: "blocker" | "critical_finding" | "decision";
+        alertKind: "blocker" | "critical_finding" | "finding" | "decision";
         deliveryId?: string;
         sequence?: number;
     }) => void | Promise<void>;

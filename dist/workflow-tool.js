@@ -150,7 +150,7 @@ export function createWorkflowTool(options = {}) {
         name: modelFacing ? "start_workflow" : "workflow",
         label: modelFacing ? "Start workflow" : "Workflow",
         description: modelFacing
-            ? "Start requested multi-agent work in background. Call exactly {script} or {preset,args?}; never put code in args. Existing runs use /workflows."
+            ? "Start requested background agents: {script} or {preset,args?}; never code in args. Existing runs use /workflows."
             : allowResume
                 ? "Run a saved/built-in or JavaScript workflow in the background; results return automatically. Use resumeFromRunId only to revise the same paused run."
                 : "Start a new background workflow for an explicitly requested multi-agent task. Provide a saved name or JavaScript using agent(), parallel(), and pipeline(); results return automatically. Existing runs use /workflows.",

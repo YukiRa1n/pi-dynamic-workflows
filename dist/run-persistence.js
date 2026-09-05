@@ -240,7 +240,7 @@ export function createRunPersistence(cwd, fsOverride, options) {
                         delivery.agentStatus === undefined))
                     return null;
                 if (delivery.alertKind !== undefined &&
-                    !new Set(["blocker", "critical_finding", "decision"]).has(delivery.alertKind))
+                    !new Set(["blocker", "critical_finding", "finding", "decision"]).has(delivery.alertKind))
                     return null;
                 if (delivery.checkpoint !== undefined && delivery.checkpoint !== "paused")
                     return null;

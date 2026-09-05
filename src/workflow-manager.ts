@@ -311,7 +311,7 @@ export interface WorkflowManagerOptions {
     source?: {
       runId: string;
       workflowName: string;
-      alertKind: "blocker" | "critical_finding" | "decision";
+      alertKind: "blocker" | "critical_finding" | "finding" | "decision";
       deliveryId?: string;
       sequence?: number;
     },
@@ -1057,7 +1057,7 @@ export class WorkflowManager extends EventEmitter {
   private admitExplicitDelivery(
     managed: ManagedRun,
     message: string,
-    alertKind: "blocker" | "critical_finding" | "decision",
+    alertKind: "blocker" | "critical_finding" | "finding" | "decision",
   ): PersistedDeliveryRecord {
     const content = typeof message === "string" ? message : String(message ?? "");
     const bytes = Buffer.byteLength(content, "utf8");

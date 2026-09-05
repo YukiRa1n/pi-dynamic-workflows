@@ -87,6 +87,25 @@ test("outbox acknowledgement is generation-fenced and removes only the same stab
   }
 });
 
+test("noncritical findings persist and replay with their evidence intact", async () => {
+  const cwd = tempDir();
+  try {
+    const m = manager(cwd);
+    const evidence =
+      "parser.ts:12 accepts empty batches; user input validation is unaffected; impact remains uncertain";
+    const run = m.startInBackground(
+      `export const meta = { name: "finding", description: "finding delivery" }; await deliver({kind:"finding", message:${JSON.stringify(evidence)}}); return await agent("finish");`,
+    );
+    await run.promise;
+    const persisted = m.getPersistence().load(run.runId);
+    const finding = persisted?.deliveryOutbox?.find((item) => item.alertKind === "finding");
+    assert.equal(finding?.content, evidence);
+    assert.equal(m.listPendingDeliveries().find((item) => item.deliveryId === finding?.deliveryId)?.content, evidence);
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 test("completed-agent delivery is durable, replayable, and deduplicated by call ID", async () => {
   const cwd = tempDir();
   try {
