@@ -141,6 +141,9 @@ export class WorkflowManager extends EventEmitter {
     /** Optional host observer for live subagent results; hosts own delivery policy. */
     onAgentMessage;
     pendingMessages = new Map();
+    /** Per-run UTF-8 byte total of that run's queued messages, kept in lockstep
+     * with pendingMessages so admission does not re-sum the whole queue. */
+    pendingBytesByRun = new Map();
     pendingMessageCount = 0;
     pendingMessageBytes = 0;
     activeAgentSenders = new Map();
@@ -212,7 +215,9 @@ export class WorkflowManager extends EventEmitter {
         if (managed?.status !== "running")
             return undefined;
         const queue = this.pendingMessages.get(managed.runId) ?? [];
-        const queuedBytes = queue.reduce((total, item) => total + Buffer.byteLength(item.message, "utf8"), 0);
+        // O(1) per-run total (maintained on push/drop) instead of re-summing the
+        // queue on every enqueue, which was O(n^2) across a queue of up to 256.
+        const queuedBytes = this.pendingBytesByRun.get(managed.runId) ?? 0;
         const aggregateCount = this.pendingMessageCount;
         const aggregateBytes = this.pendingMessageBytes;
         const textBytes = Buffer.byteLength(text, "utf8");
@@ -223,6 +228,7 @@ export class WorkflowManager extends EventEmitter {
         queue.push({ message: text, kind });
         this.pendingMessageCount++;
         this.pendingMessageBytes += textBytes;
+        this.pendingBytesByRun.set(managed.runId, queuedBytes + textBytes);
         this.pendingMessages.set(managed.runId, queue);
         return managed.runId;
     }
@@ -238,8 +244,11 @@ export class WorkflowManager extends EventEmitter {
         if (!messages)
             return;
         this.pendingMessages.delete(runId);
+        const bytes = this.pendingBytesByRun.get(runId) ??
+            messages.reduce((sum, item) => sum + Buffer.byteLength(item.message, "utf8"), 0);
+        this.pendingBytesByRun.delete(runId);
         this.pendingMessageCount = Math.max(0, this.pendingMessageCount - messages.length);
-        this.pendingMessageBytes = Math.max(0, this.pendingMessageBytes - messages.reduce((sum, item) => sum + Buffer.byteLength(item.message, "utf8"), 0));
+        this.pendingMessageBytes = Math.max(0, this.pendingMessageBytes - bytes);
     }
     /** Send immediately to a child in one explicitly identified running workflow. */
     async sendToAgent(message, agentId, runId, kind) {
@@ -1123,16 +1132,26 @@ export class WorkflowManager extends EventEmitter {
                 onLog: (message) => {
                     if (!this.isCurrent(managed))
                         return;
-                    const nextBytes = managed.snapshot.logs.reduce((total, item) => total + Buffer.byteLength(item, "utf8"), 0) +
-                        Buffer.byteLength(message, "utf8");
+                    // Incremental byte total (see ManagedRun.logBytes): the previous
+                    // implementation summed every retained entry on each log line, which
+                    // was O(n^2) over a run's (up to 10k) log entries.
+                    let previousBytes = managed.logBytes;
+                    if (previousBytes === undefined) {
+                        previousBytes = managed.snapshot.logs.reduce((total, item) => total + Buffer.byteLength(item, "utf8"), 0);
+                        managed.logBytes = previousBytes;
+                    }
+                    const nextBytes = previousBytes + Buffer.byteLength(message, "utf8");
                     if (managed.snapshot.logs.length >= 10_000 || nextBytes > 2 * 1024 * 1024) {
                         if (managed.snapshot.logs.length < 10_000 &&
                             !managed.snapshot.logs.some((item) => item.includes("log resource limit reached"))) {
-                            managed.snapshot.logs.push("workflow log resource limit reached; further entries omitted");
+                            const marker = "workflow log resource limit reached; further entries omitted";
+                            managed.snapshot.logs.push(marker);
+                            managed.logBytes = previousBytes + Buffer.byteLength(marker, "utf8");
                         }
                         return;
                     }
                     managed.snapshot.logs.push(message);
+                    managed.logBytes = nextBytes;
                     this.emitLive(managed, "log", { runId: managed.runId, message });
                     progress();
                 },

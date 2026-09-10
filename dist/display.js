@@ -78,9 +78,20 @@ export function createWorkflowSnapshot(meta) {
     };
 }
 export function recomputeWorkflowSnapshot(snapshot) {
-    const runningCount = snapshot.agents.filter((agent) => agent.status === "running").length;
-    const doneCount = snapshot.agents.filter((agent) => agent.status === "done").length;
-    const errorCount = snapshot.agents.filter((agent) => agent.status === "error").length;
+    // Single pass instead of three filter passes: this runs on every rendered
+    // frame (the panel re-renders continuously), over up to MAX_AGENTS_PER_RUN
+    // entries.
+    let runningCount = 0;
+    let doneCount = 0;
+    let errorCount = 0;
+    for (const agent of snapshot.agents) {
+        if (agent.status === "running")
+            runningCount++;
+        else if (agent.status === "done")
+            doneCount++;
+        else if (agent.status === "error")
+            errorCount++;
+    }
     return { ...snapshot, agentCount: snapshot.agents.length, runningCount, doneCount, errorCount };
 }
 export function createWidgetWorkflowDisplay(ctx, options = {}) {
@@ -194,14 +205,35 @@ export function renderWorkflowLines(snapshot, options = {}, theme = NO_THEME) {
         ? snapshot.phases
         : unique(snapshot.agents.map((agent) => agent.phase).filter(Boolean));
     const rendered = new Set();
+    // Bucket agents by phase once; the previous per-phase `filter` was
+    // O(phases x agents) on every rendered frame.
+    const byPhase = new Map();
+    for (const agent of snapshot.agents) {
+        if (agent.phase === undefined)
+            continue;
+        const bucket = byPhase.get(agent.phase);
+        if (bucket)
+            bucket.push(agent);
+        else
+            byPhase.set(agent.phase, [agent]);
+    }
     for (const phase of phaseNames) {
-        const agents = snapshot.agents.filter((agent) => agent.phase === phase);
-        for (const agent of agents)
+        const agents = byPhase.get(phase) ?? [];
+        let done = 0;
+        let running = 0;
+        let errors = 0;
+        let skipped = 0;
+        for (const agent of agents) {
             rendered.add(agent);
-        const done = agents.filter((agent) => agent.status === "done").length;
-        const running = agents.filter((agent) => agent.status === "running").length;
-        const errors = agents.filter((agent) => agent.status === "error").length;
-        const skipped = agents.filter((agent) => agent.status === "skipped").length;
+            if (agent.status === "done")
+                done++;
+            else if (agent.status === "running")
+                running++;
+            else if (agent.status === "error")
+                errors++;
+            else if (agent.status === "skipped")
+                skipped++;
+        }
         const complete = agents.length > 0 && done + errors + skipped === agents.length;
         const marker = running > 0 || (!complete && snapshot.currentPhase === phase) ? "▶" : complete ? "✓" : " ";
         lines.push(theme.fg("accent", `  ${marker} ${terminalText(phase)}`) +

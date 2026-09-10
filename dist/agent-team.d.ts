@@ -158,6 +158,9 @@ export declare class WorkflowAgentTeam {
     claimTask(memberId: string, taskId: string, attemptGen?: number): AgentTeamTaskSnapshot;
     completeTask(memberId: string, taskId: string, result?: string, attemptGen?: number): AgentTeamTaskSnapshot;
     snapshot(): AgentTeamSnapshot;
+    /** Cheap run-wide quota preflight counts — no snapshot/list allocation. */
+    taskCount(): number;
+    pendingMessageCount(): number;
     /** Static tool schemas; dynamic team/member identity stays in closures. */
     createTools(memberId: string, attemptGen?: number, isAdmitted?: () => boolean): ToolDefinition[];
     private assertMemberAttempt;

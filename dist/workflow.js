@@ -1645,7 +1645,7 @@ export async function runWorkflow(script, options = {}) {
             },
             addTasks: (tasks) => {
                 throwIfAdmissionClosed();
-                const currentTasks = [...teams.values()].reduce((total, item) => total + item.snapshot().tasks.length, 0);
+                const currentTasks = [...teams.values()].reduce((total, item) => total + item.taskCount(), 0);
                 if (currentTasks + tasks.length > MAX_TEAM_TASKS_PER_RUN) {
                     throw new WorkflowError("Run-wide Agent Team task capacity exceeded", WorkflowErrorCode.RESOURCE_LIMIT_EXCEEDED, { recoverable: false });
                 }
@@ -1656,7 +1656,7 @@ export async function runWorkflow(script, options = {}) {
             snapshot: () => team.snapshot(),
             send: (to, message) => {
                 throwIfAdmissionClosed();
-                const pending = [...teams.values()].reduce((total, item) => total + item.snapshot().pendingMessages, 0);
+                const pending = [...teams.values()].reduce((total, item) => total + item.pendingMessageCount(), 0);
                 if (pending >= MAX_TEAM_MESSAGES_PER_RUN) {
                     throw new WorkflowError("Run-wide Agent Team message capacity exceeded", WorkflowErrorCode.RESOURCE_LIMIT_EXCEEDED, { recoverable: false });
                 }

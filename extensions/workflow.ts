@@ -2719,13 +2719,21 @@ function installWorkflowToolResultContextBridge(pi: ExtensionAPI, getManager: ()
             suppressedTerminalIds.add(message.details.deliveryId);
           }
         }
+        if (suppressedTerminalIds.size > 0) {
+          // Batch-remove every suppressed id in one pass instead of filtering
+          // three arrays once per id (O(ids x arrays)).
+          bridge.pending = bridge.pending.filter((item) => !suppressedTerminalIds.has(item.id));
+          bridge.projectedForNextRequest = bridge.projectedForNextRequest.filter(
+            (item) => !suppressedTerminalIds.has(item.id),
+          );
+          bridge.includedInProviderRequest = bridge.includedInProviderRequest.filter(
+            (item) => !suppressedTerminalIds.has(item.id),
+          );
+        }
         for (const deliveryId of suppressedTerminalIds) {
           clearWorkflowAckWatchdog(bridge, deliveryId);
           bridge.awaitingAck.delete(deliveryId);
           bridge.uncertainAck.delete(deliveryId);
-          bridge.pending = bridge.pending.filter((item) => item.id !== deliveryId);
-          bridge.projectedForNextRequest = bridge.projectedForNextRequest.filter((item) => item.id !== deliveryId);
-          bridge.includedInProviderRequest = bridge.includedInProviderRequest.filter((item) => item.id !== deliveryId);
           bridge.wakeState.wakePendingIds.delete(deliveryId);
           bridge.wakeState.wakeAttemptedIds.delete(deliveryId);
           bridge.wakeState.wakeRequestIds.delete(deliveryId);
@@ -2836,6 +2844,10 @@ function installWorkflowToolResultContextBridge(pi: ExtensionAPI, getManager: ()
         const orderedCandidates = [...outputWaitCandidates, ...wakeCandidates, ...rotatedCandidates];
         const recovered: any[] = [];
         let recoveredBytes = 0;
+        // IDs promoted into this request's recovered batch; removed from
+        // `pending` in a single pass below instead of filtering the array once
+        // per recovered candidate.
+        const recoveredPendingIds = new Set<string>();
         for (const { delivery, record } of orderedCandidates) {
           if (!delivery.id || present.has(delivery.id) || bridge.delivered.has(delivery.id)) continue;
           if (isUncertainInCurrentGeneration(bridge, delivery.id)) continue;
@@ -2877,7 +2889,7 @@ function installWorkflowToolResultContextBridge(pi: ExtensionAPI, getManager: ()
           }
 
           recoveredBytes += payloadBytes;
-          bridge.pending = bridge.pending.filter((item) => item.id !== delivery.id);
+          recoveredPendingIds.add(delivery.id);
           recovered.push({
             role: "custom",
             customType: submitted.customType,
@@ -2886,6 +2898,9 @@ function installWorkflowToolResultContextBridge(pi: ExtensionAPI, getManager: ()
             details: { ...submitted.details, deliveryId: submitted.id },
             timestamp: Date.now(),
           });
+        }
+        if (recoveredPendingIds.size > 0) {
+          bridge.pending = bridge.pending.filter((item) => !recoveredPendingIds.has(item.id));
         }
         bridge.deferBacklogWake =
           bridge.pending.some(
@@ -3407,6 +3422,9 @@ function installWorkflowToolResultContextBridge(pi: ExtensionAPI, getManager: ()
     }
     // before_provider_request acknowledges inclusion only. Keep each stable ID
     // until after_provider_response so a failed/uncertain transport retries it.
+    // IDs promoted to `includedInProviderRequest` are removed from `pending` in
+    // one pass after the loop (the loop never reads `pending`).
+    const promotedPendingIds = new Set<string>();
     for (const item of batch) {
       const awaiting = bridge.awaitingAck.get(item.id);
       if (!awaiting) {
@@ -3452,7 +3470,10 @@ function installWorkflowToolResultContextBridge(pi: ExtensionAPI, getManager: ()
       ) {
         bridge.includedInProviderRequest.push(item);
       }
-      bridge.pending = bridge.pending.filter((delivery) => delivery.id !== item.id);
+      promotedPendingIds.add(item.id);
+    }
+    if (promotedPendingIds.size > 0) {
+      bridge.pending = bridge.pending.filter((delivery) => !promotedPendingIds.has(delivery.id));
     }
     flushWorkflowBridge(bridge);
   });

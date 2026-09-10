@@ -190,6 +190,21 @@ describe("renderWorkflowText", () => {
     assert.ok(text.includes("orphan"), "should contain orphan");
   });
 
+  it("groups declared phases in order and routes other-phase agents to Unphased", async () => {
+    const { createWorkflowSnapshot, renderWorkflowLines, recomputeWorkflowSnapshot } = await loadDisplay();
+    const snap = recomputeWorkflowSnapshot(createWorkflowSnapshot(fakeMeta("t", "d", ["Alpha", "Beta"])));
+    snap.agents = [
+      agent(1, "a1", "done", "Beta"),
+      agent(2, "a2", "done", "Alpha"),
+      agent(3, "a3", "done", "Gamma"),
+      agent(4, "a4", "done"),
+    ] as never[];
+    const text = renderWorkflowLines(recomputeWorkflowSnapshot(snap)).join("\n");
+    assert.ok(text.indexOf("Alpha") < text.indexOf("Beta"), "declared phase order is preserved");
+    assert.ok(text.indexOf("a3") > text.indexOf("Unphased"), "an undeclared phase falls into Unphased");
+    assert.ok(text.includes("a4"), "a phaseless agent is still rendered");
+  });
+
   it("shows agent tokens when available", async () => {
     const { createWorkflowSnapshot, renderWorkflowLines } = await loadDisplay();
     const snap = createWorkflowSnapshot(fakeMeta());

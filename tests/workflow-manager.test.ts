@@ -185,6 +185,46 @@ test("queued steering never guesses the newest running workflow", async () => {
   }
 });
 
+test("queued steering bytes are accounted per run and released on take", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-wf-steer-bytes-"));
+  const deferred = deferredAgent();
+  try {
+    const manager = new WorkflowManager({ cwd, agent: deferred.runner });
+    const run = manager.startInBackground(oneAgentScript);
+
+    // Per-run cap is 1_000_000 bytes. 100 x 9_000 = 900_000 queued, so a
+    // further 200_000-byte update must be rejected and a small one must fit.
+    const chunk = "x".repeat(9_000);
+    for (let i = 0; i < 100; i++) {
+      assert.equal(manager.enqueueUserMessage(chunk, run.runId, "same_task_correction"), run.runId);
+    }
+    assert.equal(
+      manager.enqueueUserMessage("y".repeat(200_000), run.runId, "same_task_correction"),
+      undefined,
+      "a per-run byte overflow is rejected",
+    );
+    assert.equal(manager.enqueueUserMessage("z", run.runId, "same_task_correction"), run.runId);
+
+    const taken = manager.takePendingMessages(run.runId);
+    assert.equal(taken.length, 101);
+    const afterTake = manager.getResourceDiagnostics();
+    assert.equal(afterTake.pendingMessageCount, 0, "taking the queue releases its message count");
+    assert.equal(afterTake.pendingMessageBytes, 0, "taking the queue releases its byte total");
+
+    // The released accounting must let the same volume be admitted again.
+    for (let i = 0; i < 100; i++) {
+      assert.equal(manager.enqueueUserMessage(chunk, run.runId, "same_task_correction"), run.runId);
+    }
+    manager.takePendingMessages(run.runId);
+    assert.equal(manager.getResourceDiagnostics().pendingMessageBytes, 0);
+
+    deferred.resolve("done");
+    await run.promise.catch(() => {});
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 test("deleteRun releases a fallback lease when persistence.delete throws", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-wf-delete-lease-"));
   try {

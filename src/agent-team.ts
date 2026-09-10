@@ -630,6 +630,17 @@ export class WorkflowAgentTeam {
     return { id: this.id, name: this.name, members: this.listMembers(), tasks: this.listTasks(), pendingMessages };
   }
 
+  /** Cheap run-wide quota preflight counts — no snapshot/list allocation. */
+  taskCount(): number {
+    return this.tasks.size;
+  }
+
+  pendingMessageCount(): number {
+    let pending = 0;
+    for (const inbox of this.inboxes.values()) pending += inbox.length;
+    return pending;
+  }
+
   /** Static tool schemas; dynamic team/member identity stays in closures. */
   createTools(memberId: string, attemptGen?: number, isAdmitted?: () => boolean): ToolDefinition[] {
     this.assertMemberAttempt(memberId, attemptGen);

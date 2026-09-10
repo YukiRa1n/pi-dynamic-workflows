@@ -83,6 +83,15 @@ export interface ManagedRun {
         endedAt?: string;
     }>;
     /**
+     * Running UTF-8 byte total of `snapshot.logs`, maintained incrementally by
+     * onLog. Recomputing it from every retained entry on each log line made log
+     * ingestion O(n^2) over a run's (up to 10k) entries. Undefined until first
+     * needed; lazily seeded from the current log array (e.g. after resume, where
+     * logs are restored from disk without a cached total). Never persisted — it
+     * is a pure derivative of `snapshot.logs`.
+     */
+    logBytes?: number;
+    /**
      * Live snapshot-agent lookup keyed by the agent CALL's unique id (see
      * WorkflowRunOptions.onAgentStart/onAgentEnd/onAgentHistory's `id` field in
      * workflow.ts — unique per call, never per label). onAgentEnd/onAgentHistory
@@ -401,6 +410,9 @@ export declare class WorkflowManager extends EventEmitter {
     /** Optional host observer for live subagent results; hosts own delivery policy. */
     onAgentMessage?: WorkflowManagerOptions["onAgentMessage"];
     private pendingMessages;
+    /** Per-run UTF-8 byte total of that run's queued messages, kept in lockstep
+     * with pendingMessages so admission does not re-sum the whole queue. */
+    private pendingBytesByRun;
     private pendingMessageCount;
     private pendingMessageBytes;
     private activeAgentSenders;
