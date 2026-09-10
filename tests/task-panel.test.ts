@@ -83,6 +83,16 @@ describe("installResultDelivery", () => {
 
   // ── deliverText: verdict path ──
 
+  it("automatic delivery tells the parent about partial results", () => {
+    const pi = createMockPi();
+    const run = makeRun();
+    const manager = createMockManager({ ...run, result: { ...run.result, status: "partial" } });
+    mod.installResultDelivery(pi, manager);
+    manager.emit("complete", { runId: "test-run-1" });
+    assert.match(pi._calls[0].content, /partially finished/);
+    assert.match(pi._calls[0].content, /do not report full completion/);
+  });
+
   it("delivers verdict when result.result has verdict", () => {
     const pi = createMockPi();
     const manager = createMockManager(makeRun());

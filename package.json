@@ -36,7 +36,7 @@
     "check:scripts": "node --import ./scripts/test-process.mjs node_modules/typescript/bin/tsc -p tsconfig.scripts.json",
     "format": "biome format --write .",
     "lint": "biome lint .",
-    "build": "tsc",
+    "build": "node --import ./scripts/test-process.mjs node_modules/typescript/bin/tsc",
     "docs:generate": "tsx scripts/generate-workflow-capabilities.ts",
     "docs:check": "tsx scripts/generate-workflow-capabilities.ts --check",
     "context:generate": "tsx scripts/generate-workflow-context-measurement.ts",

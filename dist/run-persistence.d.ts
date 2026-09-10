@@ -72,6 +72,14 @@ export interface PersistedRunState {
      * the navigator shows only the current session's runs (undefined = legacy/global). */
     sessionId?: string;
     status: RunStatus;
+    /** Semantic completion quality, retained independently of lifecycle status. */
+    outcome?: "completed" | "partial" | "exhausted";
+    /** Run-level failure survives process exit and terminal-run eviction. */
+    failure?: {
+        message: string;
+        code: string;
+        recoverable: boolean;
+    };
     /** Durable record version. It increases on every successful save. */
     revision?: number;
     /** Why a paused run is paused (e.g. "usage_limit" when a provider quota was hit). */

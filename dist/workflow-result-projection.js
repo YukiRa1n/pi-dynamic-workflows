@@ -71,5 +71,25 @@ export function summarizeWorkflowResult(result, maxChars = DEFAULT_WORKFLOW_RESU
     const available = limit - Buffer.byteLength(marker, "utf8");
     const head = Math.ceil(available * 0.7);
     const tail = available - head;
-    return `${truncateUtf8(serialized, head, "")}${marker}${truncateUtf8(serialized.slice(-tail), tail, "")}`;
+    return `${truncateUtf8(serialized, head, "")}${marker}${utf8Tail(serialized, tail)}`;
+}
+/** Retain the actual conclusion, including multibyte Chinese and emoji. */
+function utf8Tail(text, budget) {
+    let start = text.length;
+    let bytes = 0;
+    while (start > 0) {
+        let previous = start - 1;
+        const code = text.charCodeAt(previous);
+        if (code >= 0xdc00 && code <= 0xdfff && previous > 0) {
+            const high = text.charCodeAt(previous - 1);
+            if (high >= 0xd800 && high <= 0xdbff)
+                previous--;
+        }
+        const size = Buffer.byteLength(text.slice(previous, start), "utf8");
+        if (bytes + size > budget)
+            break;
+        bytes += size;
+        start = previous;
+    }
+    return text.slice(start);
 }

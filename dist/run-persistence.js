@@ -111,6 +111,14 @@ export function createRunPersistence(cwd, fsOverride, options) {
         const statuses = new Set(["pending", "running", "paused", "completed", "failed", "aborted"]);
         if (typeof state.status !== "string" || !statuses.has(state.status))
             return null;
+        if (state.outcome !== undefined && !["completed", "partial", "exhausted"].includes(state.outcome))
+            return null;
+        if (state.failure !== undefined &&
+            (!isRecord(state.failure) ||
+                !isText(state.failure.message, 16_000) ||
+                !isText(state.failure.code, 200) ||
+                typeof state.failure.recoverable !== "boolean"))
+            return null;
         if (state.revision !== undefined && (!Number.isSafeInteger(state.revision) || state.revision < 1))
             return null;
         if (!isText(state.startedAt, 200) || !isText(state.updatedAt, 200))

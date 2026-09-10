@@ -88,6 +88,10 @@ export interface PersistedRunState {
    * the navigator shows only the current session's runs (undefined = legacy/global). */
   sessionId?: string;
   status: RunStatus;
+  /** Semantic completion quality, retained independently of lifecycle status. */
+  outcome?: "completed" | "partial" | "exhausted";
+  /** Run-level failure survives process exit and terminal-run eviction. */
+  failure?: { message: string; code: string; recoverable: boolean };
   /** Durable record version. It increases on every successful save. */
   revision?: number;
   /** Why a paused run is paused (e.g. "usage_limit" when a provider quota was hit). */
@@ -416,6 +420,15 @@ export function createRunPersistence(
     if (expectedRunId !== undefined && state.runId !== expectedRunId) return null;
     const statuses: ReadonlySet<string> = new Set(["pending", "running", "paused", "completed", "failed", "aborted"]);
     if (typeof state.status !== "string" || !statuses.has(state.status)) return null;
+    if (state.outcome !== undefined && !["completed", "partial", "exhausted"].includes(state.outcome)) return null;
+    if (
+      state.failure !== undefined &&
+      (!isRecord(state.failure) ||
+        !isText(state.failure.message, 16_000) ||
+        !isText(state.failure.code, 200) ||
+        typeof state.failure.recoverable !== "boolean")
+    )
+      return null;
     if (state.revision !== undefined && (!Number.isSafeInteger(state.revision) || state.revision < 1)) return null;
     if (!isText(state.startedAt, 200) || !isText(state.updatedAt, 200)) return null;
     if (state.completedAt !== undefined && !isText(state.completedAt, 200)) return null;

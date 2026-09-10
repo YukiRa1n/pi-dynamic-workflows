@@ -1143,6 +1143,89 @@ function fakeUiCapturingComponent(): {
   return { ui, notifications, getComponent: () => capturedComponent };
 }
 
+test("u resumes the selected run once even when pressed repeatedly", async () => {
+  const { ui, notifications, getComponent } = fakeUiCapturingComponent();
+  let calls = 0;
+  let resolveResume: (value: boolean) => void = () => {};
+  const pending = new Promise<boolean>((resolve) => {
+    resolveResume = resolve;
+  });
+  const manager = {
+    on: () => {},
+    off: () => {},
+    getRun: () => undefined,
+    listRuns: () => [
+      { runId: "paused-run", status: "paused", workflowName: "audit", agents: [], logs: [], phases: [] },
+    ],
+    resume: async (id: string) => {
+      assert.equal(id, "paused-run");
+      calls++;
+      return pending;
+    },
+  } as unknown as WorkflowManager;
+  openWorkflowNavigator({} as ExtensionAPI, manager, ui).catch(() => {});
+  await Promise.resolve();
+  await Promise.resolve();
+  const component = getComponent();
+  assert.ok(component);
+  component.handleInput("u");
+  component.handleInput("u");
+  await Promise.resolve();
+  assert.equal(calls, 1);
+  resolveResume(true);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.ok(notifications.some((notice) => /Resumed paused-run/.test(notice.message)));
+  component.dispose?.();
+});
+
+test("restart keeps run limits and cannot duplicate an active or paused run", async () => {
+  for (const status of ["completed", "running", "paused"]) {
+    const { ui, getComponent } = fakeUiCapturingComponent();
+    const calls: unknown[][] = [];
+    const limits = {
+      tokenBudget: 1234,
+      maxAgents: 3,
+      agentTimeoutMs: null,
+      workflowTimeoutMs: 12000,
+      concurrency: 2,
+      agentRetries: 0,
+      toolset: "read-only",
+      autoResume: false,
+    };
+    const manager = {
+      on: () => {},
+      off: () => {},
+      getRun: () => undefined,
+      listRuns: () => [
+        {
+          runId: "restart-run",
+          workflowName: "audit",
+          status,
+          script: "script",
+          args: { x: 1 },
+          agents: [],
+          logs: [],
+          phases: [],
+          ...limits,
+        },
+      ],
+      startInBackground: (...args: unknown[]) => {
+        calls.push(args);
+        return { runId: "new-run" };
+      },
+    } as unknown as WorkflowManager;
+    openWorkflowNavigator({} as ExtensionAPI, manager, ui).catch(() => {});
+    await Promise.resolve();
+    await Promise.resolve();
+    const component = getComponent();
+    assert.ok(component);
+    component.handleInput("r");
+    assert.equal(calls.length, status === "completed" ? 1 : 0);
+    if (status === "completed") assert.deepEqual(calls[0], ["script", { x: 1 }, limits]);
+    component.dispose?.();
+  }
+});
+
 test("deleting a saved workflow whose storage.delete throws (e.g. EACCES) notifies an error instead of crashing the overlay (#330 audit follow-up)", async () => {
   const { ui, notifications, getComponent } = fakeUiCapturingComponent();
 

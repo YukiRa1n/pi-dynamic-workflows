@@ -142,6 +142,15 @@ export function createGetWorkflowOutputTool(options) {
                 const initial = ownedRun(manager, params.runId, sessionId);
                 if (!initial)
                     return workflowOutputError(params.runId, block, "run not found in current session");
+                const interrupted = (run) => ({
+                    ...workflowOutputState(manager, run, block, options, {
+                        interrupted: true,
+                        message: "Workflow output wait was interrupted. The workflow continues in the background.",
+                    }),
+                    terminate: true,
+                });
+                if (signal?.aborted)
+                    return interrupted(initial);
                 if (initial.status === "running") {
                     const claimed = claimAgentOutputs(manager, initial);
                     if (claimed.outputs.length > 0) {
@@ -167,19 +176,8 @@ export function createGetWorkflowOutputTool(options) {
                     }
                     outcome = await waiting;
                 }
-                if (outcome === "interrupted") {
-                    return {
-                        ...workflowOutputState(manager, initial, block, options, {
-                            interrupted: true,
-                            message: "Workflow output wait was interrupted. The workflow continues in the background.",
-                        }),
-                        // Pi's tool loop otherwise performs one more model iteration with
-                        // the already-aborted signal before it can observe stopReason=aborted.
-                        // End this main-session turn directly; the detached workflow owns a
-                        // different AbortController and remains running.
-                        terminate: true,
-                    };
-                }
+                if (outcome === "interrupted" || signal?.aborted)
+                    return interrupted(initial);
                 const current = ownedRun(manager, params.runId, sessionId);
                 if (!current) {
                     return workflowOutputError(params.runId, block, "run was deleted while waiting");
@@ -191,6 +189,8 @@ export function createGetWorkflowOutputTool(options) {
                     // publish its terminal result. This avoids returning the synthesizer
                     // once as an agent batch and immediately again as the workflow final.
                     await new Promise((resolve) => setImmediate(resolve));
+                    if (signal?.aborted)
+                        return interrupted(current);
                     const afterAgent = ownedRun(manager, params.runId, sessionId);
                     if (!afterAgent)
                         return workflowOutputError(params.runId, block, "run was deleted while waiting");
@@ -242,24 +242,26 @@ export function createGetWorkflowOutputTool(options) {
             }
             const label = details.error
                 ? `Unavailable: ${details.error}`
-                : details.completed
-                    ? `Completed ${details.runId}`
-                    : details.delivered
-                        ? `Output delivered ${details.runId}`
-                        : details.agentOutputs?.length
-                            ? `${details.agentOutputs.length} agent output${details.agentOutputs.length === 1 ? "" : "s"} ${details.runId}`
-                            : details.interrupted
-                                ? `Wait interrupted ${details.runId}`
-                                : details.inputPending
-                                    ? `User input queued ${details.runId}`
-                                    : `${details.status ?? "unknown"} ${details.runId}`;
+                : details.partial
+                    ? `Partially completed ${details.runId}`
+                    : details.completed
+                        ? `Completed ${details.runId}`
+                        : details.delivered
+                            ? `Output delivered ${details.runId}`
+                            : details.agentOutputs?.length
+                                ? `${details.agentOutputs.length} agent output${details.agentOutputs.length === 1 ? "" : "s"} ${details.runId}`
+                                : details.interrupted
+                                    ? `Wait interrupted ${details.runId}`
+                                    : details.inputPending
+                                        ? `User input queued ${details.runId}`
+                                        : `${details.status ?? "unknown"} ${details.runId}`;
             if (details.agentOutputs?.length) {
                 // Agent finals are still one-shot tool results semantically, but use
                 // the same visual lane as workflow custom deliveries so users can
                 // distinguish actual child output from an ordinary wait status.
                 return new Text(theme.bg("customMessageBg", theme.fg("customMessageText", label)), 0, 0);
             }
-            return new Text(theme.fg(details.error || details.interrupted
+            return new Text(theme.fg(details.error || details.interrupted || details.partial
                 ? "warning"
                 : details.completed || details.delivered || details.inputPending
                     ? "success"
@@ -614,10 +616,12 @@ function workflowOutputState(manager, run, blocked, options, state = {}) {
     const resultPath = persistedResultPath(manager, run.runId);
     const safeResultPath = resultPath ? redactWorkflowText(resultPath) : undefined;
     const completed = run.status === "completed";
+    const partial = completed && (run.outcome === "partial" || run.agents.some((agent) => agent.status === "error"));
     const details = {
         runId: run.runId,
         status: run.status,
         completed,
+        ...(partial ? { partial: true } : {}),
         blocked,
         ...(state.interrupted ? { interrupted: true } : {}),
         ...(state.inputPending ? { inputPending: true } : {}),
@@ -630,20 +634,38 @@ function workflowOutputState(manager, run, blocked, options, state = {}) {
     }
     else if (completed) {
         const output = summarizeWorkflowResult(run.result, workflowResultMaxChars(options));
-        text = [`Workflow completed (run ${run.runId}).`, UNTRUSTED_RESULT_LABEL, "", output].join("\n");
+        text = [
+            partial
+                ? `Workflow partially completed (run ${run.runId}). Some work failed or hit a limit; preserve useful results and disclose the gaps instead of claiming full completion.`
+                : `Workflow completed (run ${run.runId}).`,
+            UNTRUSTED_RESULT_LABEL,
+            "",
+            output,
+        ].join("\n");
     }
     else if (run.status === "failed") {
-        const failure = liveRunFailure(manager, run.runId);
-        const error = failure?.message ?? "unknown error";
+        const failure = liveRunFailure(manager, run.runId) ?? run.failure;
+        const error = failure
+            ? redactWorkflowText(failure.message)
+            : "No run-level diagnostic was saved; inspect the agent errors and log.";
         details.error = error;
         if (failure?.code)
             details.errorCode = failure.code;
         if (failure?.recoverable !== undefined)
             details.recoverable = failure.recoverable;
         text = `Workflow failed (run ${run.runId}): ${error}.`;
+        text += `\nNext: inspect the cause in /workflows; resume the same run after fixing it, rather than starting a duplicate.`;
+        if (run.result !== undefined) {
+            text += `\n${UNTRUSTED_RESULT_LABEL}\nBest-effort result (not a successful completion):\n${summarizeWorkflowResult(run.result, workflowResultMaxChars(options))}`;
+        }
     }
     else if (run.status === "paused") {
         text = `Workflow is paused (run ${run.runId}). Resume it through /workflows if the same task should continue.`;
+        if (run.failure?.message)
+            text += `\nReason: ${redactWorkflowText(run.failure.message)}`;
+        if (run.pauseReason === "usage_limit") {
+            text += `\nProvider quota pause${run.resetHint ? `: ${redactWorkflowText(run.resetHint)}` : "."} Wait for the reset; do not repeatedly start new runs.`;
+        }
     }
     else if (run.status === "aborted") {
         text = `Workflow was aborted (run ${run.runId}).`;

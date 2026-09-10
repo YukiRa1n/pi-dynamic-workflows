@@ -114,6 +114,12 @@ function renderPersistedStatus(run) {
     const lines = [`${STATUS_ICON[run.status] ?? "?"} ${workflowName} (${run.runId}) — ${run.status}`];
     if (run.currentPhase)
         lines.push(`  phase: ${terminalText(run.currentPhase)}`);
+    if (run.outcome === "partial")
+        lines.push("  outcome: partial — inspect failed agents before reporting completion");
+    if (run.failure)
+        lines.push(`  reason: ${terminalText(run.failure.message)}`);
+    if (run.resetHint)
+        lines.push(`  reset: ${terminalText(run.resetHint)}`);
     for (const agent of run.agents) {
         const icon = agent.status === "done" ? "✓" : agent.status === "error" ? "✗" : agent.status === "running" ? "◆" : "·";
         lines.push(`  ${icon} ${terminalText(agent.label)}`);

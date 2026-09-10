@@ -2175,6 +2175,15 @@ export class WorkflowManager extends EventEmitter {
       sessionId: managed.sessionId,
       journal: keepsResumeJournal ? managed.journal : undefined,
       status: managed.status,
+      outcome: managed.result?.status,
+      failure:
+        (managed.status === "failed" || managed.status === "paused") && managed.error
+          ? {
+              message: managed.error.message.slice(0, 16_000),
+              code: managed.error.code,
+              recoverable: managed.error.recoverable,
+            }
+          : undefined,
       autoResume: managed.autoResume,
       tokenBudget: managed.tokenBudget,
       toolset: managed.toolset,

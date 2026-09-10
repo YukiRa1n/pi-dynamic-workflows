@@ -6,7 +6,7 @@
  *        ◀── (saved items in runs view) ──enter──▶ saved detail
  *
  * Keys: ↑/↓ (or j/k) select · enter/→ drill in · esc/← back (esc at top closes)
- *       On runs: p pause · x stop · r restart · s save · q quit
+ *       On runs: p pause · u resume · x stop · r restart · s save · q quit
  *       On saved: x delete · q quit
  *
  * The state machine and line rendering are pure and unit-tested; the pi-tui
@@ -1715,7 +1715,14 @@ function footerHint(state: NavigatorState, model: NavigatorModel, theme: ThemeLi
       const itemKind = model.saved().length > 0 ? state.itemKindAt(model, state.cursor) : "run";
       parts.push("↑/↓ select", "enter open", "esc back");
       if (itemKind === "run") {
-        parts.push("p pause", "x stop", "r restart", "s save");
+        const status = model.runs()[state.cursor]?.status;
+        if (status === "running") parts.push("p pause", "x stop");
+        else if (status === "paused") parts.push("u resume", "x stop");
+        else {
+          if (status === "failed" || status === "pending") parts.push("u resume");
+          parts.push("r restart");
+        }
+        parts.push("s save");
       } else {
         parts.push("x delete");
       }
@@ -1819,6 +1826,7 @@ export type NavAction =
   | { type: "back" }
   | { type: "close" }
   | { type: "pause" }
+  | { type: "resume" }
   | { type: "stop" }
   | { type: "restart" }
   | { type: "save" }
@@ -1871,6 +1879,8 @@ export function keyToAction(keyId: string | undefined, kind: ViewKind, itemKind?
       return { type: "close" };
     case "p":
       return { type: "pause" };
+    case "u":
+      return kind === "savedDetail" || itemKind === "saved" ? { type: "none" } : { type: "resume" };
     case "x":
       if (kind === "savedDetail" || itemKind === "saved") return { type: "deleteSaved" };
       return { type: "stop" };
@@ -1967,8 +1977,11 @@ export function openWorkflowNavigator(
         (historyRenderTimer as { unref?: () => void }).unref?.();
       };
       manager.on("agentHistory", onAgentHistory);
+      const resuming = new Set<string>();
+      let closed = false;
 
       const cleanup = () => {
+        closed = true;
         for (const ev of events) manager.off(ev, onEvent);
         manager.off("agentHistory", onAgentHistory);
         if (historyRenderTimer) clearTimeout(historyRenderTimer);
@@ -2040,6 +2053,38 @@ export function openWorkflowNavigator(
               if (id) ui.notify(manager.stop(id) ? `Stopped ${id}` : `Cannot stop ${id}`, "info");
               break;
             }
+            case "resume": {
+              const id = state.activeRunId(model);
+              const run = id ? manager.listRuns().find((item) => item.runId === id) : undefined;
+              if (!id || !run || !["paused", "failed", "pending"].includes(run.status)) {
+                ui.notify("Select a paused or failed run to resume.", "warning");
+                break;
+              }
+              if (resuming.has(id)) break;
+              resuming.add(id);
+              ui.notify(`Resuming ${id}…`, "info");
+              void Promise.resolve()
+                .then(() => manager.resume(id))
+                .then((resumed) => {
+                  if (!closed)
+                    ui.notify(
+                      resumed ? `Resumed ${id}` : `Cannot resume ${id}; inspect its current status.`,
+                      resumed ? "info" : "warning",
+                    );
+                })
+                .catch((error) => {
+                  if (!closed)
+                    ui.notify(
+                      `Resume failed: ${redactForModel(error instanceof Error ? error.message : String(error))}`,
+                      "error",
+                    );
+                })
+                .finally(() => {
+                  resuming.delete(id);
+                  if (!closed) rerender();
+                });
+              break;
+            }
             case "restart": {
               const id = state.activeRunId(model);
               const run = id ? manager.listRuns().find((r) => r.runId === id) : undefined;
@@ -2047,8 +2092,26 @@ export function openWorkflowNavigator(
                 ui.notify(id ? `Cannot restart ${id} (no script saved)` : "No run selected to restart", "warning");
                 break;
               }
+              if (run.status === "running" || run.status === "paused") {
+                ui.notify(
+                  run.status === "paused"
+                    ? "Press u to resume this run from its saved progress."
+                    : "This run is still active. Pause or stop it before restarting.",
+                  "warning",
+                );
+                break;
+              }
               try {
-                const { runId: newId } = manager.startInBackground(run.script, run.args);
+                const { runId: newId } = manager.startInBackground(run.script, run.args, {
+                  tokenBudget: run.tokenBudget,
+                  maxAgents: run.maxAgents,
+                  agentTimeoutMs: run.agentTimeoutMs,
+                  workflowTimeoutMs: run.workflowTimeoutMs,
+                  concurrency: run.concurrency,
+                  agentRetries: run.agentRetries,
+                  toolset: run.toolset,
+                  autoResume: run.autoResume,
+                });
                 ui.notify(`Restarted ${sanitizeUiText(run.workflowName || "workflow")} as ${newId}`, "info");
               } catch (error) {
                 ui.notify(

@@ -1,7 +1,6 @@
 import { spawn } from "node:child_process";
 import { readdirSync } from "node:fs";
 import { resolve } from "node:path";
-import "./test-process.mjs";
 
 const root = resolve(import.meta.dirname, "..");
 const args = process.argv.slice(2);

@@ -2,6 +2,15 @@
 
 All notable changes to `@quintinshaw/pi-dynamic-workflows` are documented here.
 
+## [Unreleased]
+
+### Changed
+
+- Preserve completion quality and run-level failure diagnostics in durable state; recovered terminal notifications and output reads expose useful results with explicit partial/failure context.
+- Preserve the actual UTF-8 tail of long Chinese and emoji results. Cancelling an output wait no longer consumes unread agent results.
+- Add `u` to resume the selected navigator run, coalesce repeated resume requests, show state-specific controls, and preserve limits/toolset on restart. Active or paused runs cannot be accidentally duplicated by restart.
+- Add local compilation/test admission checks for physical and Windows commit-memory headroom. Low headroom or unavailable Windows counters prevents validation from starting; no paging-file or global system settings are changed.
+
 ## [3.5.1-yuki.6] - 2026-09-06
 
 ### Added

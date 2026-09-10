@@ -6,7 +6,7 @@
  *        ◀── (saved items in runs view) ──enter──▶ saved detail
  *
  * Keys: ↑/↓ (or j/k) select · enter/→ drill in · esc/← back (esc at top closes)
- *       On runs: p pause · x stop · r restart · s save · q quit
+ *       On runs: p pause · u resume · x stop · r restart · s save · q quit
  *       On saved: x delete · q quit
  *
  * The state machine and line rendering are pure and unit-tested; the pi-tui
@@ -162,6 +162,8 @@ export type NavAction = {
     type: "close";
 } | {
     type: "pause";
+} | {
+    type: "resume";
 } | {
     type: "stop";
 } | {

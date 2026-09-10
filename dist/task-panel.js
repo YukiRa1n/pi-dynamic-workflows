@@ -167,8 +167,14 @@ export function deliverText(run, opts = {}) {
     const tokens = `${segment ? ` · ${segment}` : ""}${cost}`;
     const agents = run.result?.agentCount ?? run.snapshot.agentCount;
     const duration = run.result?.durationMs ? ` · ${(run.result.durationMs / 1000).toFixed(1)}s` : "";
+    const partial = run.result?.status === "partial";
     const lines = [
-        `✓ Background workflow "${terminalText(run.snapshot.name)}" finished (${agents} agents${tokens}${duration}).`,
+        `${partial ? "⚠" : "✓"} Background workflow "${terminalText(run.snapshot.name)}" ${partial ? "partially finished" : "finished"} (${agents} agents${tokens}${duration}).`,
+        ...(partial
+            ? [
+                "Some work failed or hit a limit. Preserve useful results and disclose the remaining gaps; do not report full completion.",
+            ]
+            : []),
         "",
         summary,
     ];

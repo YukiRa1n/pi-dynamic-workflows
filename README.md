@@ -21,6 +21,12 @@ After installation, Pi gains:
 
 The extension uses the stock Pi extension API and keeps compact start, active-list, output-wait, and exact-ID stop definitions registered. Its provider-visible prefix therefore stays stable for prompt caching; there is no per-turn tool lease or dynamic `setActiveTools` rewrite. The list returns only current-session running/paused handles. `get_workflow_output` is an event wait, not a status check: it waits without its own deadline for a durable subagent message, explicit message, terminal result, Esc, or queued user input. A steer/follow-up releases the tool at Pi's normal post-tool boundary so the user message can enter the ongoing agent loop; it does not stop the background workflow. Stop requires one exact ID. Other existing-run actions stay under `/workflows`; a new requirement is never routed into an unrelated run.
 
+### Results and recovery
+
+Partial results are labeled as partial in the output tool and automatic completion message, so the parent can preserve useful findings and disclose gaps. Run-level failure diagnostics and completion quality are saved with the run; cold-start delivery includes the saved result summary instead of only a status notice. Failed output retrieval also includes any best-effort result. Long Chinese/emoji reports retain their actual final conclusion when projected to the output budget. Cancelling an output wait leaves unreturned agent results unread.
+
+In the navigator, `u` resumes the selected paused/failed run. Repeated presses while resume is pending submit only once. The footer shows controls appropriate to the selected state. `r` starts a new run from a terminal run's saved script and arguments while preserving its limits and toolset; it refuses running/paused runs to avoid accidental duplication. Use `u` to continue saved progress.
+
 ### Interjecting while work continues
 
 A message entered with Pi's steering mode takes temporary priority over background updates. The footer shows `User message queued`, then `Replying to user`. The assistant answers the question or applies the correction before continuing unfinished work. A successful response containing visible text ends this temporary priority and clears the footer status; the user's requirements remain part of the conversation. Tool-only notifications, failed responses, and Esc do not count as an answer. Follow-up mode keeps Pi's normal after-the-current-turn behavior.

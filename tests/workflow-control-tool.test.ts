@@ -187,6 +187,60 @@ test("get_workflow_output exposes a strict next-output wait schema", () => {
   assert.throws(() => prepare({ runId: "audit-abc123", extra: true }), /does not accept extra/);
 });
 
+test("cancelled output reads leave pending agent results available", async () => {
+  const item = { ...run("running"), sessionId: "session-a" };
+  item.agents = [{ id: 1, label: "report", prompt: "work", status: "done", result: "unread report" }];
+  const manager = outputManager(item);
+  const controller = new AbortController();
+  controller.abort();
+  const cancelled = await executeOutput(manager, { runId: item.runId }, controller.signal);
+  assert.equal(cancelled.details.interrupted, true);
+  assert.equal(cancelled.terminate, true);
+  const next = await executeOutput(manager, { runId: item.runId, block: false });
+  assert.match(next.content[0].text, /unread report/);
+});
+
+test("cancellation during the final-agent grace turn leaves its output unclaimed", async () => {
+  const item = { ...run("running"), sessionId: "session-a", agents: [] };
+  const manager = outputManager(item);
+  const controller = new AbortController();
+  const pending = executeOutput(manager, { runId: item.runId }, controller.signal);
+  manager.state.agents.push({ id: 1, label: "report", prompt: "work", status: "done", result: "late report" });
+  manager.emit("agentEnd", { runId: item.runId });
+  queueMicrotask(() => controller.abort());
+  assert.equal((await pending).details.interrupted, true);
+  const next = await executeOutput(manager, { runId: item.runId, block: false });
+  assert.match(next.content[0].text, /late report/);
+});
+
+test("cold output retrieval preserves failure diagnostics and best-effort work", async () => {
+  const manager = outputManager({
+    ...run("failed"),
+    sessionId: "session-a",
+    failure: { message: "Provider unavailable", code: "AGENT_EXECUTION_ERROR", recoverable: true },
+    result: { report: "saved findings" },
+  });
+  const response = await executeOutput(manager, { runId: "audit-abc123" });
+  assert.match(response.content[0].text, /Provider unavailable/);
+  assert.match(response.content[0].text, /saved findings/);
+  assert.match(response.content[0].text, /resume the same run/);
+  assert.equal(response.details.recoverable, true);
+});
+
+test("partial completion is clearly distinguished from full success", async () => {
+  const manager = outputManager({
+    ...run("completed"),
+    sessionId: "session-a",
+    outcome: "partial",
+    result: "usable subset",
+  });
+  const response = await executeOutput(manager, { runId: "audit-abc123" });
+  assert.equal(response.details.completed, true);
+  assert.equal(response.details.partial, true);
+  assert.match(response.content[0].text, /partially completed/);
+  assert.match(response.content[0].text, /usable subset/);
+});
+
 test("get_workflow_output returns a bounded completed result immediately", async () => {
   const manager = outputManager({
     ...run("completed"),

@@ -1642,13 +1642,53 @@ function suspendWorkflowBridge(manager: WorkflowManager): void {
 
 type PendingWorkflowDeliveryRecord = ReturnType<WorkflowManager["listPendingDeliveries"]>[number];
 
-function deliveryFromOutboxRecord(
+export function deliveryFromOutboxRecord(
   manager: WorkflowManager,
   record: PendingWorkflowDeliveryRecord,
 ): WorkflowBridgeDelivery {
   const live = manager.getRun(record.runId);
+  const recoverDetails = record.content === undefined && record.kind === "terminal";
+  let recoveryBudget = DEFAULT_WORKFLOW_RESULT_CHARS;
+  let recovered: ReturnType<ReturnType<WorkflowManager["getPersistence"]>["load"]> | undefined;
+  if (recoverDetails) {
+    try {
+      recoveryBudget = Math.min(
+        24_000,
+        loadWorkflowSettings({ cwd: manager.getCwd() }).deliveredResultMaxChars ?? recoveryBudget,
+      );
+    } catch {
+      // Presentation configuration is optional for retained/embedded managers.
+    }
+    try {
+      recovered = manager.getPersistence().load(record.runId);
+    } catch {
+      // Older hosts can still replay the durable envelope without loading details.
+    }
+  }
+  const outcome = recoverDetails ? (live?.result?.status ?? recovered?.outcome) : undefined;
+  const result = recoverDetails ? (live?.result ? live.result.result : recovered?.result) : undefined;
+  const failure = recoverDetails ? (live?.error?.message ?? recovered?.failure?.message) : undefined;
+  const recoverySummary =
+    recoverDetails && (recovered || live)
+      ? [
+          `Background workflow "${redactForModel(record.workflowName, 512)}" (${record.runId}) ${outcome === "partial" ? "partially completed" : record.runStatus}.`,
+          ...(outcome === "partial"
+            ? ["Some work failed or hit a limit. Disclose gaps; do not claim full completion."]
+            : []),
+          ...(failure ? [`Reason: ${redactForModel(failure, 2_048)}`] : []),
+          ...(result !== undefined
+            ? [
+                UNTRUSTED_WORKFLOW_CONTENT_LABEL,
+                ...(record.runStatus === "failed" ? ["Best-effort result; this run failed:"] : []),
+                summarizeWorkflowResult(result, recoveryBudget),
+              ]
+            : []),
+          `Full result and subagent reports: ${manager.getPersistence().getRunsDir()}/${record.runId}.json`,
+        ].join("\n\n")
+      : undefined;
   const content =
     record.content ??
+    recoverySummary ??
     (live
       ? live.status === "completed"
         ? `✓ Background workflow "${record.workflowName}" finished.\n\n↳ Full result and subagent reports: ${manager.getPersistence().getRunsDir()}/${record.runId}.json`

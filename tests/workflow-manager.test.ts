@@ -144,6 +144,10 @@ return { diagnostic: 'all work failed' }`);
       const persisted = manager.getPersistence().load(run.runId);
       assert.equal(persisted?.status, "failed");
       assert.deepEqual(persisted?.result, { diagnostic: "all work failed" });
+      assert.equal(persisted?.outcome, "exhausted");
+      assert.equal(persisted?.failure?.code, WorkflowErrorCode.AGENT_EXECUTION_ERROR);
+      const cold = new WorkflowManager({ cwd, agent: fakeAgent() });
+      assert.match(cold.listRuns()[0]?.failure?.message ?? "", /All agent calls failed/);
     });
   } finally {
     rmSync(cwd, { recursive: true, force: true });

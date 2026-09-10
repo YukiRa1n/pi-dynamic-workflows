@@ -23,6 +23,8 @@ Selectors match a test filename or filename prefix. Missing/unknown selectors fa
 
 The two no-emit TypeScript checks keep separate incremental caches under `node_modules/.cache/pi-workflow/`; a fresh checkout still performs a complete check. `build` remains non-incremental so missing distribution files are recreated reliably. Publishability tests reuse one immutable `npm pack --dry-run --ignore-scripts` snapshot per process; each caller receives a copy. Ordinary deferred-agent fixtures must honor AbortSignal so lifecycle tests do not wait for the production drain grace period. Dedicated uncooperative-provider tests retain their intentional late-settlement behavior.
 
+Local compilation and test processes also check memory before starting. They refuse to start below 2 GiB available physical memory. On Windows they additionally require at least 4 GiB remaining commit capacity and less than 80% commit usage; inability to read those counters fails closed. The check uses the built-in Windows PowerShell without changing paging-file or global settings. CI bypasses this desktop admission check. This is an admission check, not a continuous memory limit: other applications can still allocate memory afterwards. `test:focus --list` remains available without launching a test process.
+
 ## What a good PR looks like
 
 - **One concern per PR.** Keep a bug fix, a feature, and a refactor in separate PRs. A mixed PR (e.g. a test-infra fix *and* a new runtime feature) is harder to review and to revert; split it if you can.

@@ -33,6 +33,31 @@ function withTempCwd(fn: (cwd: string) => Promise<void>) {
 }
 
 test(
+  "run diagnostics survive reload and malformed diagnostics cannot replace a good record",
+  withTempCwd(async (cwd) => {
+    const persistence = createRunPersistence(cwd);
+    const state: PersistedRunState = {
+      runId: "diagnostic-run",
+      workflowName: "audit",
+      script: "",
+      status: "failed",
+      outcome: "exhausted",
+      failure: { message: "Provider failed", code: "AGENT_EXECUTION_ERROR", recoverable: true },
+      phases: [],
+      agents: [],
+      logs: [],
+      startedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    persistence.save(state);
+    assert.deepEqual(createRunPersistence(cwd).load(state.runId)?.failure, state.failure);
+    const malformed = { ...state, failure: { ...state.failure, message: "x".repeat(16_001) } } as PersistedRunState;
+    assert.throws(() => persistence.save(malformed), /Invalid persisted/);
+    assert.equal(createRunPersistence(cwd).load(state.runId)?.failure?.message, "Provider failed");
+  }),
+);
+
+test(
   "delivery outbox round-trips beyond 512 records and rejects overflow before publishing",
   withTempCwd(async (cwd) => {
     const persistence = createRunPersistence(cwd);
