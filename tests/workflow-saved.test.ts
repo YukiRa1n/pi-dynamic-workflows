@@ -281,6 +281,28 @@ test(
 );
 
 test(
+  "createWorkflowStorage rejects schema-incomplete records instead of loading them",
+  withIsolatedHome(async (cwd) => {
+    const storage = createWorkflowStorage(cwd);
+    const projectDir = workflowProjectPaths(cwd).savedDir;
+    mkdirSync(projectDir, { recursive: true });
+    const write = (file: string, value: unknown) =>
+      writeFileSync(join(projectDir, file), JSON.stringify(value), "utf-8");
+    // Parseable records the schema cannot use (hand-edited, or written by an
+    // older/incompatible writer) must fail closed at the storage boundary.
+    write("no-script.json", { name: "no-script", description: "missing script" });
+    write("blank-script.json", { name: "blank-script", script: "   " });
+    write("bad-description.json", { name: "bad-description", description: 5, script: "ok script" });
+    write("bad-parameters.json", { name: "bad-parameters", script: "ok script", parameters: ["nope"] });
+
+    for (const name of ["no-script", "blank-script", "bad-description", "bad-parameters"]) {
+      assert.equal(storage.load(name), null, `${name} must not load`);
+    }
+    assert.deepEqual(storage.list(), [], "schema-incomplete records must not be listed");
+  }),
+);
+
+test(
   "createWorkflowStorage skips legacy files with unsafe workflow names",
   withIsolatedHome(async (cwd) => {
     const storage = createWorkflowStorage(cwd);

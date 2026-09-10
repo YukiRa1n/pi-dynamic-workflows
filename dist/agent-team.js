@@ -338,17 +338,31 @@ export class WorkflowAgentTeam {
     broadcast(from, kind, message, attemptGen) {
         this.assertMemberAttempt(from, attemptGen);
         assertModelFacingMessageKind(kind);
+        // Validate the body BEFORE the bulk reservation. send() re-checks it per
+        // recipient, but the reservation is taken up front for every recipient, so
+        // a body that can never be admitted would otherwise leak
+        // recipients.length run-wide message slots that readInbox() never releases
+        // (nothing was enqueued to consume).
+        const text = String(message ?? "").trim();
+        if (!text || text.length > 8_000)
+            throw new Error("Team message is empty or exceeds 8000 characters");
         const recipients = [...this.members.keys()].filter((id) => id !== from);
-        this.ensureBroadcastCapacity(recipients, message);
+        this.ensureBroadcastCapacity(recipients, text);
         this.quota?.reserveMessages(recipients.length);
         let count = 0;
         this.quotaSuppressed = true;
         try {
             for (const memberId of recipients) {
-                this.send(from, memberId, kind, message, attemptGen);
+                this.send(from, memberId, kind, text, attemptGen);
                 count++;
             }
             return count;
+        }
+        catch (error) {
+            // Any per-recipient failure must return the reservations for recipients
+            // that were never enqueued; delivered ones are released by readInbox().
+            this.quota?.releaseMessages?.(recipients.length - count);
+            throw error;
         }
         finally {
             this.quotaSuppressed = false;
@@ -375,8 +389,10 @@ export class WorkflowAgentTeam {
     }
     broadcastFromWorkflow(message) {
         const text = String(message ?? "").trim();
-        if (!text)
-            throw new Error("Team message must not be empty");
+        // Mirror sendFromWorkflow's size gate here, before the bulk reservation:
+        // otherwise an oversized body leaks one reserved slot per recipient.
+        if (!text || Buffer.byteLength(text, "utf8") > 100_000)
+            throw new Error("Team message is empty or too large");
         const recipients = [...this.members.keys()];
         this.ensureBroadcastCapacity(recipients, text);
         this.quota?.reserveMessages(recipients.length);
@@ -388,6 +404,10 @@ export class WorkflowAgentTeam {
                 count++;
             }
             return count;
+        }
+        catch (error) {
+            this.quota?.releaseMessages?.(recipients.length - count);
+            throw error;
         }
         finally {
             this.quotaSuppressed = false;

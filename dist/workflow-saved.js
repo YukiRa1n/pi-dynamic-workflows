@@ -64,6 +64,19 @@ export function createWorkflowStorage(cwd, fsOverride) {
         if (!data || typeof data !== "object" || !isSafeSavedWorkflowName(data.name ?? "")) {
             return null;
         }
+        // A parseable but schema-incomplete record (hand-edited, or written by an
+        // older/incompatible writer) must fail closed at this boundary. Otherwise
+        // a missing/non-string `script` surfaces as a property TypeError deep
+        // inside the workflow tool or slash-command handler instead of "no such
+        // saved workflow".
+        if (typeof data.script !== "string" || data.script.trim().length === 0)
+            return null;
+        if (data.description !== undefined && typeof data.description !== "string")
+            return null;
+        if (data.parameters !== undefined &&
+            (data.parameters === null || typeof data.parameters !== "object" || Array.isArray(data.parameters))) {
+            return null;
+        }
         return {
             ...data,
             location,

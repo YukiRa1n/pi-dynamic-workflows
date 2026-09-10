@@ -41,6 +41,40 @@ test("Agent Team broadcast preflights all recipients and does not partially enqu
   assert.equal(team.readInbox(b).length, 0, "failed broadcast must not partially deliver");
 });
 
+test("Agent Team broadcast does not leak run-wide message reservations on rejection", () => {
+  let reserved = 0;
+  const quota = {
+    reserveMembers: () => {},
+    reserveTasks: () => {},
+    reserveMessages: (count: number) => {
+      reserved += count;
+    },
+    releaseMessages: (count: number) => {
+      reserved = Math.max(0, reserved - count);
+    },
+  };
+  const team = new WorkflowAgentTeam("team", "quota", 4, { quota });
+  const a = team.addMember("a");
+  const b = team.addMember("b");
+  const c = team.addMember("c");
+  assert.equal(reserved, 0);
+
+  // Bodies that send()/sendFromWorkflow() would reject must fail before the
+  // bulk reservation is taken, leaving the run-wide message budget untouched.
+  assert.throws(() => team.broadcast(a, "decision", "x".repeat(9_000)), /exceeds 8000/i);
+  assert.throws(() => team.broadcast(a, "decision", "   "), /empty/i);
+  assert.throws(() => team.broadcastFromWorkflow("y".repeat(100_001)), /too large/i);
+  assert.equal(reserved, 0, "rejected broadcasts must not retain run-wide message quota");
+
+  // A legitimate broadcast reserves one slot per recipient; consuming each
+  // inbox releases exactly that recipient's slot again.
+  assert.equal(team.broadcast(a, "decision", "usable"), 2);
+  assert.equal(reserved, 2);
+  team.readInbox(b);
+  team.readInbox(c);
+  assert.equal(reserved, 0, "reading an inbox releases its reserved messages");
+});
+
 test("Agent Team exposes only classified, targeted model-facing messages", async () => {
   const team = new WorkflowAgentTeam("team", "classified", 3, { maxMessages: 8 });
   const a = team.addMember("a");
