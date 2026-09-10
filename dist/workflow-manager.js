@@ -574,7 +574,10 @@ export class WorkflowManager extends EventEmitter {
         return execution;
     }
     assertPausedDurableCapacity() {
-        const durable = this.persistence.getResourceDiagnostics();
+        // Paused-only probe: stats just the paused records instead of every
+        // persisted run, which is the whole cost of the general diagnostics sweep
+        // and ran on every workflow start.
+        const durable = this.persistence.getPausedCapacity();
         if (durable.pausedRunCount >= this.maxPausedRunsOnDisk || durable.pausedRunBytes >= this.maxPausedBytesOnDisk) {
             throw new WorkflowError("Paused durable-run capacity is exhausted; explicitly prune old paused runs before starting more", WorkflowErrorCode.RESOURCE_LIMIT_EXCEEDED, { recoverable: false });
         }
@@ -2180,6 +2183,11 @@ export class WorkflowManager extends EventEmitter {
     getRun(runId) {
         assertSafeRunId(runId);
         return this.runs.get(runId);
+    }
+    /** Cheap per-event probe for UI watchers: is any owned run still running?
+     * Uses the persisted cache without deep-cloning (see run-persistence). */
+    hasRunningRun() {
+        return this.persistence.hasRunningRun(this.sessionId);
     }
     /** Fresh, bounded resource view for operators and regression tests. */
     getResourceDiagnostics() {

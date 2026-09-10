@@ -736,6 +736,31 @@ export function createRunPersistence(cwd, fsOverride, options) {
         }
         return true;
     };
+    /**
+     * Shared cached state list. Returns the RAW parsed states (never cloned) and
+     * is only for read-only probes such as list()'s clone source, hasRunningRun(),
+     * and getPausedCapacity(); list() is the sole caller that must clone before
+     * exposing states to callers that may mutate them.
+     */
+    const cachedStates = () => {
+        const now = Date.now();
+        // Never expose the parsed objects retained by listCache/fileStateCache.
+        // A shallow array copy still lets callers poison status, logs, agents, or
+        // other nested state indefinitely while the on-disk signature is stable.
+        if (listCache && now - listCacheAt < LIST_CACHE_TTL_MS) {
+            return listCache;
+        }
+        const computed = computeList();
+        const result = computed.states;
+        // Do not retain a process-lifetime copy of an arbitrarily large paused
+        // fleet or a parsed state set that exceeds the configured byte budget.
+        // The byte estimate uses native durable JSON file sizes, matching
+        // fileStateCache's accounting without serializing the whole result a
+        // second time just to decide whether it is cacheable.
+        listCache = result.length <= maxParsedCacheEntries && computed.bytes <= maxParsedCacheBytes ? result : undefined;
+        listCacheAt = now;
+        return result;
+    };
     const durableBytes = (runId) => {
         let bytes = 0;
         for (const path of candidateRunPaths(runId)) {
@@ -752,7 +777,7 @@ export function createRunPersistence(cwd, fsOverride, options) {
         return bytes;
     };
     const getResourceDiagnostics = () => {
-        const runs = computeList().states;
+        const runs = cachedStates();
         let persistedRunBytes = 0;
         let pausedRunBytes = 0;
         let terminalRunBytes = 0;
@@ -929,23 +954,23 @@ export function createRunPersistence(cwd, fsOverride, options) {
             return null;
         },
         list() {
-            const now = Date.now();
-            // Never expose the parsed objects retained by listCache/fileStateCache.
-            // A shallow array copy still lets callers poison status, logs, agents, or
-            // other nested state indefinitely while the on-disk signature is stable.
-            if (listCache && now - listCacheAt < LIST_CACHE_TTL_MS) {
-                return cloneRunStates(listCache);
+            return cloneRunStates(cachedStates());
+        },
+        hasRunningRun(sessionId) {
+            // Same source and filter as list(), minus the deep clone the panel's
+            // per-event active-run probe used to trigger on every manager event.
+            return cachedStates().some((run) => run.status === "running" && (sessionId === undefined || run.sessionId === sessionId));
+        },
+        getPausedCapacity() {
+            let pausedRunCount = 0;
+            let pausedRunBytes = 0;
+            for (const run of cachedStates()) {
+                if (run.status !== "paused")
+                    continue;
+                pausedRunCount++;
+                pausedRunBytes += durableBytes(run.runId);
             }
-            const computed = computeList();
-            const result = computed.states;
-            // Do not retain a process-lifetime copy of an arbitrarily large paused
-            // fleet or a parsed state set that exceeds the configured byte budget.
-            // The byte estimate uses native durable JSON file sizes, matching
-            // fileStateCache's accounting without serializing the whole result a
-            // second time just to decide whether it is cacheable.
-            listCache = result.length <= maxParsedCacheEntries && computed.bytes <= maxParsedCacheBytes ? result : undefined;
-            listCacheAt = now;
-            return cloneRunStates(result);
+            return { pausedRunCount, pausedRunBytes };
         },
         delete(runId, expectedRevision, lease) {
             return deleteRun(runId, expectedRevision, lease);

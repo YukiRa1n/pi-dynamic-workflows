@@ -676,6 +676,9 @@ export declare class WorkflowManager extends EventEmitter {
      * Get status of a specific run.
      */
     getRun(runId: string): ManagedRun | undefined;
+    /** Cheap per-event probe for UI watchers: is any owned run still running?
+     * Uses the persisted cache without deep-cloning (see run-persistence). */
+    hasRunningRun(): boolean;
     /** Fresh, bounded resource view for operators and regression tests. */
     getResourceDiagnostics(): ResourceDiagnostics & {
         inMemoryRuns: number;

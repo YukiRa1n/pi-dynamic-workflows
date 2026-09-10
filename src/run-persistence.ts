@@ -246,6 +246,18 @@ export interface RunPersistence {
   load(runId: string): PersistedRunState | null;
   /** List all persisted runs. */
   list(): PersistedRunState[];
+  /**
+   * Cheap session-scoped "is any run currently running" probe. Reads the same
+   * cached state list as list() but never deep-clones it, so a UI watcher can
+   * gate periodic repaints on it without paying a full clone per event.
+   */
+  hasRunningRun(sessionId?: string): boolean;
+  /**
+   * Cheap paused-only capacity probe for the run-start admission path. Unlike
+   * getResourceDiagnostics() it stats only paused records instead of every
+   * persisted run, which is all the paused-capacity gate actually needs.
+   */
+  getPausedCapacity(): { pausedRunCount: number; pausedRunBytes: number };
   /** Delete a persisted run, optionally fenced by its current revision. */
   delete(runId: string, expectedRevision?: number, lease?: RunLease): boolean;
   /**
@@ -1012,6 +1024,32 @@ export function createRunPersistence(
     return true;
   };
 
+  /**
+   * Shared cached state list. Returns the RAW parsed states (never cloned) and
+   * is only for read-only probes such as list()'s clone source, hasRunningRun(),
+   * and getPausedCapacity(); list() is the sole caller that must clone before
+   * exposing states to callers that may mutate them.
+   */
+  const cachedStates = (): PersistedRunState[] => {
+    const now = Date.now();
+    // Never expose the parsed objects retained by listCache/fileStateCache.
+    // A shallow array copy still lets callers poison status, logs, agents, or
+    // other nested state indefinitely while the on-disk signature is stable.
+    if (listCache && now - listCacheAt < LIST_CACHE_TTL_MS) {
+      return listCache;
+    }
+    const computed = computeList();
+    const result = computed.states;
+    // Do not retain a process-lifetime copy of an arbitrarily large paused
+    // fleet or a parsed state set that exceeds the configured byte budget.
+    // The byte estimate uses native durable JSON file sizes, matching
+    // fileStateCache's accounting without serializing the whole result a
+    // second time just to decide whether it is cacheable.
+    listCache = result.length <= maxParsedCacheEntries && computed.bytes <= maxParsedCacheBytes ? result : undefined;
+    listCacheAt = now;
+    return result;
+  };
+
   const durableBytes = (runId: string): number => {
     let bytes = 0;
     for (const path of candidateRunPaths(runId)) {
@@ -1028,7 +1066,7 @@ export function createRunPersistence(
   };
 
   const getResourceDiagnostics = (): DurableResourceDiagnostics => {
-    const runs = computeList().states;
+    const runs = cachedStates();
     let persistedRunBytes = 0;
     let pausedRunBytes = 0;
     let terminalRunBytes = 0;
@@ -1197,23 +1235,26 @@ export function createRunPersistence(
     },
 
     list(): PersistedRunState[] {
-      const now = Date.now();
-      // Never expose the parsed objects retained by listCache/fileStateCache.
-      // A shallow array copy still lets callers poison status, logs, agents, or
-      // other nested state indefinitely while the on-disk signature is stable.
-      if (listCache && now - listCacheAt < LIST_CACHE_TTL_MS) {
-        return cloneRunStates(listCache);
+      return cloneRunStates(cachedStates());
+    },
+
+    hasRunningRun(sessionId?: string): boolean {
+      // Same source and filter as list(), minus the deep clone the panel's
+      // per-event active-run probe used to trigger on every manager event.
+      return cachedStates().some(
+        (run) => run.status === "running" && (sessionId === undefined || run.sessionId === sessionId),
+      );
+    },
+
+    getPausedCapacity(): { pausedRunCount: number; pausedRunBytes: number } {
+      let pausedRunCount = 0;
+      let pausedRunBytes = 0;
+      for (const run of cachedStates()) {
+        if (run.status !== "paused") continue;
+        pausedRunCount++;
+        pausedRunBytes += durableBytes(run.runId);
       }
-      const computed = computeList();
-      const result = computed.states;
-      // Do not retain a process-lifetime copy of an arbitrarily large paused
-      // fleet or a parsed state set that exceeds the configured byte budget.
-      // The byte estimate uses native durable JSON file sizes, matching
-      // fileStateCache's accounting without serializing the whole result a
-      // second time just to decide whether it is cacheable.
-      listCache = result.length <= maxParsedCacheEntries && computed.bytes <= maxParsedCacheBytes ? result : undefined;
-      listCacheAt = now;
-      return cloneRunStates(result);
+      return { pausedRunCount, pausedRunBytes };
     },
 
     delete(runId: string, expectedRevision?: number, lease?: RunLease): boolean {

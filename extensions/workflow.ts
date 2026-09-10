@@ -43,6 +43,7 @@ import {
   UsageLimitScheduler,
   type WorkflowDeliveryPayload,
   WorkflowManager,
+  type WorkflowSettings,
 } from "../src/index.js";
 import { truncateUtf8 } from "../src/safe-serialize.js";
 import { redactForModel, sanitizeForTerminal } from "../src/sanitize.js";
@@ -772,12 +773,30 @@ function hasCurrentWorkflowTransportTracking(bridge: WorkflowBridge, deliveryId:
   );
 }
 
-function hasWorkflowOutboxRecord(bridge: WorkflowBridge, deliveryId: string): boolean {
+/**
+ * ~1s TTL settings memo for the per-completion delivery path. Each read parses
+ * the global AND project settings files synchronously, and the path read them
+ * once in onAgentMessage and again in deliverAgentReport — i.e. per completed
+ * subagent. A fan-out of hundreds therefore paid hundreds of synchronous file
+ * reads just to decide whether streaming is enabled. The TTL matches the
+ * progress panel's own settings cache, so a settings change still takes effect
+ * within a second. Scoped per manager so a reload/new session re-reads, and
+ * deliberately NOT applied inside loadWorkflowSettings (its callers include
+ * tests that write a file and immediately expect the new value).
+ */
+const deliverySettingsCache = new WeakMap<WorkflowManager, { at: number; value: WorkflowSettings }>();
+function deliverySettings(manager: WorkflowManager): WorkflowSettings {
+  const now = Date.now();
+  const cached = deliverySettingsCache.get(manager);
+  if (cached && now - cached.at < 1_000) return cached.value;
+  let value: WorkflowSettings;
   try {
-    return bridge.manager.listPendingDeliveries().some((record) => record.deliveryId === deliveryId);
+    value = loadWorkflowSettings({ cwd: manager.getCwd() });
   } catch {
-    return false;
+    value = {};
   }
+  deliverySettingsCache.set(manager, { at: now, value });
+  return value;
 }
 
 type WorkflowWakeContext = Pick<ExtensionContext, "isIdle" | "hasPendingMessages">;
@@ -1652,10 +1671,7 @@ export function deliveryFromOutboxRecord(
   let recovered: ReturnType<ReturnType<WorkflowManager["getPersistence"]>["load"]> | undefined;
   if (recoverDetails) {
     try {
-      recoveryBudget = Math.min(
-        24_000,
-        loadWorkflowSettings({ cwd: manager.getCwd() }).deliveredResultMaxChars ?? recoveryBudget,
-      );
+      recoveryBudget = Math.min(24_000, deliverySettings(manager).deliveredResultMaxChars ?? recoveryBudget);
     } catch {
       // Presentation configuration is optional for retained/embedded managers.
     }
@@ -1668,6 +1684,15 @@ export function deliveryFromOutboxRecord(
   const outcome = recoverDetails ? (live?.result?.status ?? recovered?.outcome) : undefined;
   const result = recoverDetails ? (live?.result ? live.result.result : recovered?.result) : undefined;
   const failure = recoverDetails ? (live?.error?.message ?? recovered?.failure?.message) : undefined;
+  // Redact just the run-record path (home prefix -> ~) while leaving the rest
+  // of the summary intact. Applying redactForModel() to the whole content would
+  // truncate a long recovery summary to its default byte budget.
+  let runRecordPath = `${record.runId}.json`;
+  try {
+    runRecordPath = redactForModel(`${manager.getPersistence().getRunsDir()}/${record.runId}.json`, 4_096);
+  } catch {
+    // Fall back to the bare filename when the runs dir is unavailable.
+  }
   const recoverySummary =
     recoverDetails && (recovered || live)
       ? [
@@ -1683,7 +1708,7 @@ export function deliveryFromOutboxRecord(
                 summarizeWorkflowResult(result, recoveryBudget),
               ]
             : []),
-          `Full result and subagent reports: ${manager.getPersistence().getRunsDir()}/${record.runId}.json`,
+          `Full result and subagent reports: ${runRecordPath}`,
         ].join("\n\n")
       : undefined;
   const content =
@@ -1691,8 +1716,8 @@ export function deliveryFromOutboxRecord(
     recoverySummary ??
     (live
       ? live.status === "completed"
-        ? `✓ Background workflow "${record.workflowName}" finished.\n\n↳ Full result and subagent reports: ${manager.getPersistence().getRunsDir()}/${record.runId}.json`
-        : `✗ Background workflow ${record.runId} ${record.runStatus}.\n\n↳ Full result and subagent reports: ${manager.getPersistence().getRunsDir()}/${record.runId}.json`
+        ? `✓ Background workflow "${record.workflowName}" finished.\n\n↳ Full result and subagent reports: ${runRecordPath}`
+        : `✗ Background workflow ${record.runId} ${record.runStatus}.\n\n↳ Full result and subagent reports: ${runRecordPath}`
       : `Background workflow ${record.runId} ${record.runStatus}; inspect the durable run record for the complete result.`);
   const terminal = record.kind === "terminal";
   const agent = record.kind === "agent";
@@ -2190,7 +2215,7 @@ function deliverWorkflowResult(manager: WorkflowManager, payload: WorkflowDelive
 }
 
 function deliverAgentReport(bridge: WorkflowBridge, report: WorkflowAgentReport): void {
-  const settings = loadWorkflowSettings({ cwd: bridge.manager.getCwd() });
+  const settings = deliverySettings(bridge.manager);
   // Automatic main-session delivery is the default. Setting this explicitly
   // to false keeps the legacy on-demand get_workflow_output path available.
   if (settings.streamAgentResults === false) return;
@@ -2449,7 +2474,7 @@ function bindDeliverBridge(manager: WorkflowManager, pi: ExtensionAPI): void {
     // this setting is intentionally scoped to the extension's background path.
     const managed = manager.getRun(event.runId);
     if (managed && managed.background !== true) return;
-    if (loadWorkflowSettings({ cwd: manager.getCwd() }).streamAgentResults === false) return;
+    if (deliverySettings(manager).streamAgentResults === false) return;
     const callId = event.callId ?? event.id;
     deliverAgentReport(bridge, {
       runId: event.runId,
@@ -2926,6 +2951,28 @@ function installWorkflowToolResultContextBridge(pi: ExtensionAPI, getManager: ()
         // A replay failure must never corrupt the provider context projection.
       }
     }
+    // One durable-outbox snapshot per context event for the message loop below.
+    // The loop previously called listPendingDeliveries() (a full scan of every
+    // persisted run) once per custom delivery message, and again to resolve its
+    // record, i.e. O(messages x runs) on the synchronous provider-context path.
+    // Built lazily on first use, so it reflects the suppressed-terminal cleanup
+    // above (which discards records) and a bridge-less event pays nothing. No
+    // code in the loop adds or removes outbox records (persistDeliveryPhase only
+    // transitions an existing record), so a single snapshot stays valid.
+    let outboxSnapshotById: Map<string, PendingWorkflowDeliveryRecord> | undefined;
+    const outboxRecordById = (deliveryId: string): PendingWorkflowDeliveryRecord | undefined => {
+      if (!bridge) return undefined;
+      if (!outboxSnapshotById) {
+        try {
+          outboxSnapshotById = new Map(
+            bridge.manager.listPendingDeliveries().map((record) => [record.deliveryId, record]),
+          );
+        } catch {
+          outboxSnapshotById = new Map();
+        }
+      }
+      return outboxSnapshotById.get(deliveryId);
+    };
     const output: any[] = [];
     const sourceMessages = rotateWorkflowHistoryMessages(
       event.messages as any[],
@@ -3192,7 +3239,7 @@ function installWorkflowToolResultContextBridge(pi: ExtensionAPI, getManager: ()
       const hasRecoverableTransport = Boolean(
         details.deliveryId &&
           bridge &&
-          (hasWorkflowOutboxRecord(bridge, details.deliveryId) ||
+          (outboxRecordById(details.deliveryId) !== undefined ||
             hasCurrentWorkflowTransportTracking(bridge, details.deliveryId)),
       );
       if (
@@ -3235,9 +3282,7 @@ function installWorkflowToolResultContextBridge(pi: ExtensionAPI, getManager: ()
           // generation. Re-admit that same entry; never send a duplicate. A
           // history entry without that outbox record is intentionally passive:
           // it is body projection only, not a new acknowledgement candidate.
-          const record = bridge.manager
-            .listPendingDeliveries()
-            .find((candidate) => candidate.deliveryId === details.deliveryId);
+          const record = outboxRecordById(details.deliveryId);
           if (
             record &&
             persistDeliveryPhase(bridge.manager, record.runId, details.deliveryId, generation, "submitted")

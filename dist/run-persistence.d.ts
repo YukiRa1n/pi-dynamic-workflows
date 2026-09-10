@@ -234,6 +234,21 @@ export interface RunPersistence {
     load(runId: string): PersistedRunState | null;
     /** List all persisted runs. */
     list(): PersistedRunState[];
+    /**
+     * Cheap session-scoped "is any run currently running" probe. Reads the same
+     * cached state list as list() but never deep-clones it, so a UI watcher can
+     * gate periodic repaints on it without paying a full clone per event.
+     */
+    hasRunningRun(sessionId?: string): boolean;
+    /**
+     * Cheap paused-only capacity probe for the run-start admission path. Unlike
+     * getResourceDiagnostics() it stats only paused records instead of every
+     * persisted run, which is all the paused-capacity gate actually needs.
+     */
+    getPausedCapacity(): {
+        pausedRunCount: number;
+        pausedRunBytes: number;
+    };
     /** Delete a persisted run, optionally fenced by its current revision. */
     delete(runId: string, expectedRevision?: number, lease?: RunLease): boolean;
     /**

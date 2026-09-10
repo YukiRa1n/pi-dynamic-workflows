@@ -890,8 +890,14 @@ export function installTaskPanel(_pi, manager, ui, opts = {}) {
         return cached;
     };
     // Live shimmer and detailed token sampling need periodic ticks only while
-    // providers are actually working. Paused panels stay event-driven.
-    const hasActiveRun = () => manager.listRuns().some((r) => r.status === "running");
+    // providers are actually working. Paused panels stay event-driven. Prefer the
+    // manager's cheap no-clone probe (falls back for duck-typed embedders/tests
+    // that only provide listRuns).
+    const hasActiveRun = () => {
+        if (typeof manager.hasRunningRun === "function")
+            return manager.hasRunningRun();
+        return manager.listRuns().some((r) => r.status === "running");
+    };
     ui.setWidget("workflow-tasks", (tui, theme) => {
         // Coalesced repaint scheduler: manager events only set the dirty flag;
         // frames are composed at the shimmer cadence with OMP-style adaptive

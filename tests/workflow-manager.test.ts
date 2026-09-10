@@ -225,6 +225,52 @@ test("queued steering bytes are accounted per run and released on take", async (
   }
 });
 
+test("hasRunningRun mirrors the session-filtered running view without cloning", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-wf-has-running-"));
+  const deferred = deferredAgent();
+  try {
+    const manager = new WorkflowManager({ cwd, agent: deferred.runner, sessionId: "session-a" });
+    const run = manager.startInBackground(oneAgentScript);
+    assert.equal(manager.hasRunningRun(), true);
+    assert.equal(
+      manager.listRuns().some((r) => r.status === "running"),
+      true,
+      "the cheap probe agrees with the full listing",
+    );
+
+    const other = new WorkflowManager({ cwd, agent: fakeAgent(), sessionId: "session-b" });
+    assert.equal(other.listRuns().some((r) => r.status === "running"), false);
+    assert.equal(other.hasRunningRun(), false, "the probe applies listRuns()'s session filter");
+
+    deferred.resolve("done");
+    await run.promise.catch(() => {});
+    assert.equal(manager.hasRunningRun(), false, "a settled run is no longer reported active");
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("getPausedCapacity matches the full diagnostics paused totals", async () => {
+  const cwd = mkdtempSync(join(tmpdir(), "pi-wf-paused-capacity-"));
+  const deferred = deferredAgent();
+  try {
+    const manager = new WorkflowManager({ cwd, agent: deferred.runner });
+    const run = manager.startInBackground(oneAgentScript);
+    assert.equal(manager.pause(run.runId), true);
+    await manager.getRun(run.runId)?.execution?.catch(() => {});
+
+    const persistence = manager.getPersistence();
+    const capacity = persistence.getPausedCapacity();
+    const diagnostics = persistence.getResourceDiagnostics();
+    assert.equal(capacity.pausedRunCount, 1);
+    assert.equal(capacity.pausedRunCount, diagnostics.pausedRunCount);
+    assert.equal(capacity.pausedRunBytes, diagnostics.pausedRunBytes);
+    assert.ok(capacity.pausedRunBytes > 0, "the paused record contributes durable bytes");
+  } finally {
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 test("deleteRun releases a fallback lease when persistence.delete throws", async () => {
   const cwd = mkdtempSync(join(tmpdir(), "pi-wf-delete-lease-"));
   try {
