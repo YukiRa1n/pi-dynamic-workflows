@@ -25,6 +25,8 @@ The extension uses the stock Pi extension API and keeps compact start, active-li
 
 Partial results are labeled as partial in the output tool and automatic completion message, so the parent can preserve useful findings and disclose gaps. Run-level failure diagnostics and completion quality are saved with the run; cold-start delivery includes the saved result summary instead of only a status notice. Failed output retrieval also includes any best-effort result. Long Chinese/emoji reports retain their actual final conclusion when projected to the output budget. Cancelling an output wait leaves unreturned agent results unread.
 
+New subagent reports carry independent review IDs and a dynamic provider-only priority ledger. User follow-ups always outrank workflow reports; failures, blockers, and critical findings rank ahead of decisions/findings, while routine reports remain FIFO. Actionable multi-step reports ask the model to maintain one Todo per review ID. A report is semantically reviewed only after the final response emits its request-scoped hidden receipt; generic progress, unrelated answers, tool-use text, and transport acknowledgement cannot retire it.
+
 In the navigator, `u` resumes the selected paused/failed run. Repeated presses while resume is pending submit only once. The footer shows controls appropriate to the selected state. `r` starts a new run from a terminal run's saved script and arguments while preserving its limits and toolset; it refuses running/paused runs to avoid accidental duplication. Use `u` to continue saved progress.
 
 ### Interjecting while work continues

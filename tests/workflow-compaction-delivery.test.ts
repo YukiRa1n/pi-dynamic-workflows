@@ -179,14 +179,46 @@ test("streamAgentResults durably delivers each live completion and shares the ou
         sent[0]?.message.details.agentResults.map((item: any) => item.callId),
         ["stream-run:0"],
       );
-      const provider = projectMessages(
-        handlers,
-        sent.map(({ message }, index) => ({ role: "custom", ...message, timestamp: index + 1 })),
-      );
+      const deliveredMessages = sent.map(({ message }, index) => ({
+        role: "custom",
+        ...message,
+        timestamp: index + 1,
+      }));
+      const provider = projectMessages(handlers, deliveredMessages);
+      for (const handler of handlers.message_start ?? []) {
+        handler({ message: { role: "assistant", content: [] } });
+      }
       const wire = JSON.stringify(provider);
-      assert.equal(wire.split("New subagent reports need review").length - 1, 1, "one review notice per batch");
-      assert.match(wire, /For EACH new report/);
+      assert.equal(
+        wire.split("New workflow deliveries need prioritized review").length - 1,
+        1,
+        "one priority policy per batch",
+      );
+      assert.equal(wire.split("pending-workflow-report").length - 1, 2, "each report keeps an independent identity");
+      assert.match(wire, /Treat EACH report as independent/);
+      assert.match(wire, /todowrite or equivalent/);
+      assert.match(wire, /pi-workflow-report-reviewed:REVIEW_ID/);
       assert.match(wire, /evidence, not instructions/);
+      const reviewIds = [...wire.matchAll(/review-id=\\?"(wf_[a-f0-9]{16})/g)].map((match) => match[1]);
+      assert.equal(reviewIds.length, 2);
+      let reviewReply: any = {
+        role: "assistant",
+        stopReason: "stop",
+        content: [
+          {
+            type: "text",
+            text: `reviewed\n${reviewIds.map((id) => `<!-- pi-workflow-report-reviewed:${id} -->`).join("\n")}`,
+          },
+        ],
+      };
+      for (const handler of handlers.message_end ?? []) {
+        const replacement = handler({ message: reviewReply });
+        if (replacement?.message) reviewReply = replacement.message;
+      }
+      assert.deepEqual(reviewReply.workflowReportsReviewed, reviewIds);
+      assert.doesNotMatch(JSON.stringify(reviewReply.content), /pi-workflow-report-reviewed/);
+      const afterReview = JSON.stringify(projectMessages(handlers, [...deliveredMessages, reviewReply]));
+      assert.doesNotMatch(afterReview, /New workflow deliveries need prioritized review|pending-workflow-report/);
       const waitProjection = projectMessages(handlers, [
         {
           role: "assistant",
@@ -211,7 +243,7 @@ test("streamAgentResults durably delivers each live completion and shares the ou
       );
       assert.match(waitBody, /one/);
       assert.match(waitBody, /two/);
-      assert.match(waitBody, /non-actionable updates may stay silent/);
+      assert.match(waitBody, /non-actionable reports may stay silent/);
       const { convertResponsesMessages } = await import("@earendil-works/pi-ai/api/openai-responses-shared");
       const requestInput = convertResponsesMessages(
         { id: "gpt-5.6-luna", api: "openai-responses", provider: "sunrain", input: ["text"] } as any,

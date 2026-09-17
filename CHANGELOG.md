@@ -7,6 +7,7 @@ All notable changes to `@quintinshaw/pi-dynamic-workflows` are documented here.
 ### Changed
 
 - Extract interactive follow-up prioritization from `extensions/workflow.ts` into the independently loaded `extensions/follow-up-priority.ts`. Pending steering is ranked newest-first, ordinary follow-ups remain FIFO, multi-step/multi-item work receives Todo guidance, and only explicit per-ID completion receipts retire an item.
+- Dynamically prioritize independently identified subagent reports below user follow-ups, with failures/blockers first and routine reports FIFO. Actionable reports receive Todo guidance, and explicit request-scoped review receipts replace the previous generic-response heuristic.
 - Preserve completion quality and run-level failure diagnostics in durable state; recovered terminal notifications and output reads expose useful results with explicit partial/failure context.
 - Preserve the actual UTF-8 tail of long Chinese and emoji results. Cancelling an output wait no longer consumes unread agent results.
 - Add `u` to resume the selected navigator run, coalesce repeated resume requests, show state-specific controls, and preserve limits/toolset on restart. Active or paused runs cannot be accidentally duplicated by restart.
