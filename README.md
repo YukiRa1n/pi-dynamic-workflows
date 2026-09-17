@@ -29,17 +29,11 @@ New subagent reports carry independent review IDs and a dynamic provider-only pr
 
 In the navigator, `u` resumes the selected paused/failed run. Repeated presses while resume is pending submit only once. The footer shows controls appropriate to the selected state. `r` starts a new run from a terminal run's saved script and arguments while preserving its limits and toolset; it refuses running/paused runs to avoid accidental duplication. Use `u` to continue saved progress.
 
-### Interjecting while work continues
-
-A standalone `follow-up-priority` extension, loaded separately from the workflow runtime, tracks interactive/RPC steering and follow-up messages with durable identities. Steering items dynamically rank newest-first ahead of background work; ordinary follow-ups retain Pi's FIFO behavior. A new item changes execution priority but does not erase an older unfinished item. Provider-only notices label every pending item independently and prohibit treating later text as the explanation of an earlier image, file, or question unless the user explicitly links them.
-
-When multiple items are pending, or one item needs multiple tool steps, the notice asks the model to maintain one Todo entry per follow-up ID with its current priority. Completion is explicit: the model emits a hidden per-ID receipt only after fully resolving that item; the extension strips the marker and persists the acknowledgement with the assistant reply. Ordinary prose, tool-use progress, provider errors, truncation, and aborts cannot acknowledge an item. Reloading the extension or pruning provider context therefore cannot re-arm completed work or silently retire unfinished work. See [the follow-up priority lifecycle](docs/interactive-steering.md) for recovery and integration details.
-
 ## Requirements
 
 - Node.js 22.19.0 or newer is recommended (matching the installed Pi's `engines` requirement).
 - [`@earendil-works/pi-coding-agent`](https://www.npmjs.com/package/@earendil-works/pi-coding-agent) version `0.84.2` or newer.
-- The extension runtime uses Pi's public extension API. Pi 0.84.x and 0.85.x require the mechanical compatibility patch below for lossless native messages submitted during compaction; that host defect occurs before extension input hooks run.
+- The extension runtime uses Pi's public extension API.
 - At least one authenticated model/provider configured in Pi.
 - Git is optional, but required when a workflow requests `isolation: "worktree"`.
 
@@ -68,24 +62,6 @@ To test the package for one Pi process without keeping it installed:
 ```bash
 pi -e git:github.com/YukiRa1n/pi-dynamic-workflows
 ```
-
-### Lossless compaction-queue compatibility patch
-
-Pi 0.84.x and 0.85.x can accept a compaction-queued prompt, later treat the whole agent run as a failed send, call `session.clearQueue()`, and restore an obsolete full snapshot. That can duplicate the accepted prompt and erase unrelated steering or follow-up input queued in the meantime. An extension cannot intercept this admission boundary because Pi stores the input before its normal `input` and `message_end` hooks run.
-
-From this repository, inspect the globally installed Pi host:
-
-```bash
-npm run check:pi-compaction
-```
-
-Apply the bounded compatibility patch:
-
-```bash
-npm run patch:pi-compaction
-```
-
-The patch verifies the package name, supported version, prompt-preflight API, vulnerable method shape, and exactly one bundled CLI target before writing anything. It patches both `dist/modes/interactive/interactive-mode.js` and the chunk used by the real `pi` executable, while retaining adjacent `.compaction-queue-original*` backups; a changed host receives a content-addressed backup instead of overwriting or reusing a stale one. It is idempotent and refuses unknown host shapes. A Pi upgrade can replace it; rerun the check after every upgrade. Fully restart Pi after applying it—`/reload` cannot replace already loaded host code.
 
 ### Project-level installation
 
@@ -143,7 +119,7 @@ The local fork records workflow projection, final prepared provider payload, res
 
 Each JSONL row carries a session ID, logger instance, request number, and stage. For `provider-request-prepared`, the `text` field contains the serialized request after all `before_provider_request` handlers. Parse that field as JSON when `truncated` is false. A projection record alone is not proof of final inclusion, and HTTP success is not proof that the model evaluated every report. Providers that bypass Pi's payload callback have no final-payload evidence and are reported as unobserved. Each session keeps one 16 MiB log and one rotation; payload text is capped at 8 MiB with an explicit truncation flag.
 
-Final tracing requires the independent local Pi host patch in `scripts/patch-pi-request-trace.mjs`. Pass the installed `dist/core/extensions/runner.js` and the bundled chunk containing `emitBeforeProviderRequest` as explicit paths. The script retains adjacent `.request-trace-original` backups and rejects unknown method shapes. This tracing patch is separate from the lossless compaction-queue patch above. Package upgrades may replace either patch. Restart Pi after applying one; `/reload` alone cannot reload the bundled host. Wait for active workflows to finish before restarting.
+Final tracing requires the independent local Pi host patch in `scripts/patch-pi-request-trace.mjs`. Pass the installed `dist/core/extensions/runner.js` and the bundled chunk containing `emitBeforeProviderRequest` as explicit paths. The script retains adjacent `.request-trace-original` backups and rejects unknown method shapes. Package upgrades may replace the patch. Restart Pi after applying it; `/reload` alone cannot reload the bundled host. Wait for active workflows to finish before restarting.
 
 ### 2. Configure model tiers
 

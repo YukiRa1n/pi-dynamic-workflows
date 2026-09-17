@@ -6,8 +6,7 @@ All notable changes to `@quintinshaw/pi-dynamic-workflows` are documented here.
 
 ### Changed
 
-- Add a fail-closed Pi 0.84.x/0.85.x compatibility patch for lossless compaction-queue rollback. The patched host treats prompt preflight acceptance as the dispatch commit point, restores only the undispatched suffix ahead of concurrent input, and never clears queues it does not own. Both the importable host and the real bundled CLI are patched and backed up.
-- Extract interactive follow-up prioritization from `extensions/workflow.ts` into the independently loaded `extensions/follow-up-priority.ts`. Pending steering is ranked newest-first, ordinary follow-ups remain FIFO, multi-step/multi-item work receives Todo guidance, and only explicit per-ID completion receipts retire an item.
+- Move generic interactive follow-up prioritization and its Pi compaction-queue compatibility patch to the independent [`pi-follow-up-priority`](https://github.com/YukiRa1n/pi-follow-up-priority) package.
 - Dynamically prioritize independently identified subagent reports below user follow-ups, with failures/blockers first and routine reports FIFO. Actionable reports receive Todo guidance, and explicit request-scoped review receipts replace the previous generic-response heuristic.
 - Preserve completion quality and run-level failure diagnostics in durable state; recovered terminal notifications and output reads expose useful results with explicit partial/failure context.
 - Preserve the actual UTF-8 tail of long Chinese and emoji results. Cancelling an output wait no longer consumes unread agent results.
