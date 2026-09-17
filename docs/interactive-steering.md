@@ -11,7 +11,7 @@ The extension observes interactive/RPC input submitted while Pi is streaming:
 
 | State | Transition | Provider behavior |
 | --- | --- | --- |
-| Queued | Pi accepts steering or follow-up input | Pi owns the real user queue; the footer shows the queue count. |
+| Queued | Pi accepts steering or follow-up input | Pi owns the real user queue; the footer shows the queue count. Affected 0.84.x/0.85.x hosts need the compatibility patch below before this ownership is lossless across compaction rollback. |
 | Pending | Pi finalizes the user message | A UUID and delivery kind are persisted beside unchanged user content. |
 | In request | Context projection ranks unresolved IDs | Provider-only notices label each item independently and publish the current priority ledger. |
 | Completed | A final `stop` response emits that ID's hidden completion receipt | The marker is stripped and the assistant message persists the acknowledged ID. |
@@ -33,6 +33,12 @@ Priority projection is read-only. User text and attachments are never rewritten 
 Legacy `workflowSteeringId` and `workflowSteeringAcknowledged` fields remain readable. New entries use the neutral `followUpPriorityId`, `followUpPriorityKind`, and `followUpPriorityAcknowledged` fields.
 
 The settled-boundary wake handles a real user message stranded after Pi's last queue poll. Its empty UI-only marker is removed before provider conversion. Explicit abort, compaction, prompt preflight, and session navigation fence that wake.
+
+### Host admission boundary
+
+Semantic receipts start only after Pi emits the finalized user message. During compaction, Pi 0.84.x/0.85.x first stores editor input in its private `compactionQueuedMessages` array, before extension `input` or `message_end` hooks can assign a follow-up ID. The affected host's rollback clears unrelated live queues and replaces the current compaction queue with an obsolete snapshot. No prompt projection or completion receipt can recover an item erased at that earlier boundary.
+
+Run `npm run patch:pi-compaction` from the repository to apply the fail-closed compatibility patch to the global Pi installation. It changes the dispatch commit point to prompt preflight acceptance, restores only the failed and undispatched suffix, prepends that suffix to concurrent compaction input, and never calls `session.clearQueue()` from this local rollback. Fully restart Pi afterwards.
 
 ## Verification and activation
 
