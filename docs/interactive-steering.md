@@ -1,38 +1,47 @@
-# Interjection priority lifecycle
+# Follow-up priority lifecycle
 
-User steering interrupts the conversation at Pi's next message boundary. It does not cancel a provider request or stop a background workflow. Follow-up input retains Pi's after-turn queue semantics.
+`extensions/follow-up-priority.ts` is a standalone Pi extension. The workflow runtime does not install or own it. The package manifest loads priority handling before `extensions/workflow.ts`, so its provider-context cleanup and receipts remain independent of workflow execution.
+
+The extension observes interactive/RPC input submitted while Pi is streaming:
+
+- Steering is an interruption. Pending steering items rank newest-first.
+- Follow-up input keeps Pi's after-turn semantics and FIFO ordering.
+- All pending user items rank ahead of unrelated background updates once Pi delivers them.
+- A newer item changes priority but never cancels an older unfinished item unless the user explicitly says to replace, cancel, or ignore it.
 
 | State | Transition | Provider behavior |
 | --- | --- | --- |
-| Queued | Interactive/RPC steering input is accepted | Pi owns the real user queue; the footer shows `User message queued`. |
-| Pending | Pi finalizes that user message | A UUID is persisted alongside its unchanged text. |
-| In request | Context projection selects the pending ID; the payload hook or assistant stream starts | A temporary notice asks the model to address the interjection before background updates. |
-| Acknowledged | That request finishes a `stop` or `toolUse` response with visible text | The assistant message records the request's IDs. The notice and footer priority end. |
+| Queued | Pi accepts steering or follow-up input | Pi owns the real user queue; the footer shows the queue count. |
+| Pending | Pi finalizes the user message | A UUID and delivery kind are persisted beside unchanged user content. |
+| In request | Context projection ranks unresolved IDs | Provider-only notices label each item independently and publish the current priority ledger. |
+| Completed | A final `stop` response emits that ID's hidden completion receipt | The marker is stripped and the assistant message persists the acknowledged ID. |
 
-An acknowledgement means that a visible response was emitted, not that a semantic evaluator proved the question fully answered. Thinking-only responses, tool-only notifications, errors, truncation, and aborts do not acknowledge input. A response cannot acknowledge another interjection that arrived after its request started. Repeating the same text creates a new identity.
+## Todo and completion contract
 
-Requirements remain in ordinary user history after acknowledgement. The notice asks the assistant to continue only unfinished work and to avoid repeating completed answers. Fresh user prompts retire the previous task's temporary priority. Multiple pending interjections are addressed together, with the latest correction taking precedence where they conflict.
+When more than one user item is pending, or one item requires multiple tool steps, the provider notice asks the model to use `todowrite` or an equivalent Todo tool. The model maintains one entry per follow-up ID, includes its current priority, preserves unfinished entries, and updates status as work progresses. A direct one-line answer does not need a ceremonial Todo item.
+
+Each pending message stays independent. Later text must not be treated as the description of an earlier image, file, or question unless the user explicitly links them. Before stopping, the model must answer each item or state its blocker and keep it pending.
+
+Unresolved follow-ups and required attachments must not be compacted, summarized away, or passed to `ctx_reduce`. They become eligible for context reduction only after their completion receipt is durable.
+
+Completion is explicit and per item. The model appends `<!-- pi-follow-up-done:ID -->` only after fully resolving that ID. The extension removes this hidden marker before display/persistence and records `followUpPriorityAcknowledged`. Ordinary visible prose, acknowledgements, plans, tool-use progress, errors, truncation, and aborts do not retire an item. A response can retire several IDs only by emitting one valid receipt for each.
 
 ## Recovery
 
-Priority projection is read-only. The receipt is persisted with the actual assistant reply through Pi's `message_end` replacement API. On reload or context pruning, the extension reads receipts from the active session branch, including entries omitted from the provider context. Navigating to a branch before a receipt restores that branch's unanswered input; acknowledgement does not leak between branches or sessions.
+Priority projection is read-only. User text and attachments are never rewritten in session history. On reload or context pruning, the extension rebuilds unresolved state from durable user identities and assistant receipts on the active branch. Navigating to a branch before a receipt restores that branch's unanswered item; acknowledgements do not leak between branches or sessions.
 
-Custom providers that omit `before_provider_request` associate their input IDs at the assistant's stream-start event. A context preview alone never acknowledges input. Legacy steering messages without UUIDs use a stable identity derived from their timestamp and content and infer completion from visible historical replies.
+Legacy `workflowSteeringId` and `workflowSteeringAcknowledged` fields remain readable. New entries use the neutral `followUpPriorityId`, `followUpPriorityKind`, and `followUpPriorityAcknowledged` fields.
 
-The existing settled-boundary wake handles a real user message stranded after Pi's last queue poll. Its empty UI-only marker is removed from provider context. Explicit abort, compaction, prompt preflight, and session navigation fence that wake.
+The settled-boundary wake handles a real user message stranded after Pi's last queue poll. Its empty UI-only marker is removed before provider conversion. Explicit abort, compaction, prompt preflight, and session navigation fence that wake.
 
 ## Verification and activation
 
-`tests/workflow-steering-continuity.test.ts` covers request ownership, repeated text, tool notifications, provider failure, context pruning, branch navigation, and reply acknowledgement. `tests/workflow-steering-session.test.ts` uses real `createAgentSession`, the actual Pi queue and session persistence, and a deterministic local faux provider. It covers an interjection followed by a tool call, a background notification, and extension recreation. These tests make no external model requests.
+`tests/workflow-steering-continuity.test.ts` covers dynamic ranking, Todo guidance, per-ID receipts, repeated text, failures, queue recovery, legacy fields, branch navigation, and hidden marker removal. `tests/workflow-steering-session.test.ts` uses real `createAgentSession`, Pi's actual queue/session persistence, and a deterministic local faux provider. It verifies that tool-use progress does not retire a follow-up and that only the final explicit receipt does.
 
-The local fix was also exercised through the installed Pi 0.85.0 bundled CLI in RPC mode, with the complete workflow extension, isolated settings/session storage, and an offline faux provider. Four provider requests verified the initial task, prioritized interjection, tool continuation after acknowledgement, and a later background notification without renewed priority.
-
-After updating this local checkout without changing the package version, exit and restart Pi once. `/reload` deliberately preserves an existing `WorkflowManager` of the same package version, including its old runtime methods. New processes load all corrected runtime and persistence code. Normal later reloads retain the new steering receipts.
-
-Checkpoint identity version 4 distinguishes omitted defaults from all legal JSON values. A journal created with an older checkpoint identity conservatively misses at that checkpoint on the first resume; downstream work follows the existing changed-prefix replay policy.
+Restart Pi once after updating a checkout that previously embedded this behavior in `extensions/workflow.ts`. Normal later `/reload` operations load both extension resources from the package manifest.
 
 ## Design references
 
 - [Pi agent loop](https://github.com/earendil-works/pi/blob/main/packages/agent/src/agent-loop.ts): steering is drained at response boundaries, with a separate follow-up queue.
-- [LangGraph interrupts](https://docs.langchain.com/oss/python/langgraph/interrupts): identify suspended work explicitly, persist state, and make replayed side effects idempotent. This extension uses reply receipts rather than restarting an interrupted graph.
-- [Anthropic context engineering](https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents): keep the active context focused. Priority instructions are temporary projections rather than permanent additions to user text or the system prompt.
+- [LangGraph interrupts](https://docs.langchain.com/oss/python/langgraph/interrupts): identify suspended work explicitly, persist state, and make replayed side effects idempotent.
+- [Anthropic context engineering](https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents): keep active context focused; priority instructions are temporary projections rather than permanent changes to user text.

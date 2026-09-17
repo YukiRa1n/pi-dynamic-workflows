@@ -71,6 +71,7 @@
   ],
   "pi": {
     "extensions": [
+      "extensions/follow-up-priority.ts",
       "extensions/workflow.ts"
     ],
     "skills": [

@@ -12,8 +12,23 @@ import {
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { installInteractiveSteeringContinuity } from "../extensions/workflow.js";
+import { installFollowUpPriority } from "../extensions/follow-up-priority.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
+
+function followUpIdFromContext(messages: any[]): string {
+  const text = messages
+    .flatMap((message) =>
+      typeof message.content === "string"
+        ? [message.content]
+        : Array.isArray(message.content)
+          ? message.content.filter((part: any) => part?.type === "text").map((part: any) => part.text)
+          : [],
+    )
+    .join("\n");
+  const match = text.match(/<pending-user-follow-up id="([^"]+)"/);
+  assert.ok(match, "provider context contains the active follow-up identity");
+  return match[1];
+}
 
 test("real Pi session retires steering after a visible reply across tools, notifications and reload", async () => {
   const root = mkdtempSync(join(tmpdir(), "pi-steering-session-"));
@@ -58,7 +73,7 @@ test("real Pi session retires steering after a visible reply across tools, notif
           noPromptTemplates: true,
           noThemes: true,
           noContextFiles: true,
-          extensionFactories: [installInteractiveSteeringContinuity],
+          extensionFactories: [installFollowUpPriority],
         });
         await loader.reload();
         const { session } = await createAgentSession({
@@ -105,21 +120,24 @@ test("real Pi session retires steering after a visible reply across tools, notif
           },
           (context) => {
             requests.push(JSON.stringify(context.messages));
-            return fauxAssistantMessage("Remaining check completed.");
+            const followUpId = followUpIdFromContext(context.messages);
+            return fauxAssistantMessage(`Remaining check completed.\n<!-- pi-follow-up-done:${followUpId} -->`);
           },
         ]);
         await session.prompt("Run the check.", { source: "rpc" });
         assert.equal(requests.length, 3);
-        assert.match(requests[1], /pending user interjection/);
-        assert.doesNotMatch(requests[2], /pending user interjection/);
+        assert.match(requests[1], /pending-user-follow-up/);
+        assert.match(requests[1], /todowrite or equivalent/);
+        assert.match(requests[2], /pending-user-follow-up/, "tool-use progress does not retire the follow-up");
         const history = manager
           .getBranch()
           .filter((entry) => entry.type === "message")
           .map((entry: any) => entry.message);
-        const steer = history.find((message: any) => message.steering === true);
-        const receipt = history.find((message: any) => Array.isArray(message.workflowSteeringAcknowledged));
-        assert.ok(steer?.workflowSteeringId, "the real input/message_end path persists its identity");
-        assert.deepEqual(receipt?.workflowSteeringAcknowledged, [steer.workflowSteeringId]);
+        const steer = history.find((message: any) => message.followUpPriorityKind === "steer");
+        const receipt = history.find((message: any) => Array.isArray(message.followUpPriorityAcknowledged));
+        assert.ok(steer?.followUpPriorityId, "the real input/message_end path persists its identity");
+        assert.deepEqual(receipt?.followUpPriorityAcknowledged, [steer.followUpPriorityId]);
+        assert.doesNotMatch(JSON.stringify(receipt?.content), /pi-follow-up-done/, "hidden receipts are stripped");
 
         session.dispose();
         session = await makeSession();
@@ -139,7 +157,7 @@ test("real Pi session retires steering after a visible reply across tools, notif
         );
         assert.doesNotMatch(
           requests.at(-1) ?? "",
-          /pending user interjection|workflowSteeringId|workflowSteeringAcknowledged/,
+          /pending-user-follow-up|followUpPriorityId|followUpPriorityAcknowledged|workflowSteeringId|workflowSteeringAcknowledged/,
         );
         assert.deepEqual(errors, []);
       } finally {

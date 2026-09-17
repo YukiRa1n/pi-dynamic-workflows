@@ -29,9 +29,9 @@ In the navigator, `u` resumes the selected paused/failed run. Repeated presses w
 
 ### Interjecting while work continues
 
-A message entered with Pi's steering mode takes temporary priority over background updates. The footer shows `User message queued`, then `Replying to user`. The assistant answers the question or applies the correction before continuing unfinished work. A successful response containing visible text ends this temporary priority and clears the footer status; the user's requirements remain part of the conversation. Tool-only notifications, failed responses, and Esc do not count as an answer. Follow-up mode keeps Pi's normal after-the-current-turn behavior.
+A standalone `follow-up-priority` extension, loaded separately from the workflow runtime, tracks interactive/RPC steering and follow-up messages with durable identities. Steering items dynamically rank newest-first ahead of background work; ordinary follow-ups retain Pi's FIFO behavior. A new item changes execution priority but does not erase an older unfinished item. Provider-only notices label every pending item independently and prohibit treating later text as the explanation of an earlier image, file, or question unless the user explicitly links them.
 
-Each interjection has a session-persisted identity and its reply records an acknowledgement. Reloading the extension or pruning the provider context cannot re-arm an acknowledged interjection. The wait tool also shows how to interject or cancel; Esc cancels that wait without stopping the background run. See [the steering lifecycle design](docs/interactive-steering.md) for recovery and integration details.
+When multiple items are pending, or one item needs multiple tool steps, the notice asks the model to maintain one Todo entry per follow-up ID with its current priority. Completion is explicit: the model emits a hidden per-ID receipt only after fully resolving that item; the extension strips the marker and persists the acknowledgement with the assistant reply. Ordinary prose, tool-use progress, provider errors, truncation, and aborts cannot acknowledge an item. Reloading the extension or pruning provider context therefore cannot re-arm completed work or silently retire unfinished work. See [the follow-up priority lifecycle](docs/interactive-steering.md) for recovery and integration details.
 
 ## Requirements
 
