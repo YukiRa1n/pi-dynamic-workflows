@@ -1594,10 +1594,7 @@ export class WorkflowManager extends EventEmitter {
           // was O(n^2) over a run's (up to 10k) log entries.
           let previousBytes = managed.logBytes;
           if (previousBytes === undefined) {
-            previousBytes = managed.snapshot.logs.reduce(
-              (total, item) => total + Buffer.byteLength(item, "utf8"),
-              0,
-            );
+            previousBytes = managed.snapshot.logs.reduce((total, item) => total + Buffer.byteLength(item, "utf8"), 0);
             managed.logBytes = previousBytes;
           }
           const nextBytes = previousBytes + Buffer.byteLength(message, "utf8");

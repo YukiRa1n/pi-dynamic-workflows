@@ -239,7 +239,10 @@ test("hasRunningRun mirrors the session-filtered running view without cloning", 
     );
 
     const other = new WorkflowManager({ cwd, agent: fakeAgent(), sessionId: "session-b" });
-    assert.equal(other.listRuns().some((r) => r.status === "running"), false);
+    assert.equal(
+      other.listRuns().some((r) => r.status === "running"),
+      false,
+    );
     assert.equal(other.hasRunningRun(), false, "the probe applies listRuns()'s session filter");
 
     deferred.resolve("done");
